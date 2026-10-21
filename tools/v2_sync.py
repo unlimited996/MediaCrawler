@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -110,6 +112,58 @@ def _diff_fields(before: Dict[str, Any], after: Dict[str, Any]) -> list:
         })
     return out
 
+
+async def _load_media_index(session, chapter_id: int) -> Dict[str, MediaAttachment]:
+    """已有媒体按 source_url 建索引（用于只增不删的 upsert）。"""
+    rows = (await session.execute(
+        select(MediaAttachment).where(
+            MediaAttachment.target_type == "chapter",
+            MediaAttachment.target_id == chapter_id)
+    )).scalars().all()
+    return {m.source_url: m for m in rows if m.source_url}
+
+
+async def _upsert_media(session, chapter_id: int, url: str, idx: int,
+                        local_path: str, index: Dict[str, MediaAttachment]) -> str:
+    """媒体入库：只新增，不删除。
+
+    - 新 URL → INSERT（带 storage_type / source_status / downloaded_at）
+    - 已有 URL → 只补空字段（local_path / checksum / 存储类型），
+      本次抓取没带回来的历史媒体永不删除（story 硬删除才级联）
+    """
+    lp = local_path or None
+    existing = index.get(url)
+    if existing is not None:
+        # 本地文件后来才下载完：回补路径，不动其它字段
+        if lp and not existing.local_path:
+            existing.local_path = lp
+            existing.storage_type = "local"
+            existing.download_status = "done"
+            try:
+                existing.size_bytes = Path(lp).stat().st_size
+                existing.mime_type = (mimetypes.guess_type(lp)[0]
+                                      or existing.mime_type or "image/jpeg")
+            except Exception:
+                pass
+            try:
+                from sqlalchemy import text as _text
+                existing.downloaded_at = (await session.execute(
+                    _text("SELECT now()"))).scalar()
+            except Exception:
+                pass
+        return "updated"
+
+    session.add(MediaAttachment(
+        target_type="chapter", target_id=chapter_id,
+        media_type="image", source_url=url,
+        local_path=lp,
+        sort_order=idx - 1,
+        download_status="done" if lp else "pending",
+        storage_type="local" if lp else "url",
+        source_status="alive" if url else "unknown",
+    ))
+    index[url] = None  # 占位，避免同批重复 URL 重复插入
+    return "inserted"
 
 async def record_story_edit(session, story_id: int, chapter_id: Optional[int],
                             before: Dict[str, Any], after: Dict[str, Any],
@@ -368,6 +422,7 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 from media_downloader.paths import build_media_dir
                 from tools.paths import DATA_DIR
                 media_dir = build_media_dir(DATA_DIR, platform_code, content_id)
+                _media_index = await _load_media_index(session, chapter.id)
                 for idx, img in enumerate(_split_list(_pick(item, _IMAGE_KEYS)), 1):
                     img = str(img)
                     if not img.startswith(("http://", "https://")):
@@ -378,13 +433,8 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                         if candidate.exists():
                             local_path = str(candidate)
                             break
-                    session.add(MediaAttachment(
-                        target_type="chapter", target_id=chapter.id,
-                        media_type="image", source_url=img,
-                        local_path=local_path or None,
-                        sort_order=idx - 1,
-                        download_status="done" if local_path else "pending",
-                    ))
+                    await _upsert_media(session, chapter.id, img, idx,
+                                        local_path, _media_index)
 
                 tag_ids = []
                 for tag_name in _split_list(_pick(item, _TAG_KEYS))[:10]:
@@ -453,9 +503,12 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                     from media_downloader.paths import build_media_dir
                     from tools.paths import DATA_DIR
                     media_dir = build_media_dir(DATA_DIR, platform_code, content_id)
+                    # 只增不删：新 URL 才插入；已有 URL 只回补本地路径；
+                    # 本次没带回来的历史媒体保留不动
+                    _media_index = await _load_media_index(session, chapter.id)
                     for idx, img in enumerate(_split_list(_pick(item, _IMAGE_KEYS)), 1):
                         img = str(img)
-                        if img in existing_urls or not img.startswith(("http://", "https://")):
+                        if not img.startswith(("http://", "https://")):
                             continue
                         local_path = ""
                         for ext in (".webp", ".jpg", ".jpeg", ".png", ".gif"):
@@ -463,13 +516,8 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                             if candidate.exists():
                                 local_path = str(candidate)
                                 break
-                        session.add(MediaAttachment(
-                            target_type="chapter", target_id=chapter.id,
-                            media_type="image", source_url=img,
-                            local_path=local_path or None,
-                            sort_order=idx - 1,
-                            download_status="done" if local_path else "pending",
-                        ))
+                        await _upsert_media(session, chapter.id, img, idx,
+                                            local_path, _media_index)
 
                 # 编辑记录：与抓取前的快照比对，有差异才落一条
                 if story is not None:
