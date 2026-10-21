@@ -1,32 +1,36 @@
-import { Bug, Wifi, AlertTriangle, Flame, Database, FolderOpen, CalendarClock } from 'lucide-react'
+import { Bug, Wifi, Flame, Database, FolderOpen, CalendarClock } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Badge } from '@/components/ui/badge'
 import { useCrawlerStore } from '@/store/crawlerStore'
-import { useCrawlerStatus } from '@/hooks/useCrawler'
+import { useCrawlerStatus, usePlatforms } from '@/hooks/useCrawler'
+import { getPlatformTheme } from '@/components/data/platform/platformTheme'
 import { LanguageSwitch } from './LanguageSwitch'
 import { ThemeToggle } from './ThemeToggle'
 
 export type MainView = 'crawl' | 'discover' | 'data' | 'browser' | 'tasks'
 
 interface SidebarProps {
-  onShowDisclaimer?: () => void
   view: MainView
-  onViewChange: (view: MainView) => void
+  onViewChange: (view: MainView, platform?: string) => void
+  /** 数据管理当前选中的平台（'' = 全部） */
+  dataPlatform: string
 }
 
-export function Sidebar({ onShowDisclaimer, view, onViewChange }: SidebarProps) {
+export function Sidebar({ view, onViewChange, dataPlatform }: SidebarProps) {
   const { t } = useTranslation()
-  const { t: tLicense } = useTranslation('license')
   const status = useCrawlerStore((state) => state.status)
+  const { data: platforms } = usePlatforms()
 
   // Poll status
   useCrawlerStatus()
 
   const isRunning = status === 'running'
+  const list = (platforms || []) as { value: string; label: string }[]
 
   return (
-    <header className="h-14 flex-shrink-0 glass-panel border-b border-cyber-border-subtle relative z-10">
-      <div className="h-full px-4 flex items-center justify-between">
+    <header className="flex-shrink-0 glass-panel border-b border-cyber-border-subtle relative z-10">
+      {/* 第一行：主导航 */}
+      <div className="h-14 px-4 flex items-center justify-between">
         {/* Left: Logo and GitHub Star */}
         <div className="flex items-center gap-3">
           <Bug className="w-5 h-5 text-cyber-neon-cyan" />
@@ -34,7 +38,7 @@ export function Sidebar({ onShowDisclaimer, view, onViewChange }: SidebarProps) 
             MediaCrawler
           </span>
 
-          {/* 主导航：抓取 / 热搜时光机 / 数据管理 / 数据浏览 */}
+          {/* 主导航：抓取 / 热搜时光机 / 定时任务 / 数据浏览 */}
           <div className="flex items-center gap-1 ml-1">
             <button
               onClick={() => onViewChange('crawl')}
@@ -70,17 +74,6 @@ export function Sidebar({ onShowDisclaimer, view, onViewChange }: SidebarProps) 
               <span className="hidden sm:inline">{t('nav.tasks')}</span>
             </button>
             <button
-              onClick={() => onViewChange('data')}
-              className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono transition-all ${
-                view === 'data'
-                  ? 'bg-cyber-neon-green text-black font-bold'
-                  : 'text-cyber-text-secondary hover:text-cyber-text-primary border border-cyber-border-subtle hover:border-cyber-neon-green/50'
-              }`}
-            >
-              <Database className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">{t('nav.data')}</span>
-            </button>
-            <button
               onClick={() => onViewChange('browser')}
               className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono transition-all ${
                 view === 'browser'
@@ -103,22 +96,6 @@ export function Sidebar({ onShowDisclaimer, view, onViewChange }: SidebarProps) 
           )}
         </div>
 
-        {/* Center: Warning Text */}
-        <button
-          onClick={onShowDisclaimer}
-          className="flex items-center gap-3 px-4 py-1.5 rounded-lg border border-cyber-neon-orange/50 bg-cyber-neon-orange/10 hover:bg-cyber-neon-orange/20 transition-all cursor-pointer"
-        >
-          <AlertTriangle className="w-4 h-4 text-cyber-neon-orange flex-shrink-0" />
-          <div className="flex items-center gap-4 text-xs font-mono">
-            <span className="text-cyber-neon-orange">
-              <span className="text-cyber-neon-pink font-bold">1.</span> {tLicense('content.line1')}
-            </span>
-            <span className="text-cyber-neon-orange">
-              <span className="text-cyber-neon-pink font-bold">2.</span> {tLicense('content.line2')}
-            </span>
-          </div>
-        </button>
-
         {/* Right: Actions and Status */}
         <div className="flex items-center gap-3">
           {/* Theme Toggle */}
@@ -137,6 +114,48 @@ export function Sidebar({ onShowDisclaimer, view, onViewChange }: SidebarProps) 
             </div>
           </div>
         </div>
+      </div>
+
+      {/* 第二行：数据管理按平台拆分入口（品牌色区分，点击直达该平台的数据） */}
+      <div className="flex items-center gap-1 px-4 pb-2 -mt-1 overflow-x-auto">
+        <button
+          onClick={() => onViewChange('data', '')}
+          className="flex flex-shrink-0 items-center gap-1 rounded-md border px-2 py-[3px] text-[11px] font-mono transition-all"
+          style={{
+            color: view === 'data' && !dataPlatform ? '#06B6D4' : undefined,
+            background: view === 'data' && !dataPlatform ? 'rgba(6,182,212,0.12)' : undefined,
+            borderColor: view === 'data' && !dataPlatform ? 'rgba(6,182,212,0.45)' : 'rgba(120,120,140,0.25)',
+          }}
+          title={t('nav.data')}
+        >
+          <Database className="w-3 h-3" />
+          {t('nav.data')}
+        </button>
+        {list.map((p) => {
+          const theme = getPlatformTheme(p.value)
+          // 后端下发的是英文平台名，优先用平台主题里的中文名（未知平台才退回）
+          const label = theme.label === p.value ? p.label : theme.label
+          const active = view === 'data' && dataPlatform === p.value
+          return (
+            <button
+              key={p.value}
+              onClick={() => onViewChange('data', p.value)}
+              className="flex flex-shrink-0 items-center gap-1 rounded-md border px-2 py-[3px] text-[11px] font-mono transition-all"
+              style={{
+                color: active ? theme.accent : undefined,
+                background: active ? theme.accentSoft : 'transparent',
+                borderColor: active ? `${theme.accent}66` : `${theme.accent}33`,
+              }}
+              title={label}
+            >
+              <span
+                className="h-1.5 w-1.5 flex-shrink-0 rounded-full"
+                style={{ background: theme.accent }}
+              />
+              {label}
+            </button>
+          )
+        })}
       </div>
     </header>
   )

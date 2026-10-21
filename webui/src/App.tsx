@@ -13,14 +13,14 @@ import { DataExplorer } from '@/components/data/DataExplorer'
 import type { MainView } from '@/components/layout/Sidebar'
 
 function App() {
-  // 主视图：抓取 / 热搜时光机 / 数据管理 / 数据浏览
+  // 主视图：抓取 / 热搜时光机 / 数据浏览 / 数据管理（按平台拆分）
   const [view, setView] = useState<MainView>('crawl')
+  /** 数据管理当前选中的平台（'' = 全部）；平台入口在顶部第二行 */
+  const [dataPlatform, setDataPlatform] = useState('')
   // Initialize by checking localStorage if license has been accepted
   const [licenseAccepted, setLicenseAccepted] = useState(() => isLicenseAccepted())
   // Initialize by checking localStorage if env check has passed
   const [envChecked, setEnvChecked] = useState(() => isEnvChecked())
-  // State for showing disclaimer manually
-  const [showDisclaimer, setShowDisclaimer] = useState(false)
 
   const handleEnvCheckComplete = () => {
     setEnvChecked(true)
@@ -28,30 +28,31 @@ function App() {
 
   const handleLicenseAccept = () => {
     setLicenseAccepted(true)
-    setShowDisclaimer(false)
   }
 
-  const handleShowDisclaimer = () => {
-    setShowDisclaimer(true)
+  /** 顶部导航切换；进数据管理时一并带上平台（平台入口按平台直达） */
+  const handleViewChange = (next: MainView, platform?: string) => {
+    setView(next)
+    if (next === 'data') setDataPlatform(platform ?? '')
   }
 
   return (
     <div className="flex flex-col h-screen cyber-grid overflow-hidden relative">
-      {/* License Disclaimer Modal - Shows first or when triggered */}
-      {(!licenseAccepted || showDisclaimer) && (
+      {/* License Disclaimer Modal - 首次使用时弹出（顶部横幅已移除） */}
+      {!licenseAccepted && (
         <LicenseDisclaimer onAccept={handleLicenseAccept} />
       )}
 
       {/* Environment Check Modal - Shows after license accepted */}
-      {licenseAccepted && !showDisclaimer && !envChecked && (
+      {licenseAccepted && !envChecked && (
         <EnvironmentCheck onCheckComplete={handleEnvCheckComplete} />
       )}
 
       {/* Header Bar */}
       <Sidebar
-        onShowDisclaimer={handleShowDisclaimer}
         view={view}
-        onViewChange={setView}
+        onViewChange={handleViewChange}
+        dataPlatform={dataPlatform}
       />
 
       {/* Main Area */}
@@ -71,7 +72,10 @@ function App() {
         ) : view === 'browser' ? (
           <DataExplorer />
         ) : (
-          <DataManagementView />
+          <DataManagementView
+            platform={dataPlatform}
+            onPlatformChange={setDataPlatform}
+          />
         )}
       </div>
 

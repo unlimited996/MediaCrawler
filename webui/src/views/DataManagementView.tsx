@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import {
@@ -26,10 +26,26 @@ function fmtTs(ts?: number | null): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
-export function DataManagementView() {
+/**
+ * 数据管理页。
+ *
+ * platform 由顶部导航栏的平台入口驱动（受控）；不传时退回内部 state，
+ * 保证单独复用这个视图也能自己切平台。
+ */
+export function DataManagementView({
+  platform: platformProp, onPlatformChange,
+}: {
+  platform?: string
+  onPlatformChange?: (p: string) => void
+} = {}) {
   const { t } = useTranslation('data')
   const queryClient = useQueryClient()
-  const [platform, setPlatform] = useState<string>('')
+  const [innerPlatform, setInnerPlatform] = useState<string>('')
+  const platform = platformProp !== undefined ? platformProp : innerPlatform
+  const setPlatform = (p: string) => {
+    setInnerPlatform(p)
+    onPlatformChange?.(p)
+  }
   const [keyword, setKeyword] = useState('')
   const [searchInput, setSearchInput] = useState('')
   const [tag, setTag] = useState('')
@@ -48,6 +64,12 @@ export function DataManagementView() {
     queryKey: ['storyTags'],
     queryFn: async () => (await storyApi.tags(30)).data.items,
   })
+
+  // 平台切换（顶部入口或页内下拉）都要回到第一页，否则会停在空页
+  useEffect(() => {
+    setPage(1)
+    setSelected(new Set())
+  }, [platform])
 
   const tsRange = useMemo(() => {
     const now = Date.now()
@@ -147,7 +169,7 @@ export function DataManagementView() {
         {/* 平台 */}
         <select
           value={platform}
-          onChange={(e) => { setPlatform(e.target.value); setPage(1) }}
+          onChange={(e) => setPlatform(e.target.value)}
           className="h-8 px-2 rounded-md text-xs font-mono bg-cyber-bg-tertiary border border-cyber-border-subtle text-cyber-text-primary"
         >
           <option value="">{t('manage.allPlatforms')}</option>
