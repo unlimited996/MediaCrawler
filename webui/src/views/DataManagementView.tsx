@@ -70,7 +70,11 @@ function StoryCard({
   const theme = getPlatformTheme(it.platform)
   const [broken, setBroken] = useState(false)
   const title = splitTopics(it.title).clean || it.title || ''
-  const cover = it.cover_url
+  // 封面取帖子内部首张图片：本地副本优先（外链签名会过期），无本地副本用外链
+  const cover = it.cover_local_url || it.cover_url || ''
+  // 无图（或图挂了）时展示正文前 50 字
+  const excerpt = (it.excerpt || it.summary || '').slice(0, 50)
+  const showTextCover = !cover || broken
 
   return (
     <div
@@ -79,7 +83,7 @@ function StoryCard({
     >
       {/* 封面：统一 3:4，object-cover 保证不变形 */}
       <div className="relative w-full flex-shrink-0 overflow-hidden bg-cyber-bg-tertiary aspect-[3/4]">
-        {cover && !broken ? (
+        {!showTextCover ? (
           <img
             src={cover}
             alt=""
@@ -87,6 +91,14 @@ function StoryCard({
             className="h-full w-full object-cover"
             onError={() => setBroken(true)}
           />
+        ) : excerpt ? (
+          // 无图 / 图挂了：显示正文前 50 字
+          <div
+            className="flex h-full w-full items-start overflow-hidden p-2.5 text-[11px] leading-5 text-cyber-text-secondary"
+            style={{ background: theme.accentSoft }}
+          >
+            <span className="line-clamp-6">{excerpt}</span>
+          </div>
         ) : (
           <div
             className="flex h-full w-full items-center justify-center text-2xl font-bold"

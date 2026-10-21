@@ -19,7 +19,8 @@ from sqlalchemy import and_, delete as sa_delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models_v2 import (
-    Author, Comment, MediaAttachment, SourceSite, Story, StoryChapter, StoryTag, Tag,
+    Author, Comment, MediaAttachment, SourceSite, Story, StoryChapter,
+    StoryEditLog, StoryTag, Tag,
 )
 
 router = APIRouter(prefix="/stories", tags=["story"])
@@ -141,13 +142,68 @@ async def list_stories(
             author_map = {r[0]: {"name": r[1], "avatar": r[2] or "", "url": r[3] or ""}
                           for r in a_rows}
 
+        # 封面 / 正文摘录（卡片视图要用）
+        #   cover_local_url : 帖子首张图，已落盘的本地副本（外链带签名会过期，实测 403）
+        #   cover_url       : 帖子首张图，无本地副本时的外链
+        #   excerpt         : 正文前 50 字，无图时卡片显示它
+        ch_rows = (await session.execute(
+            select(StoryChapter.id, StoryChapter.story_id, StoryChapter.content_text)
+            .where(StoryChapter.story_id.in_(ids))
+        )).all() if ids else []
+        chapter_ids = [r[0] for r in ch_rows]
+        excerpt_map: Dict[int, str] = {}
+        for _cid, _sid, _txt in ch_rows:
+            if _sid in excerpt_map or not _txt:
+                continue
+            excerpt_map[_sid] = " ".join(str(_txt).split())[:50]
+
+        cover_local: Dict[int, str] = {}
+        cover_first: Dict[int, str] = {}
+        if chapter_ids:
+            from tools.paths import DATA_DIR as _DATA_DIR
+            cov = (await session.execute(
+                select(MediaAttachment.target_id, MediaAttachment.local_path,
+                       MediaAttachment.source_url, MediaAttachment.media_type,
+                       StoryChapter.source_content_id, StoryChapter.story_id,
+                       StoryChapter.source_site_id)
+                .join(StoryChapter, MediaAttachment.target_id == StoryChapter.id)
+                .where(MediaAttachment.target_type == "chapter",
+                       MediaAttachment.target_id.in_(chapter_ids),
+                       MediaAttachment.media_type == "image")
+                .order_by(MediaAttachment.sort_order.asc())
+            )).all()
+            site_codes = {x.id: x.code for x in (await session.execute(
+                select(SourceSite))).scalars().all()}
+            for _tid, lp, src, _mt, content_id, sid, site_id in cov:
+                # 首张图外链（不论有没有本地副本）
+                if sid not in cover_first and src:
+                    cover_first[sid] = src
+                if sid in cover_local or not lp:
+                    continue
+                try:
+                    rel = Path(lp).resolve().relative_to(_DATA_DIR.resolve())
+                    cover_local[sid] = f"/api/data/{rel.as_posix()}"
+                except Exception:
+                    p = Path(lp)
+                    cover_local[sid] = (
+                        f"/api/data/media/{site_codes.get(site_id) or ''}/"
+                        f"{content_id}/{p.name}")
+
         items = [{
             "id": s.id,
             "title": s.title,
             "summary": (s.summary or "")[:200],
-            "cover_url": s.cover_url,
+            # 首张图：本地副本优先（外链会过期），没有再退回外链 / story.cover_url
+            "cover_url": (cover_local.get(s.id)
+                          or cover_first.get(s.id)
+                          or s.cover_url or ""),
+            "cover_local_url": cover_local.get(s.id) or "",
+            # 无图时卡片显示正文前 50 字
+            "excerpt": excerpt_map.get(s.id) or (s.summary or "")[:50],
             "category": s.category,
             "platform": site_name.get(s.primary_site_id),
+            "media_count": int(s.media_count or 0),
+            "edit_count": int(s.edit_count or 0),
             "author_id": s.author_id,
             "author": (author_map.get(s.author_id) or {}).get("name") or "",
             "author_avatar": (author_map.get(s.author_id) or {}).get("avatar") or "",
@@ -206,6 +262,31 @@ async def list_authors(
             } for r in rows],
             "total": len(rows),
         }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/edits/recent")
+async def list_recent_edits(limit: int = Query(20, ge=1, le=100)):
+    """最近的编辑记录（跨内容）。"""
+    engine, session = await _session()
+    if session is None:
+        return {"items": []}
+    try:
+        rows = (await session.execute(
+            select(StoryEditLog, Story.title)
+            .join(Story, StoryEditLog.story_id == Story.id)
+            .order_by(StoryEditLog.edit_ts.desc()).limit(limit)
+        )).all()
+        return {"items": [{
+            "id": r[0].id,
+            "story_id": r[0].story_id,
+            "story_title": r[1],
+            "edit_ts": r[0].edit_ts,
+            "changed_fields": r[0].changed_fields or [],
+            "source": r[0].source,
+        } for r in rows]}
     finally:
         await session.close()
         await engine.dispose()
@@ -297,6 +378,8 @@ async def get_story(story_id: int):
                 "type": m.media_type,
                 "url": m.source_url,
                 "local_path": m.local_path,
+                "storage_type": m.storage_type or "url",
+                "source_status": m.source_status or "unknown",
                 # 本地已下载的文件走 API 路由吐出（CDN 防盗链，浏览器直连 403）
                 "local_url": (
                     f"/api/data/media/{platform_code}/"
@@ -958,3 +1041,62 @@ async def set_story_watch(story_id: int, kind: str,
         asyncio.create_task(_kickoff())
 
     return {"kind": kind, kind: _watch_view(task, True)}
+
+
+
+# ---------------------------------------------------------------------------
+# 帖子编辑记录（P2）
+#
+# /edits 列表 + /edits/{edit_id} 详情，供详情页「编辑记录」弹层做前后比对。
+# ---------------------------------------------------------------------------
+
+@router.get("/{story_id}/edits")
+async def list_story_edits(story_id: int, limit: int = Query(50, ge=1, le=200)):
+    """某条内容的编辑记录列表（只给摘要，详情单独取）。"""
+    engine, session = await _session()
+    if session is None:
+        return {"items": [], "total": 0}
+    try:
+        rows = (await session.execute(
+            select(StoryEditLog).where(StoryEditLog.story_id == story_id)
+            .order_by(StoryEditLog.edit_ts.desc()).limit(limit)
+        )).scalars().all()
+        return {
+            "items": [{
+                "id": e.id,
+                "edit_ts": e.edit_ts,
+                "changed_fields": e.changed_fields or [],
+                "source": e.source,
+                "chapter_id": e.chapter_id,
+            } for e in rows],
+            "total": len(rows),
+        }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/{story_id}/edits/{edit_id}")
+async def get_story_edit(story_id: int, edit_id: int):
+    """单条编辑记录：含 before / after / diff，前端直接双栏比对。"""
+    engine, session = await _session()
+    if session is None:
+        return {"detail": "配置库不可用"}
+    try:
+        e = await session.get(StoryEditLog, edit_id)
+        if e is None or e.story_id != story_id:
+            return {"detail": "not found"}
+        return {
+            "id": e.id,
+            "story_id": e.story_id,
+            "chapter_id": e.chapter_id,
+            "edit_ts": e.edit_ts,
+            "changed_fields": e.changed_fields or [],
+            "before": e.before or {},
+            "after": e.after or {},
+            "diff": e.diff or [],
+            "source": e.source,
+        }
+    finally:
+        await session.close()
+        await engine.dispose()

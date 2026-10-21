@@ -37,7 +37,7 @@ import config as config_module
 
 from .routers import (crawler_router, data_router, websocket_router, export_router,
                       config_router, story_router, discover_router, accounts_router,
-                      scheduler_router)
+                      scheduler_router, stance_tags_router)
 
 # Project root directory (used for running subprocesses like uv run main.py)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -111,6 +111,22 @@ async def _install_loop_exception_handler():
     except Exception as e:
         print(f"[stance] 回填任务启动失败（不影响 API）：{e}")
 
+    # 态度标签库（P3）：库空时写入 9 个内置标签，并预热进程内缓存
+    try:
+        from tools.stance import ensure_seeded, load_library
+
+        async def _stance_lib_boot():
+            try:
+                n = await ensure_seeded()
+                lib = await load_library(force=True)
+                print(f"[stance] 标签库就绪：{n} 个标签，version={lib.get('version')}")
+            except Exception as e:
+                print(f"[stance] 标签库初始化失败（判定时会重试）：{e}")
+
+        asyncio.create_task(_stance_lib_boot())
+    except Exception as e:
+        print(f"[stance] 标签库启动失败（不影响 API）：{e}")
+
 # CORS configuration - allow frontend dev server access
 app.add_middleware(
     CORSMiddleware,
@@ -135,6 +151,7 @@ app.include_router(story_router, prefix="/api")
 app.include_router(discover_router, prefix="/api")
 app.include_router(accounts_router, prefix="/api")
 app.include_router(scheduler_router, prefix="/api")
+app.include_router(stance_tags_router, prefix="/api")
 
 
 @app.api_route("/", methods=["GET", "HEAD"])

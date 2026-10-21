@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -30,7 +31,7 @@ from database.db_session import get_async_engine
 from config.db_config import resolve_config_db_type
 from database.models_v2 import (
     Author, Comment, MediaAttachment, SourceSite, Story, StoryChapter,
-    StoryTag, Tag,
+    StoryEditLog, StoryTag, Tag,
 )
 from tools import utils
 from tools.crawler_util import safe_int
@@ -57,15 +58,29 @@ async def _stance_for(story_id: Optional[int], text: str) -> str:
 
     story_id 缺失（孤儿评论）或判定失败都退 neutral，不影响入库。
     """
-    if not story_id:
-        return "neutral"
-    try:
-        from tools.stance import judge_comment_stance
+    return (await _stance_detail_for(story_id, text)).get("stance", "neutral")
 
+
+async def _stance_detail_for(story_id: Optional[int], text: str,
+                             sentiment: Optional[str] = None) -> Dict[str, Any]:
+    """按态度标签库判定（P3），返回 stance / tag_code / tag_id / confidence。
+
+    标签库每次判定前按版本号刷新，新增或修改标签后下次判定立即生效。
+    """
+    if not story_id:
+        return {"stance": "neutral"}
+    try:
+        from tools.stance import ensure_seeded, judge_with_library, load_library
+
+        await ensure_seeded()
+        lib = await load_library()
         post_stance = await get_story_stance(story_id)
-        return judge_comment_stance(text or "", post_stance).get("stance", "neutral")
-    except Exception:
-        return "neutral"
+        r = judge_with_library(text or "", post_stance, sentiment)
+        r["version"] = lib.get("version")
+        return r
+    except Exception as e:
+        utils.logger.warning(f"[v2_sync] 立场判定失败，退 neutral: {e}")
+        return {"stance": "neutral"}
 
 # ---------------------------------------------------------------------------
 # session 工厂：与 API 层（api/routers/story.py）使用同一套 db_type 解析，
@@ -74,6 +89,60 @@ async def _stance_for(story_id: Optional[int], text: str) -> str:
 # 在 API 进程里该值是默认的 "jsonl"，会静默拿到 None session。
 # ---------------------------------------------------------------------------
 
+
+#: 参与编辑比对的字段（数值字段单独用「有变化」判定，避免点赞波动刷记录）
+_EDIT_TEXT_FIELDS = ("title", "content_text")
+_EDIT_NUM_FIELDS = ("like_count", "comment_count")
+
+
+def _diff_fields(before: Dict[str, Any], after: Dict[str, Any]) -> list:
+    """生成 [{field, before, after, kind}]，前端直接渲染双栏对比。"""
+    out = []
+    for f in _EDIT_TEXT_FIELDS + _EDIT_NUM_FIELDS:
+        b, a = before.get(f), after.get(f)
+        if b == a:
+            continue
+        out.append({
+            "field": f,
+            "before": "" if b is None else str(b),
+            "after": "" if a is None else str(a),
+            "kind": "number" if f in _EDIT_NUM_FIELDS else "text",
+        })
+    return out
+
+
+async def record_story_edit(session, story_id: int, chapter_id: Optional[int],
+                            before: Dict[str, Any], after: Dict[str, Any],
+                            source: str = "crawl") -> bool:
+    """内容发生变化时写一条编辑记录（P2）。无变化返回 False。"""
+    try:
+        import config
+        if not getattr(config, "ENABLE_STORY_EDIT_LOG", True):
+            return False
+    except Exception:
+        pass
+    diff = _diff_fields(before, after)
+    if not diff:
+        return False
+    try:
+        session.add(StoryEditLog(
+            story_id=story_id,
+            chapter_id=chapter_id,
+            edit_ts=int(time.time() * 1000),
+            changed_fields=[d["field"] for d in diff],
+            before={k: before.get(k) for k in before},
+            after={k: after.get(k) for k in after},
+            diff=diff,
+            source=source,
+        ))
+        story = await session.get(Story, story_id)
+        if story is not None:
+            story.edited_at = int(time.time() * 1000)
+            story.edit_count = int(story.edit_count or 0) + 1
+        return True
+    except Exception as e:
+        utils.logger.warning(f"[v2_sync] 写编辑记录失败 story={story_id}: {e}")
+        return False
 
 @asynccontextmanager
 async def _v2_session():
@@ -333,6 +402,13 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 story = (await session.execute(
                     select(Story).where(Story.id == chapter.story_id)
                 )).scalar_one_or_none()
+                # 编辑记录：先快照旧值，改完再比对（P2）
+                _edit_before = {
+                    "title": story.title if story else None,
+                    "content_text": chapter.content_text,
+                    "like_count": chapter.like_count,
+                    "comment_count": chapter.comment_count,
+                }
                 if story is not None:
                     story.like_count = like_count
                     story.comment_count = comment_count
@@ -394,6 +470,16 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                             sort_order=idx - 1,
                             download_status="done" if local_path else "pending",
                         ))
+
+                # 编辑记录：与抓取前的快照比对，有差异才落一条
+                if story is not None:
+                    await record_story_edit(
+                        session, story.id, chapter.id, _edit_before,
+                        {"title": story.title,
+                         "content_text": chapter.content_text,
+                         "like_count": chapter.like_count,
+                         "comment_count": chapter.comment_count},
+                        source=str(item.get("crawl_source") or "crawl"))
 
             await session.commit()
             return True
@@ -546,13 +632,37 @@ async def backfill_comment_stances(story_id: Optional[int] = None,
             for c in rows:
                 by_story.setdefault(c.story_id, []).append(c)
 
+            # 标签库：先确保种子已写入并载入内存，整批共用一个版本
+            try:
+                from tools.stance import (ensure_seeded, judge_with_library,
+                                          load_library)
+                await ensure_seeded(session)
+                lib = await load_library(session=session)
+                tags = lib.get("tags") or []
+                ver = lib.get("version") or 0
+            except Exception:
+                tags, ver = [], 0
+
             for sid, comments in by_story.items():
                 post_stance = await get_story_stance(sid)
                 for c in comments:
                     try:
-                        r = judge_comment_stance(
-                            c.content_text or "", post_stance, c.sentiment)
+                        if tags:
+                            r = judge_with_library(
+                                c.content_text or "", post_stance, c.sentiment,
+                                tags=tags)
+                        else:
+                            r = judge_comment_stance(
+                                c.content_text or "", post_stance, c.sentiment)
                         c.stance = r.get("stance", "neutral")
+                        # 标签库字段（P3）：供筛选 / 徽标展示
+                        c.stance_tag_id = r.get("tag_id")
+                        c.stance_tag_code = r.get("tag_code")
+                        try:
+                            c.stance_confidence = r.get("confidence")
+                        except Exception:
+                            pass
+                        c.stance_judged_ver = ver or None
                         updated += 1
                     except Exception:
                         c.stance = "neutral"
@@ -603,6 +713,16 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 if not existing.stance:
                     existing.stance = await _stance_for(
                         existing.story_id, str(item.get("content") or ""))
+                # 老数据没有标签：按最新标签库补判（P3）
+                if not existing.stance_tag_code:
+                    _d = await _stance_detail_for(
+                        existing.story_id, str(item.get("content") or ""),
+                        existing.sentiment)
+                    existing.stance_tag_id = _d.get("tag_id")
+                    existing.stance_tag_code = _d.get("tag_code")
+                    existing.stance_confidence = _d.get("confidence")
+                    existing.stance_judged_ver = _d.get("version")
+
                 await session.commit()
                 return True
 
@@ -624,6 +744,9 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 story_id = await _ensure_orphan_story(session, site_id, platform_code, content_id)
                 chapter_id = None
 
+            _c_text = str(item.get("content") or "")
+            _c_sent = _judge_sentiment(item)
+            _c_st = await _stance_detail_for(story_id, _c_text, _c_sent)
             session.add(Comment(
                 story_id=story_id,
                 chapter_id=chapter_id,
@@ -637,8 +760,12 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 like_count=safe_int(item.get("like_count") or 0),
                 sub_count=safe_int(item.get("sub_comment_count") or 0),
                 publish_ts=safe_int(_pick(item, ("create_time", "publish_time")) or 0) or None,
-                sentiment=_judge_sentiment(item),
-                stance=await _stance_for(story_id, str(item.get("content") or "")),
+                sentiment=_c_sent,
+                stance=_c_st.get("stance", "neutral"),
+                stance_tag_id=_c_st.get("tag_id"),
+                stance_tag_code=_c_st.get("tag_code"),
+                stance_confidence=_c_st.get("confidence"),
+                stance_judged_ver=_c_st.get("version"),
                 # parent 原始 ID 先落 ext，等父评论到达后由 backfill_comment_links 回填
                 ext={"parent_comment_id": str(item.get("parent_comment_id") or "")},
             ))

@@ -251,6 +251,39 @@ async def _seed(session: AsyncSession) -> Dict[str, int]:
     return stats
 
 
+#: 老库补列：create_all 不会 ALTER，历史库需要显式加列（全部 IF NOT EXISTS）
+ADD_COLUMN_SQL = [
+    ("media_attachment", "storage_type", "VARCHAR(16) NOT NULL DEFAULT 'url'"),
+    ("media_attachment", "storage_key", "TEXT"),
+    ("media_attachment", "checksum", "VARCHAR(64)"),
+    ("media_attachment", "source_status", "VARCHAR(16) NOT NULL DEFAULT 'unknown'"),
+    ("media_attachment", "source_checked_at", "TIMESTAMPTZ"),
+    ("media_attachment", "downloaded_at", "TIMESTAMPTZ"),
+    ("media_attachment", "inline_data", "BYTEA"),
+    ("media_attachment", "inline_mime", "VARCHAR(64)"),
+    ("story", "media_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("story", "cover_media_id", "BIGINT"),
+    ("story", "edited_at", "BIGINT"),
+    ("story", "edit_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("comment", "stance_tag_id", "BIGINT"),
+    ("comment", "stance_tag_code", "VARCHAR(32)"),
+    ("comment", "stance_confidence", "NUMERIC(4,2)"),
+    ("comment", "stance_judged_ver", "BIGINT"),
+]
+
+
+async def _ensure_columns(conn) -> int:
+    added = 0
+    for table, column, ddl in ADD_COLUMN_SQL:
+        try:
+            await conn.execute(
+                text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl}"))
+            added += 1
+        except Exception as e:  # 表不存在等情况跳过，不阻断初始化
+            print(f"[init_v2] 补列跳过 {table}.{column}: {e}")
+    return added
+
+
 async def init_v2(db_type: str = None) -> Dict[str, int]:
     engine = get_async_engine(db_type)
     if engine is None:
@@ -258,6 +291,8 @@ async def init_v2(db_type: str = None) -> Dict[str, int]:
 
     async with engine.begin() as conn:
         await conn.run_sync(BaseV2.metadata.create_all)
+        # 历史库补列（图片持久化 / 编辑记录 / 态度标签库）
+        await _ensure_columns(conn)
 
     async with AsyncSession(engine, expire_on_commit=False) as session:
         stats = await _seed(session)

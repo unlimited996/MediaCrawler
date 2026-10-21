@@ -25,9 +25,10 @@ from .story import router as story_router
 from .discover import router as discover_router
 from .accounts import router as accounts_router
 from .scheduler import router as scheduler_router
+from .stance_tags import router as stance_tags_router
 
 __all__ = [
     "crawler_router", "data_router", "websocket_router",
     "export_router", "config_router", "story_router", "discover_router",
-    "accounts_router", "scheduler_router",
+    "accounts_router", "scheduler_router", "stance_tags_router",
 ]

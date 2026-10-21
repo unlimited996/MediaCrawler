@@ -10,8 +10,8 @@ v1 保持不变，双轨期结束后再下线，保证存量数据与现有功�
 - 每张表带 schema_ver，标记写入时的结构版本，读取时按版本解析以兼容旧行
 """
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, ForeignKey, Index, Integer, JSON, Numeric,
-    SmallInteger, String, Text, func,
+    BigInteger, Boolean, Column, DateTime, ForeignKey, Index, Integer, JSON,
+    LargeBinary, Numeric, SmallInteger, String, Text, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
@@ -98,6 +98,11 @@ class Story(BaseV2, TimestampMixin, SoftDeleteMixin):
     heat_score = Column(Numeric(12, 4), nullable=False, server_default="0")
     first_publish_ts = Column(BigInteger)
     last_update_ts = Column(BigInteger)
+    # ---- 图片 / 编辑记录（P1/P2）----
+    media_count = Column(Integer, nullable=False, server_default="0")
+    cover_media_id = Column(BigInteger)
+    edited_at = Column(BigInteger)
+    edit_count = Column(Integer, nullable=False, server_default="0")
 
     ext = Column(JsonType, nullable=False, default=dict)
     schema_ver = Column(Integer, nullable=False, server_default="1")
@@ -176,12 +181,19 @@ class Comment(BaseV2, TimestampMixin, SoftDeleteMixin):
     sentiment = Column(String(16))                # AI 分析产物
     # 立场：相对发帖人核心观点的 agree / neutral / oppose（内容赞同度指标）
     stance = Column(String(16))
+    # ---- 态度标签库（P3）----
+    # 命中的标签（库表驱动，不再硬编码）；stance 保留为 polarity 三态归并
+    stance_tag_id = Column(BigInteger, ForeignKey("stance_tag.id"))
+    stance_tag_code = Column(String(32))
+    stance_confidence = Column(Numeric(4, 2))
+    stance_judged_ver = Column(BigInteger)        # 判定时的标签库版本，便于重算
     ext = Column(JsonType, nullable=False, default=dict)
     schema_ver = Column(Integer, nullable=False, server_default="1")
 
     __table_args__ = (
         Index("uq_comment_source", "source_site_id", "source_comment_id", unique=True),
         Index("idx_cmt_story_like", "story_id", "like_count"),
+        Index("idx_cmt_tag", "stance_tag_code"),
         Index("idx_cmt_root", "root_id", "publish_ts"),
         Index("idx_cmt_parent", "parent_id"),
         Index("idx_cmt_chapter", "chapter_id", "like_count"),
@@ -233,6 +245,20 @@ class MediaAttachment(BaseV2, TimestampMixin, SoftDeleteMixin):
     local_path = Column(Text)
     mime_type = Column(String(64))
     size_bytes = Column(BigInteger)
+    # ---- 图片持久化（P1）----
+    # 存储位置：local(本地 DATA_DIR) / object(对象存储) / inline(小图编码入库) / url(仅外链)
+    storage_type = Column(String(16), nullable=False, server_default="url")
+    # 对象存储 object key 或相对路径，配套 storage_type 使用
+    storage_key = Column(Text)
+    # 内容 sha256：跨 story 去重同一张图，删除 story 时不误删仍被引用的文件
+    checksum = Column(String(64))
+    # 外链健康度：alive / dead / unknown（原帖删除或签名过期后置 dead）
+    source_status = Column(String(16), nullable=False, server_default="unknown")
+    source_checked_at = Column(DateTime(timezone=True))
+    downloaded_at = Column(DateTime(timezone=True))
+    # 仅 <256KB 的小图/头像兜底编码入库；大图一律落盘或对象存储
+    inline_data = Column(LargeBinary)
+    inline_mime = Column(String(64))
     width = Column(Integer)
     height = Column(Integer)
     duration_sec = Column(Integer)
@@ -244,6 +270,8 @@ class MediaAttachment(BaseV2, TimestampMixin, SoftDeleteMixin):
     __table_args__ = (
         Index("idx_media_target", "target_type", "target_id", "sort_order"),
         Index("idx_media_status", "download_status"),
+        Index("idx_media_checksum", "checksum"),
+        Index("idx_media_storage", "storage_type", "download_status"),
         Index("uq_media_src", "target_type", "target_id", "source_url", unique=True),
     )
 
@@ -585,3 +613,92 @@ class ScheduledTaskRun(BaseV2):
         Index("idx_run_task_started", "task_id", "started_at"),
         Index("idx_run_status", "status", "started_at"),
     )
+
+
+# ---------------------------------------------------------------------------
+# 12. 帖子编辑记录（P2）
+# ---------------------------------------------------------------------------
+class StoryEditLog(BaseV2):
+    """帖子编辑记录：每次抓取检测到内容变化时落一条，支持前后比对。"""
+
+    __tablename__ = "story_edit_log"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    story_id = Column(BigInteger, ForeignKey("story.id", ondelete="CASCADE"), nullable=False)
+    chapter_id = Column(BigInteger, ForeignKey("story_chapter.id", ondelete="CASCADE"))
+    edit_ts = Column(BigInteger, nullable=False)
+    changed_fields = Column(JsonType, nullable=False, default=list)
+    before = Column(JsonType, nullable=False, default=dict)
+    after = Column(JsonType, nullable=False, default=dict)
+    diff = Column(JsonType, nullable=False, default=list)
+    source = Column(String(32))                   # crawl / manual / backfill
+    crawl_task_id = Column(BigInteger)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_edit_story", "story_id", "edit_ts"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 13. 回复态度标签库（P3）
+# ---------------------------------------------------------------------------
+class StanceTag(BaseV2):
+    """态度标签定义（可维护，判定逻辑与代码解耦）。"""
+
+    __tablename__ = "stance_tag"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    code = Column(String(32), nullable=False, unique=True)
+    name = Column(String(64), nullable=False)
+    name_i18n = Column(JsonType, nullable=False, default=dict)
+    # 归并到赞同度的三态：agree / neutral / oppose
+    polarity = Column(String(16), nullable=False, server_default="neutral")
+    color = Column(String(16))
+    description = Column(Text)
+    examples = Column(JsonType, nullable=False, default=list)
+    enabled = Column(Boolean, nullable=False, server_default="true")
+    sort_order = Column(Integer, nullable=False, server_default="0")
+    # 命中冲突时的优先级，越小越先匹配
+    priority = Column(Integer, nullable=False, server_default="100")
+    is_fallback = Column(Boolean, nullable=False, server_default="false")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                        onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_stance_tag_enabled", "enabled", "sort_order"),
+    )
+
+
+class StanceTagRule(BaseV2):
+    """标签判定规则（与标签解耦，可单条启停）。"""
+
+    __tablename__ = "stance_tag_rule"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    tag_id = Column(BigInteger, ForeignKey("stance_tag.id", ondelete="CASCADE"),
+                    nullable=False)
+    # keyword 子串 / regex 正则 / sentiment 情感映射 / laughter 纯笑声 / mock 嘲讽句式
+    match_type = Column(String(16), nullable=False, server_default="keyword")
+    pattern = Column(Text, nullable=False)
+    weight = Column(Numeric(4, 2), nullable=False, server_default="1.0")
+    negatable = Column(Boolean, nullable=False, server_default="true")
+    enabled = Column(Boolean, nullable=False, server_default="true")
+    note = Column(String(255))
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                        onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_rule_tag", "tag_id", "enabled"),
+    )
+
+
+class StanceTagVersion(BaseV2):
+    """标签库版本号（单行）：判定进程据此刷新内存缓存。"""
+
+    __tablename__ = "stance_tag_version"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    version = Column(BigInteger, nullable=False, server_default="1")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                        onupdate=func.now())

@@ -214,6 +214,12 @@ export interface StoryRow {
   title: string
   summary: string
   cover_url: string | null
+  /** 帖子首张图的本地副本（优先展示，外链会过期） */
+  cover_local_url: string
+  /** 正文前 50 字，无图时卡片展示 */
+  excerpt: string
+  media_count: number
+  edit_count: number
   category: string | null
   platform: string | null
   author_id: number | null

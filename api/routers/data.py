@@ -305,6 +305,30 @@ async def serve_local_media(platform: str, content_id: str, filename: str):
     )
 
 
+@router.get("/media/placeholder")
+async def media_placeholder(text: str = "无图", w: int = 300, h: int = 400):
+    """占位图：外链失效（原帖删除 / CDN 签名过期）且无本地副本时兜底。
+
+    返回一张内联 SVG，避免列表/详情页出现浏览器默认的破图图标。
+    """
+    w = max(16, min(int(w or 300), 1024))
+    h = max(16, min(int(h or 400), 1024))
+    label = (text or "无图")[:12].replace("<", "").replace("&", "")
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+        f'viewBox="0 0 {w} {h}">'
+        f'<rect width="100%" height="100%" fill="#1a1d29"/>'
+        f'<rect x="1" y="1" width="{w-2}" height="{h-2}" fill="none" '
+        f'stroke="#2a2f45" stroke-width="2" rx="8"/>'
+        f'<text x="50%" y="50%" fill="#5b6480" font-family="monospace" '
+        f'font-size="{max(12, min(w, h) // 10)}" text-anchor="middle" '
+        f'dominant-baseline="middle">{label}</text>'
+        f"</svg>"
+    )
+    return Response(content=svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=3600"})
+
+
 @router.get("/avatar-proxy")
 async def avatar_proxy(url: str):
     """代理平台头像图片。
