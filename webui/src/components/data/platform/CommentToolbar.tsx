@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Search, SlidersHorizontal, MessageSquare, MessageSquareOff } from 'lucide-react'
 
@@ -59,6 +60,8 @@ export interface TagStat {
   code: string
   name: string
   color: string | null
+  /** 归属极性：agree / neutral / oppose（负面表态都是 oppose 的子集） */
+  polarity: string | null
   count: number
 }
 
@@ -83,7 +86,6 @@ export function CommentToolbar({
   onSort,
   onStance,
   onToggleTag,
-  onClearTags,
   onHasReplies,
   onKeyword,
   onToggleReplies,
@@ -102,14 +104,23 @@ export function CommentToolbar({
   showReplies: boolean
   onSort: (v: CommentSort) => void
   onStance: (v: StanceFilter) => void
-  /** 点一个标签切换选中；多选之间是「或」关系 */
+  /** 当前立场下的下钻：传 code 选中该表态，传空串回到该立场全部 */
   onToggleTag?: (code: string) => void
-  onClearTags?: () => void
   onHasReplies: (v: HasRepliesFilter) => void
   onKeyword: (v: string) => void
   onToggleReplies: () => void
 }) {
   const { t } = useTranslation('data')
+
+  /** 当前立场下的细分表态：未选立场时给出全部标签（按极性归类需要分组，
+   *  这里直接全列，数量本来就不多） */
+  const subTags = useMemo(() => {
+    const all = tagStats || []
+    // 未选立场：只列有数据的表态，避免一行塞满 10 个空标签
+    if (!stance) return all.filter((g) => (g.count || 0) > 0)
+    // 已选立场：列该极性下的全部表态（含 0 条，便于知道有哪些细分维度）
+    return all.filter((g) => (g.polarity || 'neutral') === stance)
+  }, [tagStats, stance])
 
   const ratingKey = stats.agreement || ''
   const ratingText = ratingKey ? t(`manage.cmt.rating.${ratingKey.split('.').pop()}`) : ''
@@ -173,8 +184,8 @@ export function CommentToolbar({
           </select>
         </div>
 
-        {/* 立场分段筛选（赞同 / 中立 / 反对） */}
-        <div className="flex items-center gap-1">
+        {/* 立场分段筛选（赞同 / 中立 / 反对）+ 该立场下的细分表态（下钻） */}
+        <div className="flex flex-wrap items-center gap-1">
           <span className="text-[10px] font-mono text-cyber-text-muted">{t('manage.cmt.stance')}</span>
           <div className="flex overflow-hidden rounded border border-cyber-border-subtle">
             {STANCE_OPTIONS.map((o) => (
@@ -192,52 +203,48 @@ export function CommentToolbar({
               </button>
             ))}
           </div>
+          {/* 细分表态：选中某立场后只列该极性下的标签（阴阳/质疑/嘲讽…都是反对的子集） */}
+          {subTags.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1">
+              <span className="text-[10px] font-mono text-cyber-text-muted">›</span>
+              <button
+                type="button"
+                onClick={() => onToggleTag?.('')}
+                className={`rounded border px-1.5 py-[3px] text-[11px] font-mono transition-all ${
+                  !(selectedTags || []).length
+                    ? 'border-cyber-border-DEFAULT bg-cyber-bg-tertiary text-cyber-text-primary'
+                    : 'border-cyber-border-subtle text-cyber-text-muted hover:text-cyber-text-primary'
+                }`}
+                title={t('manage.cmt.tagAllHint', { defaultValue: '该立场下全部表态' })}
+              >
+                {t('manage.cmt.filterAll', { defaultValue: '全部' })}
+              </button>
+              {subTags.map((g) => {
+                const on = (selectedTags || []).includes(g.code)
+                const color = g.color || '#94a3b8'
+                return (
+                  <button
+                    key={g.code}
+                    type="button"
+                    onClick={() => onToggleTag?.(g.code)}
+                    title={`${g.name} · ${g.count} 条`}
+                    className={`flex items-center gap-1 rounded border px-1.5 py-[3px] text-[11px] font-mono transition-all ${
+                      on ? '' : 'opacity-75 hover:opacity-100'
+                    }`}
+                    style={{
+                      borderColor: on ? color : `${color}44`,
+                      background: on ? `${color}26` : 'transparent',
+                      color: on ? color : undefined,
+                    }}
+                  >
+                    <span>{g.name}</span>
+                    <span className="text-[10px] opacity-70">{g.count}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
         </div>
-
-        {/* 态度标签筛选（库表驱动：阴阳 / 无语 / 质疑 / 嘲讽 / 观望 / 神评 …） */}
-        {!!(tagStats || []).length && (
-          <div className="flex min-w-0 flex-wrap items-center gap-1">
-            <span className="text-[10px] font-mono text-cyber-text-muted">
-              {t('manage.cmt.stanceTag', { defaultValue: '表态' })}
-            </span>
-            <button
-              type="button"
-              onClick={() => onClearTags?.()}
-              className={`rounded border px-1.5 py-[3px] text-[11px] font-mono transition-all ${
-                !(selectedTags || []).length
-                  ? 'border-cyber-neon-cyan/50 bg-cyber-neon-cyan/15 text-cyber-neon-cyan'
-                  : 'border-cyber-border-subtle text-cyber-text-muted hover:text-cyber-text-primary'
-              }`}
-            >
-              {t('manage.cmt.filterAll', { defaultValue: '全部' })}
-            </button>
-            {(tagStats || []).map((g) => {
-              const on = (selectedTags || []).includes(g.code)
-              const color = g.color || '#94a3b8'
-              const total = (tagStats || []).reduce((a, b) => a + (b.count || 0), 0)
-              const pct = total > 0 ? Math.round((g.count / total) * 100) : 0
-              return (
-                <button
-                  key={g.code}
-                  type="button"
-                  onClick={() => onToggleTag?.(g.code)}
-                  title={`${g.name} · ${g.count} 条 · 占 ${pct}%`}
-                  className={`flex items-center gap-1 rounded border px-1.5 py-[3px] text-[11px] font-mono transition-all ${
-                    on ? '' : 'opacity-70 hover:opacity-100'
-                  }`}
-                  style={{
-                    borderColor: on ? color : `${color}44`,
-                    background: on ? `${color}26` : 'transparent',
-                    color: on ? color : undefined,
-                  }}
-                >
-                  <span>{g.name}</span>
-                  <span className="text-[10px] opacity-70">{g.count}</span>
-                </button>
-              )
-            })}
-          </div>
-        )}
 
         {/* 是否含回复 */}
         <div className="flex items-center gap-1">

@@ -114,7 +114,8 @@ export function PlatformStoryDetail({
     [commentsQ.data],
   )
   /** 态度标签分布（全量口径，不随筛选变化） */
-  const tagStats: { code: string; name: string; color: string | null; count: number }[] =
+  const tagStats: { code: string; name: string; color: string | null;
+                    polarity: string | null; count: number }[] =
     useMemo(() => commentsQ.data?.pages?.[0]?.tag_stats || [], [commentsQ.data])
 
   const comments = useMemo(() => {
@@ -307,10 +308,18 @@ export function PlatformStoryDetail({
       keyword={cmtKeyword}
       showReplies={showReplies}
       onSort={setCmtSort}
-      onStance={setCmtStance}
-      onToggleTag={(code) => setCmtTags((prev) =>
-        prev.includes(code) ? prev.filter((x) => x !== code) : [...prev, code])}
-      onClearTags={() => setCmtTags([])}
+      onStance={(v) => { setCmtStance(v); setCmtTags([]) }}
+      onToggleTag={(code) => {
+        // 空 code = 回到该立场下全部；否则单选下钻，并把分段按钮切到对应极性
+        if (!code) { setCmtTags([]); return }
+        const g = (tagStats || []).find((x) => x.code === code)
+        if (cmtTags.includes(code)) {
+          setCmtTags([])                       // 再点一次：回到该立场全部
+        } else {
+          setCmtTags([code])
+          if (g?.polarity) setCmtStance(g.polarity as StanceFilter)
+        }
+      }}
       onHasReplies={setCmtHasReplies}
       onKeyword={setCmtKeyword}
       onToggleReplies={() => setShowReplies((v) => !v)}

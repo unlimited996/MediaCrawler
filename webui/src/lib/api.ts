@@ -280,7 +280,7 @@ export const storyApi = {
                                   total: number };
               /** 态度标签分布（库表驱动，含名称/颜色/条数） */
               tag_stats?: { code: string; name: string; color: string | null;
-                            count: number }[] }>(
+                            polarity: string | null; count: number }[] }>(
       `/stories/${id}/comments`,
       { params: { sort, page, page_size, reply_limit, stance, sentiment, tag } }),
   /** 评论表态可选标签（库表驱动，含颜色与极性） */

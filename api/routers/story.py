@@ -523,11 +523,12 @@ async def get_story_comments(
                 "code": t.get("code"),
                 "name": t.get("name"),
                 "color": t.get("color"),
+                "polarity": t.get("polarity"),
                 "count": int(tag_dist.get(t.get("code") or "", 0)),
             } for t in (active_tags() or [])]
         except Exception:
-            tag_stats = [{"code": c, "name": c, "color": None, "count": n}
-                         for c, n in tag_dist.items()]
+            tag_stats = [{"code": c, "name": c, "color": None, "polarity": None,
+                          "count": n} for c, n in tag_dist.items()]
 
         # 情感分布保留作辅助参考
         sent_rows = (await session.execute(
