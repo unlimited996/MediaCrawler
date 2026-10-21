@@ -4,6 +4,7 @@ import { Badge } from '@/components/ui/badge'
 import { useCrawlerStore } from '@/store/crawlerStore'
 import { useCrawlerStatus, usePlatforms } from '@/hooks/useCrawler'
 import { getPlatformTheme } from '@/components/data/platform/platformTheme'
+import { PlatformBrandMark } from '@/components/data/platform/PlatformBrand'
 import { LanguageSwitch } from './LanguageSwitch'
 import { ThemeToggle } from './ThemeToggle'
 
@@ -148,10 +149,7 @@ export function Sidebar({ view, onViewChange, dataPlatform }: SidebarProps) {
               }}
               title={label}
             >
-              <span
-                className="h-1.5 w-1.5 flex-shrink-0 rounded-full"
-                style={{ background: theme.accent }}
-              />
+              <PlatformBrandMark platform={p.value} size={14} />
               {label}
             </button>
           )

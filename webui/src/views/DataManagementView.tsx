@@ -2,17 +2,17 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import {
-  Database, Search, FileDown, Loader2, Users, X, List, LayoutGrid,
+  Search, FileDown, Loader2, Users, X, List, LayoutGrid,
   Heart, MessageSquare, Tag as TagIcon, Eye, Trash2,
 } from 'lucide-react'
 import { storyApi } from '@/lib/api'
-import { usePlatforms } from '@/hooks/useCrawler'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { toast } from 'sonner'
 import { PlatformStoryDetail } from '@/components/data/platform/PlatformDetail'
 import { getPlatformTheme } from '@/components/data/platform/platformTheme'
 import { splitTopics, PlatformAvatar, fmtNum } from '@/components/data/platform/shared'
+import { PlatformBrandMark, PlatformPageHeader } from '@/components/data/platform/PlatformBrand'
 
 type TimeRange = 'all' | 'today' | 'week' | 'month'
 /** 列表 / 网格视图；选择写 localStorage，刷新后保留 */
@@ -159,19 +159,15 @@ function StoryCard({
  * 保证单独复用这个视图也能自己切平台。
  */
 export function DataManagementView({
-  platform: platformProp, onPlatformChange,
+  platform: platformProp,
 }: {
+  /** 当前平台（顶部导航的平台入口传入）；'' = 全部 */
   platform?: string
-  onPlatformChange?: (p: string) => void
 } = {}) {
   const { t } = useTranslation('data')
   const queryClient = useQueryClient()
-  const [innerPlatform, setInnerPlatform] = useState<string>('')
-  const platform = platformProp !== undefined ? platformProp : innerPlatform
-  const setPlatform = (p: string) => {
-    setInnerPlatform(p)
-    onPlatformChange?.(p)
-  }
+  // 平台由顶部导航的平台入口决定（页内不再放下拉，避免重复入口）
+  const platform = platformProp ?? ''
   const [keyword, setKeyword] = useState('')
   const [searchInput, setSearchInput] = useState('')
   const [tag, setTag] = useState('')
@@ -191,9 +187,8 @@ export function DataManagementView({
 
   const pageSize = 20
 
-  // 平台列表复用抓取页的同一个 query（key 与返回结构必须一致，
-  // 否则两个视图切换时会互相覆盖缓存导致渲染崩溃）
-  const { data: platforms } = usePlatforms()
+  // 说明：平台下拉已移除，平台列表 query 随之不再需要；
+  // 若以后要恢复页内切换，复用抓取页的 usePlatforms() 即可（key 必须一致）。
   const tagsQ = useQuery({
     queryKey: ['storyTags'],
     queryFn: async () => (await storyApi.tags(30)).data.items,
@@ -326,26 +321,16 @@ export function DataManagementView({
 
   return (
     <div className="h-full flex flex-col gap-3">
+      {/* 平台品牌头部：标识 + 平台名 + 品牌色，一眼区分当前平台页 */}
+      <PlatformPageHeader platform={platform}>
+        <span className="text-[11px] font-mono text-cyber-text-muted">
+          {total} {t('manage.totalUnit', { defaultValue: '条' })}
+        </span>
+      </PlatformPageHeader>
+
       {/* 筛选区 */}
       <div className="flex items-center gap-2 flex-wrap">
-        <div className="flex items-center gap-1.5">
-          <Database className="w-4 h-4 text-cyber-neon-cyan" />
-          <h2 className="text-base font-mono font-bold text-cyber-text-primary">
-            {t('manage.title')}
-          </h2>
-        </div>
 
-        {/* 平台 */}
-        <select
-          value={platform}
-          onChange={(e) => setPlatform(e.target.value)}
-          className="h-8 px-2 rounded-md text-xs font-mono bg-cyber-bg-tertiary border border-cyber-border-subtle text-cyber-text-primary"
-        >
-          <option value="">{t('manage.allPlatforms')}</option>
-          {(platforms || []).map((p: any) => (
-            <option key={p.value} value={p.value}>{p.label}</option>
-          ))}
-        </select>
 
         {/* 时间范围 */}
         <select
@@ -609,6 +594,8 @@ export function DataManagementView({
               </span>
               <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
+                {/* 平台品牌标识（无 logo 用图标，再没有用品牌色首字） */}
+                <PlatformBrandMark platform={it.platform} size={16} />
                 {/* 发帖人：头像 + 昵称（列表模式昵称固定 2 字 + 省略号，hover 看全名） */}
                 <span className="flex flex-shrink-0 items-center gap-1">
                   <PlatformAvatar

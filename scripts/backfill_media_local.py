@@ -69,7 +69,7 @@ def _find_local(media_dir: Path, sort_order: int) -> Optional[Path]:
 
 async def run(platform: str = "", story_id: Optional[int] = None,
               inline: bool = False) -> Dict[str, int]:
-    stats = {"scanned": 0, "matched": 0, "missed": 0, "inlined": 0}
+    stats = {"scanned": 0, "matched": 0, "missed": 0, "inlined": 0, "counts": 0}
     async with _v2_session() as session:
         if session is None:
             print("[backfill] 数据库不可用")
@@ -129,10 +129,22 @@ async def run(platform: str = "", story_id: Optional[int] = None,
             stats["matched"] += 1
 
         await session.commit()
+
+        # 媒体计数 / 封面：本次扫到的 story 全部刷新（历史已挂过的也要补，
+        # 否则 media_count 停留在 0）
         stories = {row[2].id for row in rows}
         for sid in stories:
             await _refresh_media_count(session, sid)
         await session.commit()
+
+        # 全量补一遍（--all-counts 或首次跑）：没有待回挂媒体的 story 也会被覆盖
+        if not rows or "--all-counts" in sys.argv:
+            all_ids = [r[0] for r in (await session.execute(
+                select(Story.id).where(Story.deleted_at.is_(None)))).all()]
+            for sid in all_ids:
+                await _refresh_media_count(session, sid)
+            await session.commit()
+            stats["counts"] = len(all_ids)
     return stats
 
 
@@ -148,9 +160,17 @@ async def _refresh_media_count(session, story_id: int) -> None:
             MediaAttachment.target_type == "chapter",
             MediaAttachment.target_id.in_(ch_ids))
     )).scalar() or 0
+    cover_id = (await session.execute(
+        select(MediaAttachment.id).where(
+            MediaAttachment.target_type == "chapter",
+            MediaAttachment.target_id.in_(ch_ids),
+            MediaAttachment.media_type == "image")
+        .order_by(MediaAttachment.sort_order.asc()).limit(1)
+    )).scalar()
     story = await session.get(Story, story_id)
     if story is not None:
         story.media_count = int(cnt)
+        story.cover_media_id = cover_id
 
 
 def main() -> None:
@@ -166,7 +186,8 @@ def main() -> None:
             platform = a
     stats = asyncio.run(run(platform=platform, story_id=story_id, inline=inline))
     print(f"[backfill] 扫描 {stats['scanned']} 条 · 回挂成功 {stats['matched']} 条 · "
-          f"本地缺失 {stats['missed']} 条 · 编码入库 {stats['inlined']} 条")
+          f"本地缺失 {stats['missed']} 条 · 编码入库 {stats['inlined']} 条 · "
+          f"刷新媒体计数 {stats['counts']} 篇")
 
 
 if __name__ == "__main__":

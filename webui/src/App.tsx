@@ -72,10 +72,7 @@ function App() {
         ) : view === 'browser' ? (
           <DataExplorer />
         ) : (
-          <DataManagementView
-            platform={dataPlatform}
-            onPlatformChange={setDataPlatform}
-          />
+          <DataManagementView platform={dataPlatform} />
         )}
       </div>
 
