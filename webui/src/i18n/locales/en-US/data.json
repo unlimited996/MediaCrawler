@@ -178,6 +178,8 @@
     "authorFilter": "Authors",
     "authorSearch": "Search authors",
     "authorEmpty": "No matching author",
-    "authorSelected": "{{count}} authors"
+    "authorSelected": "{{count}} authors",
+    "viewList": "List view",
+    "viewGrid": "Grid view"
   }
 }

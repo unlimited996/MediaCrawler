@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import {
-  Database, Search, FileDown, Loader2, Users, X,
+  Database, Search, FileDown, Loader2, Users, X, List, LayoutGrid,
   Heart, MessageSquare, Tag as TagIcon, Eye, Trash2,
 } from 'lucide-react'
 import { storyApi } from '@/lib/api'
@@ -12,9 +12,21 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { toast } from 'sonner'
 import { PlatformStoryDetail } from '@/components/data/platform/PlatformDetail'
 import { getPlatformTheme } from '@/components/data/platform/platformTheme'
-import { splitTopics, PlatformAvatar } from '@/components/data/platform/shared'
+import { splitTopics, PlatformAvatar, fmtNum } from '@/components/data/platform/shared'
 
 type TimeRange = 'all' | 'today' | 'week' | 'month'
+/** 列表 / 网格视图；选择写 localStorage，刷新后保留 */
+type ViewMode = 'list' | 'grid'
+const VIEW_MODE_KEY = 'mc_data_view_mode'
+
+function loadViewMode(): ViewMode {
+  try {
+    return (localStorage.getItem(VIEW_MODE_KEY) as ViewMode) === 'grid' ? 'grid' : 'list'
+  } catch {
+    return 'list'
+  }
+}
+
 
 const DAY_MS = 86_400_000
 
@@ -24,6 +36,108 @@ function fmtTs(ts?: number | null): string {
   const d = new Date(v)
   const p = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/**
+ * 发帖人昵称：列表模式固定只显示前 2 个字符，超出用省略号，hover 显示完整昵称。
+ * 定宽（w-[2.6rem]）+ 不换行，保证多行列表的昵称列对齐、不会因长度不同而错位。
+ */
+function AuthorShortName({ name, className = '' }: { name?: string; className?: string }) {
+  const full = name || '-'
+  const short = full.length > 2 ? `${full.slice(0, 2)}…` : full
+  return (
+    <span
+      title={full}
+      className={`inline-block w-[2.6rem] flex-shrink-0 truncate whitespace-nowrap text-left align-middle ${className}`}
+    >
+      {short}
+    </span>
+  )
+}
+
+/**
+ * 网格卡片（小红书式）：封面固定 3:4、标题最多两行、底部作者 + 互动数据。
+ * 封面裂图（CDN 防盗链）时回落到标题首字色块，不留破图。
+ */
+function StoryCard({
+  it, checked, onCheck, onOpen,
+}: {
+  it: any
+  checked: boolean
+  onCheck: () => void
+  onOpen: () => void
+}) {
+  const theme = getPlatformTheme(it.platform)
+  const [broken, setBroken] = useState(false)
+  const title = splitTopics(it.title).clean || it.title || ''
+  const cover = it.cover_url
+
+  return (
+    <div
+      onClick={onOpen}
+      className="group flex cursor-pointer flex-col overflow-hidden rounded-xl border border-cyber-border-subtle bg-cyber-bg-panel transition-all hover:border-cyber-neon-cyan/40 hover:shadow-md"
+    >
+      {/* 封面：统一 3:4，object-cover 保证不变形 */}
+      <div className="relative w-full flex-shrink-0 overflow-hidden bg-cyber-bg-tertiary aspect-[3/4]">
+        {cover && !broken ? (
+          <img
+            src={cover}
+            alt=""
+            loading="lazy"
+            className="h-full w-full object-cover"
+            onError={() => setBroken(true)}
+          />
+        ) : (
+          <div
+            className="flex h-full w-full items-center justify-center text-2xl font-bold"
+            style={{ color: theme.accent, background: theme.accentSoft }}
+          >
+            {(title || '?').trim().charAt(0) || '?'}
+          </div>
+        )}
+        {/* 勾选框浮在封面左上角；阻止冒泡，避免勾选时误开详情 */}
+        <div className="absolute left-1.5 top-1.5" onClick={(e) => e.stopPropagation()}>
+          <Checkbox
+            checked={checked}
+            onCheckedChange={onCheck}
+            className="h-4 w-4 border-white/70 bg-black/40 data-[state=checked]:border-cyber-neon-cyan data-[state=checked]:bg-cyber-neon-cyan"
+          />
+        </div>
+      </div>
+
+      <div className="flex min-w-0 flex-1 flex-col gap-1 p-2">
+        <h3
+          className="line-clamp-2 text-xs font-normal leading-5 text-cyber-text-primary"
+          title={title}
+        >
+          {title}
+        </h3>
+        {/* 底部：作者头像 + 昵称 + 互动数据 */}
+        <div className="mt-auto flex items-center gap-1.5 pt-0.5">
+          <PlatformAvatar
+            name={it.author || '-'}
+            avatar={it.author_avatar}
+            theme={theme}
+            size={18}
+          />
+          <span
+            className="min-w-0 flex-1 truncate text-[11px] text-cyber-text-secondary"
+            title={it.author || '-'}
+          >
+            {it.author || '-'}
+          </span>
+          <span className="flex flex-shrink-0 items-center gap-0.5 text-[11px] text-cyber-text-muted">
+            <Heart className="h-3 w-3" />
+            {fmtNum(it.like_count)}
+          </span>
+          <span className="hidden flex-shrink-0 items-center gap-0.5 text-[11px] text-cyber-text-muted sm:flex">
+            <MessageSquare className="h-3 w-3" />
+            {fmtNum(it.comment_count)}
+          </span>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 /**
@@ -57,6 +171,11 @@ export function DataManagementView({
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [detailId, setDetailId] = useState<number | null>(null)
+  /** 列表 / 网格视图，选择持久化到 localStorage */
+  const [viewMode, setViewMode] = useState<ViewMode>(loadViewMode)
+  useEffect(() => {
+    try { localStorage.setItem(VIEW_MODE_KEY, viewMode) } catch { /* 隐私模式忽略 */ }
+  }, [viewMode])
 
   const pageSize = 20
 
@@ -336,6 +455,34 @@ export function DataManagementView({
           <option value="comment">{t('manage.sortComment')}</option>
         </select>
 
+        {/* 列表 / 网格视图切换（选择持久化） */}
+        <div className="flex flex-shrink-0 items-center overflow-hidden rounded-md border border-cyber-border-subtle">
+          <button
+            type="button"
+            onClick={() => setViewMode('list')}
+            title={t('manage.viewList', { defaultValue: '列表视图' })}
+            className={`flex h-8 w-8 items-center justify-center transition-all ${
+              viewMode === 'list'
+                ? 'bg-cyber-neon-cyan/20 text-cyber-neon-cyan'
+                : 'text-cyber-text-muted hover:text-cyber-text-primary'
+            }`}
+          >
+            <List className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode('grid')}
+            title={t('manage.viewGrid', { defaultValue: '网格视图' })}
+            className={`flex h-8 w-8 items-center justify-center transition-all ${
+              viewMode === 'grid'
+                ? 'bg-cyber-neon-cyan/20 text-cyber-neon-cyan'
+                : 'text-cyber-text-muted hover:text-cyber-text-primary'
+            }`}
+          >
+            <LayoutGrid className="h-3.5 w-3.5" />
+          </button>
+        </div>
+
         {/* 关键词搜索（回车即搜） */}
         <div className="flex items-center gap-1 ml-auto">
           <input
@@ -412,8 +559,12 @@ export function DataManagementView({
         </div>
       </div>
 
-      {/* 列表 */}
-      <div className="flex-1 overflow-y-auto min-h-0 space-y-1">
+      {/* 列表 / 网格 */}
+      <div className={
+        viewMode === 'grid'
+          ? 'flex-1 overflow-y-auto min-h-0 grid gap-3 grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 content-start'
+          : 'flex-1 overflow-y-auto min-h-0 space-y-1'
+      }>
         {listQ.isLoading ? (
           <div className="text-center py-10 text-cyber-text-muted font-mono animate-pulse">
             {t('manage.loading')}
@@ -424,18 +575,29 @@ export function DataManagementView({
           </div>
         ) : (
           items.map((it) => (
+            viewMode === 'grid' ? (
+              <StoryCard
+                key={it.id}
+                it={it}
+                checked={selected.has(it.id)}
+                onCheck={() => toggle(it.id)}
+                onOpen={() => setDetailId(it.id)}
+              />
+            ) : (
             <div
               key={it.id}
-              className="flex items-start gap-3 px-3 py-2 rounded-md hover:bg-cyber-bg-tertiary/60 transition-colors"
+              onClick={() => setDetailId(it.id)}
+              className="flex cursor-pointer items-start gap-3 px-3 py-2 rounded-md hover:bg-cyber-bg-tertiary/60 transition-colors"
             >
-              <Checkbox
-                checked={selected.has(it.id)}
-                onCheckedChange={() => toggle(it.id)}
-                className="mt-1"
-              />
+              <span className="mt-1" onClick={(e) => e.stopPropagation()}>
+                <Checkbox
+                  checked={selected.has(it.id)}
+                  onCheckedChange={() => toggle(it.id)}
+                />
+              </span>
               <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                {/* 发帖人：头像 + 昵称（头像裂图自动回落名称首字） */}
+                {/* 发帖人：头像 + 昵称（列表模式昵称固定 2 字 + 省略号，hover 看全名） */}
                 <span className="flex flex-shrink-0 items-center gap-1">
                   <PlatformAvatar
                     name={it.author || '-'}
@@ -443,9 +605,10 @@ export function DataManagementView({
                     theme={getPlatformTheme(it.platform)}
                     size={18}
                   />
-                  <span className="max-w-[10rem] truncate text-[11px] font-mono text-cyber-text-secondary">
-                    {it.author || '-'}
-                  </span>
+                  <AuthorShortName
+                    name={it.author || '-'}
+                    className="text-[11px] font-mono text-cyber-text-secondary"
+                  />
                 </span>
                 {/* 标题里的小红书话题（#论文排版[话题]#）不进标题栏 */}
                 <span className="text-sm text-cyber-text-primary truncate" title={it.title}>
@@ -468,13 +631,15 @@ export function DataManagementView({
                 </div>
               </div>
               <Button
-                variant="ghost" size="sm" className="h-7 px-2 font-mono flex-shrink-0"
-                onClick={() => setDetailId(it.id)}
+                variant="ghost" size="sm"
+                className="hidden h-7 px-2 font-mono flex-shrink-0 sm:flex"
+                onClick={(e) => { e.stopPropagation(); setDetailId(it.id) }}
               >
                 <Eye className="w-3 h-3 mr-1" />
                 {t('manage.detail')}
               </Button>
             </div>
+            )
           ))
         )}
       </div>
