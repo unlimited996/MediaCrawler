@@ -702,3 +702,86 @@ class StanceTagVersion(BaseV2):
     version = Column(BigInteger, nullable=False, server_default="1")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(),
                         onupdate=func.now())
+
+
+# ---------------------------------------------------------------------------
+# 14. S3 对象存储配置与媒体备份（P4）
+# ---------------------------------------------------------------------------
+class S3Config(BaseV2, TimestampMixin):
+    """S3 兼容对象存储客户端配置（Garage / MinIO / AWS S3 通用）。
+
+    支持多配置共存 + 启用状态管理；备份任务取 enabled 的第一条。
+    SecretKey 加密落库（account.crypto，Fernet），API 下发只给掩码。
+    """
+
+    __tablename__ = "s3_config"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    name = Column(String(64), nullable=False, unique=True)     # 配置名，如 garage
+    endpoint = Column(String(255), nullable=False)             # http://host:port
+    access_key_id = Column(String(255), nullable=False)        # Key ID
+    secret_cipher = Column(Text, nullable=False)               # Secret Key 密文
+    region = Column(String(64), nullable=False, server_default="garage")
+    bucket = Column(String(128), nullable=False, server_default="photos")
+    # path / virtual：Garage 与自建 MinIO 一般用 path-style
+    addressing_style = Column(String(16), nullable=False, server_default="path")
+    enabled = Column(Boolean, nullable=False, server_default="true")
+
+    # 连通性探测状态（前端展示 + 备份前自检）
+    last_check_at = Column(DateTime(timezone=True))
+    last_check_ok = Column(Boolean)
+    last_error = Column(Text)
+
+    ext = Column(JsonType, nullable=False, default=dict)
+    schema_ver = Column(Integer, nullable=False, server_default="1")
+
+    __table_args__ = (
+        Index("idx_s3_config_enabled", "enabled"),
+    )
+
+
+class MediaBackup(BaseV2, TimestampMixin):
+    """媒体备份记录：一张媒体一行，上传成功后帖子删了也能按 object_key 取回。
+
+    刻意不加外键：story / media_attachment 是硬删除的，FK 会把备份记录
+    一起 Cascade 掉，违背「帖子删除后图片仍可通过备份地址访问」的目标。
+    media_id / story_id 仅作冗余检索字段，允许悬空。
+    """
+
+    __tablename__ = "media_backup"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    media_id = Column(BigInteger, nullable=False)              # 原 media_attachment.id
+    story_id = Column(BigInteger)                               # 冗余：按帖子查备份
+    s3_config_id = Column(BigInteger)                           # 备份到哪个配置（可悬空）
+
+    platform = Column(String(32))
+    content_id = Column(String(255))
+    media_type = Column(String(16), nullable=False, server_default="image")
+    # 对象键：{platform}/{media_type}/{content_id}/{filename}，保留本地目录语义
+    object_key = Column(Text, nullable=False)
+    # 平台远程地址（访问链第三级之外的原始出处，备份时直取的兜底源）
+    source_url = Column(Text)
+    mime_type = Column(String(64))
+    size_bytes = Column(BigInteger)
+    # 内容校验：本地文件算 sha256；远端直取时存 S3 ETag
+    checksum = Column(String(64))
+
+    # pending(待备份/重试中) / uploading / uploaded / failed(重试耗尽，待手动)
+    status = Column(String(16), nullable=False, server_default="pending")
+    retry_count = Column(Integer, nullable=False, server_default="0")
+    max_retries = Column(Integer, nullable=False, server_default="3")
+    # 指数退避：下次可重试时间（pending 且到期才会被批处理选中）
+    next_retry_at = Column(DateTime(timezone=True))
+    last_error = Column(Text)
+    uploaded_at = Column(DateTime(timezone=True))
+
+    ext = Column(JsonType, nullable=False, default=dict)
+    schema_ver = Column(Integer, nullable=False, server_default="1")
+
+    __table_args__ = (
+        Index("uq_backup_media", "media_id", unique=True),
+        Index("idx_backup_status", "status", "next_retry_at"),
+        Index("idx_backup_story", "story_id"),
+        Index("idx_backup_platform", "platform", "status"),
+    )

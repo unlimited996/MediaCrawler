@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import {
   Search, FileDown, Loader2, Users, X, List, LayoutGrid,
-  Heart, MessageSquare, Tag as TagIcon, Eye, Trash2,
+  Heart, MessageSquare, Tag as TagIcon, Eye, Trash2, CheckCircle2,
 } from 'lucide-react'
 import { storyApi } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -115,6 +115,16 @@ function StoryCard({
             className="h-4 w-4 border-white/70 bg-black/40 data-[state=checked]:border-cyber-neon-cyan data-[state=checked]:bg-cyber-neon-cyan"
           />
         </div>
+        {/* 已备份标识（P4）：全部图片/视频已入 S3，帖子删除也不丢图 */}
+        {it.backup_complete && (
+          <div
+            className="absolute right-1.5 top-1.5 flex items-center gap-0.5 rounded-full bg-black/50 px-1.5 py-0.5 text-[10px] text-emerald-300 backdrop-blur-sm"
+            title={`图片/视频已全部备份至 S3（${it.backup_uploaded}/${it.backup_total}）`}
+          >
+            <CheckCircle2 className="h-3 w-3" />
+            <span className="hidden sm:inline">已备份</span>
+          </div>
+        )}
       </div>
 
       <div className="flex min-w-0 flex-1 flex-col gap-1 p-2">

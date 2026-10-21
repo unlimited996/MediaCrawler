@@ -3,9 +3,10 @@ import { StoryEditLogDialog } from '@/components/data/StoryEditLogDialog'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import {
-  ArrowLeft, Loader2, RefreshCw, Trash2, Bell, BellOff, UserPlus, UserCheck, History
+  ArrowLeft, Loader2, RefreshCw, Trash2, Bell, BellOff, UserPlus, UserCheck, History,
+  CheckCircle2, CloudUpload,
 } from 'lucide-react'
-import { crawlerApi, storyApi } from '@/lib/api'
+import { crawlerApi, storyApi, s3BackupApi } from '@/lib/api'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { getPlatformTheme } from './platformTheme'
@@ -286,6 +287,18 @@ export function PlatformStoryDetail({
     },
   })
 
+  // S3 备份此帖（P4）：入队该帖全部媒体并立即执行；已完成时置灰展示进度
+  const backupM = useMutation({
+    mutationFn: () => s3BackupApi.backupStory(storyId),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ['storyDetail', storyId] })
+      toast.success(res.data?.queued
+        ? `已入队 ${res.data.queued} 个媒体，备份执行中`
+        : '该帖媒体均已在备份队列中')
+    },
+    onError: (e: any) => toast.error(`备份失败：${e?.response?.data?.detail || e?.message}`),
+  })
+
   const handleDelete = () => {
     if (!window.confirm(t('manage.deleteConfirm') || '确认【永久删除】这条内容？删除后不可恢复。')) return
     deleteM.mutate()
@@ -431,6 +444,33 @@ export function PlatformStoryDetail({
             </span>
           )}
         </button>
+
+        {/* S3 备份（P4）：全量备份后显示绿色已备份标识；否则可一键入队备份 */}
+        {(d?.backup_total ?? 0) > 0 && (
+          <button
+            type="button"
+            onClick={() => backupM.mutate()}
+            disabled={backupM.isPending}
+            className={`flex h-8 items-center gap-1.5 rounded border px-2 font-mono text-[11px] transition-all disabled:opacity-40 ${
+              d?.backup_complete
+                ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
+                : 'border-cyber-border-DEFAULT text-cyber-text-secondary hover:border-cyber-neon-cyan/40 hover:text-cyber-neon-cyan'
+            }`}
+            title={d?.backup_complete
+              ? '图片/视频已全部备份至 S3，帖子删除后仍可访问；点击可重新入队'
+              : `已备份 ${d?.backup_uploaded}/${d?.backup_total}，点击入队并执行备份`}
+          >
+            {d?.backup_complete ? (
+              <CheckCircle2 className="h-3.5 w-3.5" />
+            ) : (
+              <CloudUpload className="h-3.5 w-3.5" />
+            )}
+            {d?.backup_complete ? '已备份' : '备份此帖'}
+            <span className="rounded bg-cyber-bg-tertiary px-1 text-[10px] text-cyber-text-muted">
+              {d?.backup_uploaded}/{d?.backup_total}
+            </span>
+          </button>
+        )}
 
         <Button
           variant="ghost"

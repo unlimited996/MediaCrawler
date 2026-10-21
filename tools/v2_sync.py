@@ -124,12 +124,15 @@ async def _load_media_index(session, chapter_id: int) -> Dict[str, MediaAttachme
 
 
 async def _upsert_media(session, chapter_id: int, url: str, idx: int,
-                        local_path: str, index: Dict[str, MediaAttachment]) -> str:
+                        local_path: str, index: Dict[str, MediaAttachment],
+                        platform_code: str = "", content_id: str = "",
+                        story_id: Optional[int] = None) -> str:
     """媒体入库：只新增，不删除。
 
     - 新 URL → INSERT（带 storage_type / source_status / downloaded_at）
     - 已有 URL → 只补空字段（local_path / checksum / 存储类型），
       本次抓取没带回来的历史媒体永不删除（story 硬删除才级联）
+    - 入库后顺手入 S3 备份队列（P4，无启用配置时自动跳过）
     """
     lp = local_path or None
     existing = index.get(url)
@@ -151,9 +154,18 @@ async def _upsert_media(session, chapter_id: int, url: str, idx: int,
                     _text("SELECT now()"))).scalar()
             except Exception:
                 pass
+        # 存量/新补的媒体都确保在备份队列里（幂等，media_id 判重）
+        if platform_code:
+            try:
+                from tools.media_backup import enqueue_backup
+
+                await enqueue_backup(session, existing, platform_code,
+                                     content_id, story_id)
+            except Exception:
+                pass
         return "updated"
 
-    session.add(MediaAttachment(
+    media = MediaAttachment(
         target_type="chapter", target_id=chapter_id,
         media_type="image", source_url=url,
         local_path=lp,
@@ -161,8 +173,18 @@ async def _upsert_media(session, chapter_id: int, url: str, idx: int,
         download_status="done" if lp else "pending",
         storage_type="local" if lp else "url",
         source_status="alive" if url else "unknown",
-    ))
-    index[url] = None  # 占位，避免同批重复 URL 重复插入
+    )
+    session.add(media)
+    await session.flush()   # 拿 id 供备份队列引用
+    index[url] = media
+    if platform_code:
+        try:
+            from tools.media_backup import enqueue_backup
+
+            await enqueue_backup(session, media, platform_code,
+                                 content_id, story_id)
+        except Exception:
+            pass
     return "inserted"
 
 async def record_story_edit(session, story_id: int, chapter_id: Optional[int],
@@ -434,7 +456,10 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                             local_path = str(candidate)
                             break
                     await _upsert_media(session, chapter.id, img, idx,
-                                        local_path, _media_index)
+                                        local_path, _media_index,
+                                        platform_code=platform_code,
+                                        content_id=content_id,
+                                        story_id=story.id)
 
                 tag_ids = []
                 for tag_name in _split_list(_pick(item, _TAG_KEYS))[:10]:
@@ -517,7 +542,10 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                                 local_path = str(candidate)
                                 break
                         await _upsert_media(session, chapter.id, img, idx,
-                                            local_path, _media_index)
+                                            local_path, _media_index,
+                                            platform_code=platform_code,
+                                            content_id=content_id,
+                                            story_id=chapter.story_id)
 
                 # 编辑记录：与抓取前的快照比对，有差异才落一条
                 if story is not None:

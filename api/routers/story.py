@@ -19,8 +19,8 @@ from sqlalchemy import and_, delete as sa_delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models_v2 import (
-    Author, Comment, MediaAttachment, SourceSite, Story, StoryChapter,
-    StoryEditLog, StoryTag, Tag,
+    Author, Comment, MediaAttachment, MediaBackup, SourceSite, Story,
+    StoryChapter, StoryEditLog, StoryTag, Tag,
 )
 
 router = APIRouter(prefix="/stories", tags=["story"])
@@ -222,21 +222,55 @@ async def list_stories(
                         f"/api/data/media/{site_codes.get(site_id) or ''}/"
                         f"{content_id}/{p.name}")
 
+        # ---- S3 备份（P4）：封面第三级回退 + 全量备份徽标 ----
+        # 访问链：本地缓存 → 平台远程 → S3 备份（前两级都没有才用备份地址）
+        backup_cover: Dict[int, str] = {}
+        if chapter_ids:
+            b_rows = (await session.execute(
+                select(MediaBackup.object_key, MediaBackup.status,
+                       MediaAttachment.media_type, StoryChapter.story_id)
+                .join(MediaAttachment, MediaBackup.media_id == MediaAttachment.id)
+                .join(StoryChapter, MediaAttachment.target_id == StoryChapter.id)
+                .where(StoryChapter.story_id.in_(ids),
+                       MediaAttachment.target_type == "chapter",
+                       MediaBackup.status == "uploaded")
+                .order_by(MediaAttachment.sort_order.asc())
+            )).all()
+            for _key, _st, _mt, sid in b_rows:
+                # 只取首张已备份的图片做封面回退
+                if sid in backup_cover or _mt != "image":
+                    continue
+                backup_cover[sid] = f"/api/s3-backup/object/{_key}"
+
+        from tools.media_backup import story_backup_state
+
+        backup_state = await story_backup_state(session, ids)
+
+        def _backup_complete(sid: int) -> bool:
+            st = backup_state.get(sid) or {}
+            return st.get("total", 0) > 0 and st.get("uploaded", 0) >= st.get("total", 0)
+
         items = [{
             "id": s.id,
             "title": s.title,
             "summary": (s.summary or "")[:200],
-            # 首张图：本地副本优先（外链会过期），没有再退回外链 / story.cover_url
+            # 首张图：本地副本优先（外链会过期），再平台外链，最后 S3 备份
             "cover_url": (cover_local.get(s.id)
                           or cover_first.get(s.id)
+                          or backup_cover.get(s.id)
                           or s.cover_url or ""),
             "cover_local_url": cover_local.get(s.id) or "",
+            "cover_backup_url": backup_cover.get(s.id) or "",
             # 无图时卡片显示正文前 50 字
             "excerpt": excerpt_map.get(s.id) or (s.summary or "")[:50],
             "category": s.category,
             "platform": site_name.get(s.primary_site_id),
             "media_count": int(s.media_count or 0),
             "edit_count": int(s.edit_count or 0),
+            # 备份进度：全部媒体已入 S3 时前端给「已备份」小标识
+            "backup_total": (backup_state.get(s.id) or {}).get("total", 0),
+            "backup_uploaded": (backup_state.get(s.id) or {}).get("uploaded", 0),
+            "backup_complete": _backup_complete(s.id),
             "author_id": s.author_id,
             "author": (author_map.get(s.author_id) or {}).get("name") or "",
             "author_avatar": (author_map.get(s.author_id) or {}).get("avatar") or "",
@@ -356,6 +390,17 @@ async def get_story(story_id: int):
                 ).order_by(MediaAttachment.sort_order)
             )).scalars().all()
 
+        # S3 备份地址（P4）：本地没了、外链挂了之后的第三级访问来源
+        backup_urls: Dict[int, str] = {}
+        if media:
+            b_rows = (await session.execute(
+                select(MediaBackup.media_id, MediaBackup.object_key)
+                .where(MediaBackup.media_id.in_([m.id for m in media]),
+                       MediaBackup.status == "uploaded")
+            )).all()
+            backup_urls = {mid: f"/api/s3-backup/object/{key}"
+                           for mid, key in b_rows}
+
         author_name = None
         author_avatar = None
         author_url = None
@@ -378,6 +423,11 @@ async def get_story(story_id: int):
                 select(SourceSite.code).where(SourceSite.id == story.primary_site_id)
             )).scalar()
 
+        # 备份进度（P4）：全部媒体已入 S3 时详情页展示「已备份」标识
+        from tools.media_backup import story_backup_detail
+
+        _bk = await story_backup_detail(session, story_id)
+
         return {
             "id": story.id,
             "title": story.title,
@@ -389,6 +439,9 @@ async def get_story(story_id: int):
             "edit_count": int(story.edit_count or 0),
             "edited_at": story.edited_at,
             "platform": platform_code,
+            "backup_total": _bk["total"],
+            "backup_uploaded": _bk["uploaded"],
+            "backup_complete": _bk["complete"],
             "author": author_name,
             "author_avatar": author_avatar or "",
             "author_url": author_url or "",
@@ -423,6 +476,12 @@ async def get_story(story_id: int):
                     f"{Path(m.local_path).name}"
                     if m.local_path else None
                 ),
+                # S3 备份地址（P4）：本地 / 外链都不可用时兜底
+                "backup_url": backup_urls.get(m.id),
+                # 访问链优先级：本地 → 平台远程 → S3 备份
+                "source": ("local" if m.local_path
+                           else ("remote" if m.source_url
+                                 else ("s3" if backup_urls.get(m.id) else "none"))),
                 "sort_order": m.sort_order,
             } for m in media],
         }
@@ -715,6 +774,8 @@ async def _hard_delete_story(session: AsyncSession, story_id: int,
       v1   平台原始表（xhs_note 等）与其评论表 —— 不清会被回填/重拉复活
       v2   homefeed_content（首页流缓存）
       磁盘 附件本地文件，空的内容目录一并清掉
+      保留 media_backup（S3 备份记录）—— 帖子删除后图片仍可靠
+      object_key 从备份地址取回，这是备份机制的存在意义
 
     返回各类删除行数；story 不存在时返回 None。
     注意：已软删除（deleted_at 非空）的记录同样会被物理清掉。
@@ -751,7 +812,10 @@ async def _hard_delete_story(session: AsyncSession, story_id: int,
     )).scalars().all()
 
     # ---- 2. 磁盘上的媒体文件（只删项目 data 目录内的，防误删）----
+    # 注意：S3 备份记录（media_backup）刻意不清——帖子删除后图片仍可
+    # 通过备份地址访问；本地文件删除不影响已上传的对象。
     files_removed = 0
+    backups_kept = 0
     if purge_files:
         try:
             data_root = Path(DATA_DIR).resolve()
@@ -790,6 +854,11 @@ async def _hard_delete_story(session: AsyncSession, story_id: int,
             sa_delete(MediaAttachment).where(
                 MediaAttachment.id.in_([m.id for m in media]))
         )).rowcount or 0
+        # 统计将保留的备份记录数（仅告知，不删除）
+        backups_kept = (await session.execute(
+            select(func.count()).select_from(MediaBackup).where(
+                MediaBackup.media_id.in_([m.id for m in media]))
+        )).scalar() or 0
     tags = (await session.execute(
         sa_delete(StoryTag).where(StoryTag.story_id == story_id))).rowcount or 0
     comments_n = (await session.execute(
@@ -837,7 +906,8 @@ async def _hard_delete_story(session: AsyncSession, story_id: int,
 
     return {"chapters": chapters_n, "comments": comments_n, "media": media_count,
             "tags": tags, "files": files_removed,
-            "legacy_rows": legacy, "homefeed_rows": feed}
+            "legacy_rows": legacy, "homefeed_rows": feed,
+            "backups_kept": backups_kept}
 
 
 @router.post("/batch-delete")

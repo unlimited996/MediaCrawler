@@ -216,6 +216,8 @@ export interface StoryRow {
   cover_url: string | null
   /** 帖子首张图的本地副本（优先展示，外链会过期） */
   cover_local_url: string
+  /** 帖子首张图的 S3 备份地址（本地/外链都不可用时兜底） */
+  cover_backup_url: string
   /** 正文前 50 字，无图时卡片展示 */
   excerpt: string
   media_count: number
@@ -231,6 +233,11 @@ export interface StoryRow {
   heat_score: number
   publish_ts: number | null
   tags: string[]
+  /** S3 备份进度：已备份媒体数 / 媒体总数 */
+  backup_total: number
+  backup_uploaded: number
+  /** 全部图片视频均已备份（卡片右上角小标识） */
+  backup_complete: boolean
 }
 
 /** 详情页关注开关状态（对应后端 /stories/{id}/watch） */
@@ -370,4 +377,99 @@ export const schedulerApi = {
     }),
   listTaskRuns: (taskId: number, limit = 50) =>
     api.get<ScheduledTaskRun[]>(`/scheduler/tasks/${taskId}/runs`, { params: { limit } }),
+}
+
+// ---------------- S3 媒体备份 ----------------
+export interface S3ConfigRow {
+  id: number
+  name: string
+  endpoint: string
+  access_key_id: string
+  /** 掩码后的 Secret（明文永不下发） */
+  secret_masked: string
+  has_secret: boolean
+  region: string
+  bucket: string
+  addressing_style: string
+  enabled: boolean
+  last_check_at: string | null
+  last_check_ok: boolean | null
+  last_error: string | null
+  created_at: string | null
+}
+
+export interface S3BackupItem {
+  id: number
+  media_id: number
+  story_id: number | null
+  platform: string | null
+  content_id: string | null
+  media_type: string
+  object_key: string
+  object_url: string
+  source_url: string | null
+  mime_type: string | null
+  size_bytes: number | null
+  status: 'pending' | 'uploading' | 'uploaded' | 'failed'
+  retry_count: number
+  max_retries: number
+  next_retry_at: string | null
+  last_error: string | null
+  uploaded_at: string | null
+  created_at: string | null
+}
+
+export interface S3BackupStats {
+  configured: boolean
+  config_name?: string
+  by_status: Record<string, { count: number; bytes: number }>
+  pending: number
+  uploading: number
+  uploaded: number
+  failed: number
+  uploaded_bytes: number
+  last_error: string | null
+  last_error_at: string | null
+}
+
+export const s3BackupApi = {
+  // 配置
+  listConfigs: () =>
+    api.get<{ items: S3ConfigRow[] }>('/s3-backup/configs'),
+  createConfig: (p: Partial<S3ConfigRow> & { secret_key: string }) =>
+    api.post<S3ConfigRow>('/s3-backup/configs', p),
+  updateConfig: (id: number, p: Partial<S3ConfigRow> & { secret_key?: string }) =>
+    api.put<S3ConfigRow>(`/s3-backup/configs/${id}`, p),
+  deleteConfig: (id: number) =>
+    api.delete<{ success: boolean; deleted_id: number }>(`/s3-backup/configs/${id}`),
+  toggleConfig: (id: number, enabled: boolean) =>
+    api.post<{ success: boolean; id: number; enabled: boolean }>(
+      `/s3-backup/configs/${id}/toggle`, { enabled }),
+  testSaved: (id: number) =>
+    api.post<{ ok: boolean; latency_ms?: number; error?: string }>(
+      `/s3-backup/configs/${id}/test`),
+  testUnsaved: (p: Record<string, string | number>) =>
+    api.post<{ ok: boolean; latency_ms?: number; error?: string }>(
+      '/s3-backup/configs/test', p),
+  // 备份任务
+  stats: () => api.get<S3BackupStats>('/s3-backup/stats'),
+  run: (limit = 20) =>
+    api.post<{ started: boolean; limit?: number; note?: string }>(
+      '/s3-backup/run', {}, { params: { limit } }),
+  retryFailed: (ids?: number[]) =>
+    api.post<{ reset: number }>('/s3-backup/retry', { ids }),
+  enqueueMissing: () =>
+    api.post<{ started: boolean }>('/s3-backup/enqueue-missing'),
+  listItems: (params: { status?: string; platform?: string; story_id?: number;
+                        page?: number; page_size?: number } = {}) =>
+    api.get<{ items: S3BackupItem[]; total: number; page: number; page_size: number }>(
+      '/s3-backup/items', { params }),
+  retryItem: (id: number) =>
+    api.post<{ reset: number }>(`/s3-backup/items/${id}/retry`),
+  backupStory: (storyId: number, run = true) =>
+    api.post<{ queued: number; media_total: number }>(
+      `/s3-backup/stories/${storyId}/backup`, {}, { params: { run } }),
+  storyStatus: (storyId: number) =>
+    api.get<{ total: number; uploaded: number; complete: boolean }>(
+      `/s3-backup/stories/${storyId}/status`),
 }

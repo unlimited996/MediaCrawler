@@ -197,16 +197,20 @@ export function extractTopics(d: any): { d: any; topics: string[] } {
 
 /** 媒体列表（过滤掉空项）。
  *
- * 优先用 local_url：小红书等 CDN 有防盗链，浏览器 <img> 直连原始
- * source_url 会吃 403 裂图；本地已下载的文件走 /api/data/media/... 路由。
- * 没有本地文件时才退回原始 URL（此时大概率裂图，但总比空白好）。
+ * 访问链（P4，与后端约定）：本地缓存 → 平台远程 → S3 备份。
+ * 小红书等 CDN 有防盗链，浏览器 <img> 直连原始 source_url 会吃 403 裂图；
+ * 本地已下载的文件走 /api/data/media/... 路由；本地没有、外链过期后，
+ * 退回 S3 备份地址 /api/s3-backup/object/...（帖子删除仍可访问）。
  */
-export function pickMedia(d: any): { url: string; local?: boolean }[] {
+export function pickMedia(d: any): { url: string; local?: boolean; source?: string }[] {
   return ((d?.media || []) as any[])
-    .filter((m) => m && (typeof m.local_url === 'string' ? m.local_url : typeof m.url === 'string' && m.url))
+    .filter((m) => m && (typeof m.local_url === 'string' ? m.local_url
+                        : (typeof m.url === 'string' && m.url) || m.backup_url))
     .map((m) => ({
-      url: (m.local_url as string) || (m.url as string),
+      url: (m.local_url as string) || (m.url as string) || (m.backup_url as string),
       local: !!m.local_url,
+      // 实际取图来源：本地 / 平台外链 / S3 备份
+      source: (m.local_url ? 'local' : (m.url ? 'remote' : 's3')) as string,
     }))
 }
 

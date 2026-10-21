@@ -247,6 +247,26 @@ async def _seed(session: AsyncSession) -> Dict[str, int]:
                          "comment, story_chapter, story, author, source_site CASCADE;",
         ))
 
+    # S3 备份配置种子（P4）：库为空时写入 garage 配置，幂等
+    try:
+        from tools.media_backup import ensure_seed_config
+
+        await ensure_seed_config(session)
+    except Exception as e:
+        print(f"[init_v2] S3 种子配置跳过: {e}")
+
+    # S3 / 媒体备份表登记（2026.10.2）
+    ver2 = (await session.execute(
+        select(SchemaMigration).where(SchemaMigration.version == "2026.10.2")
+    )).scalar_one_or_none()
+    if not ver2:
+        session.add(SchemaMigration(
+            version="2026.10.2",
+            alembic_rev=None,
+            description="s3_config + media_backup (media auto backup to S3)",
+            rollback_sql="DROP TABLE IF EXISTS media_backup, s3_config CASCADE;",
+        ))
+
     await session.commit()
     return stats
 

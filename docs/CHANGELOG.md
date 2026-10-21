@@ -5,6 +5,56 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-21] S3 客户端配置持久化与图片自动备份
+
+### 新增
+- **S3 配置持久化**（`s3_config` 表，`tools/media_backup.py` 种子配置）：
+  Endpoint / Key ID / Secret Key（Fernet 加密落库，API 只回掩码）/ Region /
+  Bucket / 寻址方式全字段持久化，支持多配置增删改查与启用状态管理；
+  备份任务取第一个启用配置。首次启动自动写入 garage 种子配置
+  （joyeuse.cn:3900 / photos 桶），幂等按名判重。
+- **媒体自动备份**（`media_backup` 表 + `tools/media_backup.py`）：
+  - 对象键保留本地目录语义 `{platform}/{media_type}/{content_id}/{filename}`
+    （按平台、文件类型分文件夹；CDN 后缀 `!nd_dft_wlteh_webp_3` 也能识别扩展名）；
+  - 新抓取媒体经 `v2_sync._upsert_media` 自动入队；历史媒体一键入队
+    （`POST /s3-backup/enqueue-missing`）；API 启动时起 60s 定时循环自动跑批；
+  - 本地文件优先上传，本地没了自动从平台远程直取（httpx 带 Referer）；
+    上传后 `head_object` 校验大小，不一致按失败处理；
+  - 失败指数退避（60s × 2^n，最多 3 次），耗尽转 failed 待手动重试；
+    批处理并发 4、锁互斥，单条失败不影响整批。
+- **备份记录不随帖子删除**：`media_backup` 刻意不加外键（story 硬删除级联不到它），
+  帖子删除后图片仍可靠 object_key 从备份地址取回；删除接口返回 `backups_kept` 计数。
+- **访问链第三级**：`GET /s3-backup/object/{key}` 流式代理 S3 对象
+  （帖子列表封面与详情媒体按 本地缓存 → 平台远程 → S3 备份 顺序回退，
+  详情 media 增 `backup_url` 与 `source` 字段）。
+- **前端备份管理页**（`views/S3BackupView.tsx`，导航「图片备份」）：
+  配置卡片（启停 / 测试连接 / 编辑 / 删除，Secret 掩码）、统计卡片
+  （待备份 / 已备份 / 失败 / 体积）、备份记录表（状态 / 平台筛选、分页、
+  单条重试、对象地址直开）、立即备份 / 重试失败 / 历史入队操作。
+- **已备份标识**：全部图片视频入 S3 的帖子，网格卡片右上角显示绿色
+  「已备份」小徽标（hover 看 N/N 进度）；详情页顶部按钮显示
+  `已备份 N/N` 或「备份此帖」（点击入队并执行）。
+
+### 变更
+- `account/crypto.py` 拆出通用 `encrypt_text / decrypt_text`，Cookie 加解密委托其上。
+- `api/main.py` 启动任务：建表后种子 S3 配置 + 起 60s 备份循环（无启用配置时静默跳过）。
+- `pickMedia`（shared.tsx）访问链扩展为 local → remote → s3，并输出 `source` 字段。
+
+### 验证
+- boto3 链路自检：连接（head_bucket）→ 上传 → head 校验 → 读回字节一致 → 删除；
+- 真实 garage 上传 88 个媒体（11.7MB），S3 内目录结构
+  `xhs/image/{content_id}/001.webp` 正确，`/api/s3-backup/object/...` 代理 200
+  且字节数与源一致（RIFF/Webp magic 正确）；
+- 重试机制：5 个远端 403 的媒体按 60s→120s→240s 退避重试，耗尽转 failed，
+  `POST /retry` 重置 5 条后重新入队；
+- 删除保留：临时帖子硬删除后 `media_backup` 行存活（返回 `backups_kept: 1`），
+  object_url 仍可构造；media 行已删；
+- 列表 / 详情接口正确返回 `backup_complete`、`backup_uploaded/total`、
+  `cover_backup_url`、media `backup_url/source`；
+- 前端 `tsc -b` 与 `npm run build` 通过。
+
+---
+
 ## [2026-10-21] 修复网格图 404 / 评论表态标签筛选与改判
 
 ### 修复

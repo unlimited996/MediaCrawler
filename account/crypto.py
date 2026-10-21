@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Cookie 加解密：避免账号 Cookie 明文落库。"""
+"""敏感信息加解密：避免账号 Cookie、S3 SecretKey 等明文落库。
+
+密钥来源（优先级）：环境变量 COOKIE_ENC_KEY > data/.cookie_key（首次自动生成）。
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -25,17 +28,26 @@ def _load_or_create_key() -> bytes:
     return key
 
 
-def encrypt_cookie(plain: str) -> str:
+def encrypt_text(plain: str) -> str:
+    """通用加密（Cookie / S3 SecretKey 等敏感串共用）。"""
     if not plain:
         return ""
     return Fernet(_load_or_create_key()).encrypt(plain.encode("utf-8")).decode("utf-8")
 
 
-def decrypt_cookie(cipher: str) -> str:
+def decrypt_text(cipher: str) -> str:
+    """通用解密；key 变更或数据损坏时返回空串，由上层按「未配置」处理。"""
     if not cipher:
         return ""
     try:
         return Fernet(_load_or_create_key()).decrypt(cipher.encode("utf-8")).decode("utf-8")
     except Exception:
-        # key 变更或数据损坏时返回空，让上层按"未登录"处理，不要把密文当 Cookie 用
         return ""
+
+
+def encrypt_cookie(plain: str) -> str:
+    return encrypt_text(plain)
+
+
+def decrypt_cookie(cipher: str) -> str:
+    return decrypt_text(cipher)

@@ -10,6 +10,7 @@ import { HotTimelineView } from '@/views/HotTimelineView'
 import { DataManagementView } from '@/views/DataManagementView'
 import { ScheduledTasksView } from '@/views/ScheduledTasksView'
 import { StanceTagsView } from '@/views/StanceTagsView'
+import { S3BackupView } from '@/views/S3BackupView'
 import { DataExplorer } from '@/components/data/DataExplorer'
 import type { MainView } from '@/components/layout/Sidebar'
 
@@ -74,6 +75,8 @@ function App() {
           <DataExplorer />
         ) : view === 'stance' ? (
           <StanceTagsView />
+        ) : view === 'backup' ? (
+          <S3BackupView />
         ) : (
           <DataManagementView platform={dataPlatform} />
         )}

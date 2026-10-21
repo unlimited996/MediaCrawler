@@ -37,7 +37,7 @@ import config as config_module
 
 from .routers import (crawler_router, data_router, websocket_router, export_router,
                       config_router, story_router, discover_router, accounts_router,
-                      scheduler_router, stance_tags_router)
+                      scheduler_router, stance_tags_router, s3_backup_router)
 
 # Project root directory (used for running subprocesses like uv run main.py)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -127,6 +127,45 @@ async def _install_loop_exception_handler():
     except Exception as e:
         print(f"[stance] 标签库启动失败（不影响 API）：{e}")
 
+    # S3 媒体备份（P4）：确保表存在 + 种子配置，然后起定时备份循环。
+    # 循环每 60s 扫一批到期任务（pending/重试到期），锁互斥不影响 API 主流程。
+    try:
+        from tools.media_backup import (ensure_seed_config,
+                                         enqueue_missing, run_backup_batch)
+
+        async def _s3_backup_boot():
+            try:
+                from config.db_config import resolve_config_db_type
+                from database.db_session import get_async_engine
+                from sqlalchemy.ext.asyncio import AsyncSession
+
+                engine = get_async_engine(resolve_config_db_type())
+                if engine is None:
+                    print("[s3-backup] 非数据库存储，备份功能未启用")
+                    return
+                try:
+                    async with AsyncSession(engine, expire_on_commit=False) as s:
+                        seeded = await ensure_seed_config(s)
+                    if seeded:
+                        print("[s3-backup] 已写入种子配置 garage")
+                finally:
+                    await engine.dispose()
+            except Exception as e:
+                print(f"[s3-backup] 初始化失败（不影响 API）：{e}")
+
+            # 定时循环：先补历史入队，再按批跑；无启用配置时静默跳过
+            while True:
+                try:
+                    await enqueue_missing(limit=200)
+                    await run_backup_batch()
+                except Exception as e:
+                    print(f"[s3-backup] 备份循环异常（继续运行）：{e}")
+                await asyncio.sleep(60)
+
+        asyncio.create_task(_s3_backup_boot())
+    except Exception as e:
+        print(f"[s3-backup] 启动失败（不影响 API）：{e}")
+
 # CORS configuration - allow frontend dev server access
 app.add_middleware(
     CORSMiddleware,
@@ -152,6 +191,7 @@ app.include_router(discover_router, prefix="/api")
 app.include_router(accounts_router, prefix="/api")
 app.include_router(scheduler_router, prefix="/api")
 app.include_router(stance_tags_router, prefix="/api")
+app.include_router(s3_backup_router, prefix="/api")
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
