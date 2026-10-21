@@ -22,6 +22,14 @@ import json
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 from urllib.parse import quote, urlencode
 
+# 子评论（楼中楼）翻页参数：
+# - SUB_COMMENT_PAGE_NUM：每页条数。原写死 10，热门主评论要翻十几页，
+#   限流下很容易中途断掉；提到 30 折中（请求数减半，单页也不超接口上限）。
+# - MAX_SUB_COMMENT_PAGES：单条主评论的翻页上限，防接口一直返回
+#   has_more=true 时死循环。
+SUB_COMMENT_PAGE_NUM = 30
+MAX_SUB_COMMENT_PAGES = 100
+
 import httpx
 from playwright.async_api import BrowserContext, Page
 from tenacity import (
@@ -51,6 +59,7 @@ from .field import SearchNoteType, SearchSortType
 from .help import get_search_id
 from .extractor import XiaoHongShuExtractor
 from .playwright_sign import sign_with_xhshow
+from signer import get_signer
 
 
 class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
@@ -107,20 +116,27 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         else:
             raise ValueError("params or payload is required")
 
-        # 使用 xhshow 纯算法生成签名
-        signs = sign_with_xhshow(
-            uri=url,
-            data=data,
-            cookie_str=self.headers.get("Cookie", ""),
-            method=method,
-        )
+        # 走签名抽象层（默认 xhshow 纯算法）；取不到签名器时回退到原实现
+        cookie_str = self.headers.get("Cookie", "")
+        signer = get_signer("xhs")
+        if signer is not None:
+            try:
+                headers = signer.sign(uri=url, data=data, cookie_str=cookie_str, method=method)
+            except Exception as e:  # 签名失败不能让整个请求静默丢头
+                utils.logger.warning(
+                    f"[XiaoHongShuClient._pre_headers] 签名器异常，回退原实现：{type(e).__name__}: {e}")
+                headers = None
+        else:
+            headers = None
 
-        headers = {
-            "X-S": signs["x-s"],
-            "X-T": signs["x-t"],
-            "x-S-Common": signs["x-s-common"],
-            "X-B3-Traceid": signs["x-b3-traceid"],
-        }
+        if not headers:
+            signs = sign_with_xhshow(uri=url, data=data, cookie_str=cookie_str, method=method)
+            headers = {
+                "X-S": signs["x-s"],
+                "X-T": signs["x-t"],
+                "x-S-Common": signs["x-s-common"],
+                "X-B3-Traceid": signs["x-b3-traceid"],
+            }
         self.headers.update(headers)
         return self.headers
 
@@ -443,6 +459,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
 
         """
         result = []
+        seen_comment_ids: set = set()
         comments_has_more = True
         comments_cursor = ""
         while comments_has_more and len(result) < max_count:
@@ -457,6 +474,10 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 )
                 break
             comments = comments_res["comments"]
+            # 主评论分页之间存在重叠，同一条评论可能出现在多个分页里，
+            # 不去重会导致同一条被重复入库/重复统计（完整率按总数算会严重偏差）。
+            comments = [c for c in comments if c.get("id") not in seen_comment_ids]
+            seen_comment_ids.update(c.get("id") for c in comments if c.get("id"))
             if len(result) + len(comments) > max_count:
                 comments = comments[: max_count - len(result)]
             if callback:
@@ -497,57 +518,88 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             return []
 
         result = []
+        # 跨主评论共享：子评论 ID 全局唯一，同一子评论可能出现在内嵌预览和
+        # 翻页结果里（也可能因分页重叠重复出现），必须去重后再入库。
+        seen_sub_ids: set = set()
         for comment in comments:
             try:
                 note_id = comment.get("note_id")
-                sub_comments = comment.get("sub_comments")
-                if sub_comments and callback:
-                    await callback(note_id, sub_comments)
+                root_comment_id = comment.get("id")
+                sub_count = int(comment.get("sub_comment_count") or 0)
+                inline_subs = comment.get("sub_comments") or []
 
-                sub_comment_has_more = comment.get("sub_comment_has_more")
-                if not sub_comment_has_more:
+                # 1) 主评论响应里内嵌的子评论预览
+                if inline_subs:
+                    fresh = [c for c in inline_subs if c.get("id") not in seen_sub_ids]
+                    seen_sub_ids.update(c.get("id") for c in fresh if c.get("id"))
+                    if fresh and callback:
+                        await callback(note_id, fresh)
+
+                # 2) 判断是否还有更多子评论。
+                #    不能只信 sub_comment_has_more 标志——接口改字段名时会静默漏采；
+                #    用「预览数 < 声明总数」做兜底，保证楼中楼抓全。
+                has_more = bool(comment.get("sub_comment_has_more"))
+                if not has_more and sub_count and len(inline_subs) < sub_count:
+                    has_more = True
+                if not has_more:
                     continue
 
-                root_comment_id = comment.get("id")
-                sub_comment_cursor = comment.get("sub_comment_cursor")
-
-                while sub_comment_has_more:
+                cursor = comment.get("sub_comment_cursor") or ""
+                page = 0
+                while has_more:
+                    page += 1
+                    if page > MAX_SUB_COMMENT_PAGES:
+                        utils.logger.warning(
+                            f"[XiaoHongShuClient.get_comments_all_sub_comments] "
+                            f"root_comment_id: {root_comment_id} 翻页超过 {MAX_SUB_COMMENT_PAGES} 页，停止")
+                        break
                     try:
                         comments_res = await self.get_note_sub_comments(
                             note_id=note_id,
                             root_comment_id=root_comment_id,
                             xsec_token=xsec_token,
-                            num=10,
-                            cursor=sub_comment_cursor,
+                            num=SUB_COMMENT_PAGE_NUM,
+                            cursor=cursor,
                         )
-
-                        if comments_res is None:
-                            utils.logger.info(
-                                f"[XiaoHongShuClient.get_comments_all_sub_comments] No response found for note_id: {note_id}"
-                            )
-                            break
-                        sub_comment_has_more = comments_res.get("has_more", False)
-                        sub_comment_cursor = comments_res.get("cursor", "")
-                        if "comments" not in comments_res:
-                            utils.logger.info(
-                                f"[XiaoHongShuClient.get_comments_all_sub_comments] No 'comments' key found in response: {comments_res}"
-                            )
-                            break
-                        comments = comments_res["comments"]
-                        if callback:
-                            await callback(note_id, comments)
-                        await asyncio.sleep(crawl_interval)
-                        result.extend(comments)
                     except DataFetchError as e:
                         utils.logger.warning(
                             f"[XiaoHongShuClient.get_comments_all_sub_comments] Failed to get sub-comments for note_id: {note_id}, root_comment_id: {root_comment_id}, error: {e}. Skipping this comment's sub-comments."
                         )
-                        break  # Break out of the sub-comment acquisition loop of the current comment and continue processing the next comment
-                    except Exception as e:
-                        utils.logger.error(
-                            f"[XiaoHongShuClient.get_comments_all_sub_comments] Unexpected error when getting sub-comments for note_id: {note_id}, root_comment_id: {root_comment_id}, error: {e}"
+                        break
+
+                    if not isinstance(comments_res, dict):
+                        utils.logger.info(
+                            f"[XiaoHongShuClient.get_comments_all_sub_comments] No response found for note_id: {note_id}"
                         )
                         break
+
+                    page_comments = comments_res.get("comments") or []
+                    # 诊断日志：记录接口真实返回形态。曾出现「每页只回 1 条、
+                    # has_more 立即变 false」导致楼中楼严重漏采，靠这行定位。
+                    utils.logger.info(
+                        f"[XiaoHongShuClient.get_comments_all_sub_comments] "
+                        f"root={root_comment_id} page={page} "
+                        f"keys={sorted(comments_res.keys())} "
+                        f"has_more={comments_res.get('has_more')} "
+                        f"cursor={str(comments_res.get('cursor'))[:48]!r} "
+                        f"got={len(page_comments)} declared={sub_count}")
+
+                    has_more = bool(comments_res.get("has_more")
+                                    or comments_res.get("sub_comment_has_more"))
+                    new_cursor = comments_res.get("cursor") or ""
+                    if not page_comments:
+                        break
+                    if new_cursor and new_cursor == cursor:
+                        # 游标没动：再翻也是同一页，退出防死循环
+                        break
+                    cursor = new_cursor
+
+                    fresh = [c for c in page_comments if c.get("id") not in seen_sub_ids]
+                    seen_sub_ids.update(c.get("id") for c in fresh if c.get("id"))
+                    if fresh and callback:
+                        await callback(note_id, fresh)
+                    await asyncio.sleep(crawl_interval)
+                    result.extend(fresh)
             except Exception as e:
                 utils.logger.error(
                     f"[XiaoHongShuClient.get_comments_all_sub_comments] Error processing comment: {comment.get('id', 'unknown')}, error: {e}. Continuing with next comment."
@@ -618,6 +670,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         callback: Optional[Callable] = None,
         xsec_token: str = "",
         xsec_source: str = "pc_feed",
+        known_note_ids: Optional[set] = None,
     ) -> List[Dict]:
         """
         Get all posts published by specified user, this method will continuously find all post information under a user
@@ -627,6 +680,10 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             callback: Update callback function after one pagination crawl ends
             xsec_token: Verification token
             xsec_source: Channel source
+            known_note_ids: 增量模式已入库的 note_id 集合。
+                传入后：整页笔记全部已存在时停止翻页（主页基本按时间倒序，
+                翻到全旧的一页说明剩下的也都是旧的）；含新笔记的页只把
+                新笔记交给 callback。不传 = 全量模式，行为与原来完全一致。
 
         Returns:
 
@@ -661,7 +718,18 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             if remaining <= 0:
                 break
 
-            notes_to_add = notes[:remaining]
+            if known_note_ids is not None:
+                # 增量模式：本页有未知笔记才继续，且只处理未知的
+                fresh = [n for n in notes
+                         if str(n.get("note_id")) not in known_note_ids]
+                if not fresh:
+                    utils.logger.info(
+                        f"[XiaoHongShuClient.get_all_notes_by_creator] 增量模式："
+                        f"user_id:{user_id} 本页 {len(notes)} 条均已入库，停止翻页")
+                    break
+                notes_to_add = fresh[:remaining]
+            else:
+                notes_to_add = notes[:remaining]
             if callback:
                 await callback(notes_to_add)
 

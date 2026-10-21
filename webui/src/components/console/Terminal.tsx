@@ -4,7 +4,6 @@ import { ChevronDown, ChevronUp, Trash2, RefreshCw } from 'lucide-react'
 import { TerminalLine } from './TerminalLine'
 import { useCrawlerStore } from '@/store/crawlerStore'
 import { Button } from '@/components/ui/button'
-import { DataExplorerDialog } from '@/components/data/DataExplorerDialog'
 
 export function Terminal() {
   const { t } = useTranslation('terminal')
@@ -51,10 +50,7 @@ export function Terminal() {
             )}
           </div>
 
-          {/* Data Explorer */}
-          <DataExplorerDialog />
-
-          {/* Restore logs - 只在有清除标记时显示 */}
+          {/* 恢复日志 - 只在有清除标记时显示 */}
           {clearedAfterLogId !== null && (
             <Button
               variant="ghost"

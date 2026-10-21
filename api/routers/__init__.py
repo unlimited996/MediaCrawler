@@ -19,5 +19,15 @@
 from .crawler import router as crawler_router
 from .data import router as data_router
 from .websocket import router as websocket_router
+from .export import router as export_router
+from .config_admin import router as config_router
+from .story import router as story_router
+from .discover import router as discover_router
+from .accounts import router as accounts_router
+from .scheduler import router as scheduler_router
 
-__all__ = ["crawler_router", "data_router", "websocket_router"]
+__all__ = [
+    "crawler_router", "data_router", "websocket_router",
+    "export_router", "config_router", "story_router", "discover_router",
+    "accounts_router", "scheduler_router",
+]

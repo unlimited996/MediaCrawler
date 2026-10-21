@@ -30,7 +30,8 @@ from constant import zhihu as zhihu_constant
 from model.m_zhihu import ZhihuComment, ZhihuContent, ZhihuCreator
 from tools import utils
 from tools.crawler_util import extract_text_from_html
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.paths import libs_path
+from tools.user_hash import anonymize_user_id, mask_nickname, normalize_avatar, build_profile_url
 
 ZHIHU_SGIN_JS = None
 
@@ -47,7 +48,7 @@ def sign(url: str, cookies: str) -> Dict:
     """
     global ZHIHU_SGIN_JS
     if not ZHIHU_SGIN_JS:
-        with open("libs/zhihu.js", mode="r", encoding="utf-8-sig") as f:
+        with open(libs_path("zhihu.js"), mode="r", encoding="utf-8-sig") as f:
             ZHIHU_SGIN_JS = execjs.compile(f.read())
 
     return ZHIHU_SGIN_JS.call("get_sign", url, cookies)
@@ -123,6 +124,8 @@ class ZhihuExtractor:
         author_info = self._extract_content_or_comment_author(answer.get("author"))
         res.creator_hash = author_info.creator_hash
         res.user_nickname = author_info.user_nickname
+        res.author_avatar = author_info.author_avatar
+        res.author_url = author_info.author_url
         return res
 
     def _extract_article_content(self, article: Dict) -> ZhihuContent:
@@ -150,6 +153,8 @@ class ZhihuExtractor:
         author_info = self._extract_content_or_comment_author(article.get("author"))
         res.creator_hash = author_info.creator_hash
         res.user_nickname = author_info.user_nickname
+        res.author_avatar = author_info.author_avatar
+        res.author_url = author_info.author_url
         return res
 
     def _extract_zvideo_content(self, zvideo: Dict) -> ZhihuContent:
@@ -181,6 +186,8 @@ class ZhihuExtractor:
         author_info = self._extract_content_or_comment_author(zvideo.get("author"))
         res.creator_hash = author_info.creator_hash
         res.user_nickname = author_info.user_nickname
+        res.author_avatar = author_info.author_avatar
+        res.author_url = author_info.author_url
         return res
 
     @staticmethod
@@ -201,6 +208,8 @@ class ZhihuExtractor:
                 author = author.get("member")
             res.creator_hash = anonymize_user_id(author.get("id"))
             res.user_nickname = mask_nickname(author.get("name"))
+            res.author_avatar = normalize_avatar(author.get("avatar_url"))
+            res.author_url = build_profile_url("zhihu", author)
 
         except Exception as e :
             utils.logger.warning(
@@ -252,6 +261,8 @@ class ZhihuExtractor:
         author_info = self._extract_content_or_comment_author(comment.get("author"))
         res.creator_hash = author_info.creator_hash
         res.user_nickname = author_info.user_nickname
+        res.author_avatar = author_info.author_avatar
+        res.author_url = author_info.author_url
         return res
 
     @staticmethod

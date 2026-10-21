@@ -26,7 +26,8 @@ from typing import List
 
 import config
 from var import source_keyword_var
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, mask_nickname, pick_avatar, build_profile_url
+from tools.v2_sync import persist_to_v2
 
 from ._store_impl import *
 
@@ -63,7 +64,9 @@ async def update_bilibili_video(video_item: Dict):
         "desc": video_item_view.get("desc", "")[:500],
         "create_time": video_item_view.get("pubdate"),
         "creator_hash": anonymize_user_id(video_user_info.get("mid")),  # 创作者匿名哈希(不存原始 mid)
-        "nickname": mask_nickname(video_user_info.get("name")),  # 用户昵称(已脱敏)
+        "nickname": mask_nickname(video_user_info.get("name")),  # 用户昵称
+        "author_avatar": pick_avatar(video_user_info),  # 作者头像 URL
+        "author_url": build_profile_url("bili", video_user_info),  # 用户主页 URL（跳转用）
         "liked_count": str(video_item_stat.get("like", "")),
         "disliked_count": str(video_item_stat.get("dislike", "")),
         "video_play_count": str(video_item_stat.get("view", "")),
@@ -79,6 +82,7 @@ async def update_bilibili_video(video_item: Dict):
     }
     utils.logger.info(f"[store.bilibili.update_bilibili_video] bilibili video id:{video_id}, title:{save_content_item.get('title')}")
     await BiliStoreFactory.create_store().store_content(content_item=save_content_item)
+    await persist_to_v2("bili", save_content_item, "content")
 
 
 async def update_up_info(video_item: Dict):
@@ -106,13 +110,16 @@ async def update_bilibili_video_comment(video_id: str, comment_item: Dict):
         "video_id": str(video_id),
         "content": content.get("message"),
         "creator_hash": anonymize_user_id(user_info.get("mid")),  # 创作者匿名哈希(不存原始 mid)
-        "nickname": mask_nickname(user_info.get("uname")),  # 用户昵称(已脱敏)
+        "nickname": mask_nickname(user_info.get("uname")),  # 用户昵称
+        "author_avatar": pick_avatar(user_info),  # 作者头像 URL
+        "author_url": build_profile_url("bili", user_info),  # 用户主页 URL（跳转用）
         "sub_comment_count": str(comment_item.get("rcount", 0)),
         "like_count": like_count,
         "last_modify_ts": utils.get_current_timestamp(),
     }
     utils.logger.info(f"[store.bilibili.update_bilibili_video_comment] Bilibili video comment: {comment_id}, content: {save_comment_item.get('content')}")
     await BiliStoreFactory.create_store().store_comment(comment_item=save_comment_item)
+    await persist_to_v2("bili", save_comment_item, "comment")
 
 
 async def batch_update_bilibili_creator_fans(creator_info: Dict, fans_list: List[Dict]):
@@ -160,7 +167,7 @@ async def update_bilibili_creator_dynamic(creator_info: Dict, dynamic_info: Dict
     save_dynamic_item = {
         "dynamic_id": dynamic_info["dynamic_id"],
         "creator_hash": anonymize_user_id(creator_info.get("id")),  # 创作者匿名哈希(不存原始 ID)
-        "user_name": mask_nickname(creator_info.get("name")),  # 用户名称(已脱敏)
+        "user_name": mask_nickname(creator_info.get("name")),  # 用户名称
         "text": dynamic_info["text"],
         "type": dynamic_info["type"],
         "pub_ts": dynamic_info["pub_ts"],

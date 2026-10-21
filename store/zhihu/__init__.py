@@ -32,6 +32,7 @@ from ._store_impl import (ZhihuCsvStoreImplement,
                                           ZhihuMongoStoreImplement,
                                           ZhihuExcelStoreImplement)
 from tools import utils
+from tools.v2_sync import persist_to_v2
 from var import source_keyword_var
 
 
@@ -83,6 +84,7 @@ async def update_zhihu_content(content_item: ZhihuContent):
     local_db_item.update({"last_modify_ts": utils.get_current_timestamp()})
     utils.logger.info(f"[store.zhihu.update_zhihu_content] zhihu content: {local_db_item}")
     await ZhihuStoreFactory.create_store().store_content(local_db_item)
+    await persist_to_v2("zhihu", local_db_item, "content")
 
 
 
@@ -115,6 +117,7 @@ async def update_zhihu_content_comment(comment_item: ZhihuComment):
     local_db_item.update({"last_modify_ts": utils.get_current_timestamp()})
     utils.logger.info(f"[store.zhihu.update_zhihu_note_comment] zhihu content comment:{local_db_item}")
     await ZhihuStoreFactory.create_store().store_comment(local_db_item)
+    await persist_to_v2("zhihu", local_db_item, "comment")
 
 
 async def save_creator(creator: ZhihuCreator):

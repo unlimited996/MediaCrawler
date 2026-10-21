@@ -14,6 +14,15 @@
     "disclaimer": "For personal learning only, commercial use prohibited",
     "license": "License"
   },
+  "nav": {
+    "crawl": "CRAWL",
+    "discover": "HOT_TIMEMACHINE",
+    "data": "DATA",
+    "tasks": "TASKS",
+    "dataBrowser": "FILES",
+    "config": "CONFIG",
+    "queue": "QUEUE"
+  },
   "action": {
     "loading": "Loading...",
     "skip": "SKIP_CHECK",

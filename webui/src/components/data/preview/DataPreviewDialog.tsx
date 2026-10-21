@@ -42,7 +42,7 @@ export function DataPreviewDialog({ file, open, onOpenChange }: DataPreviewDialo
         <DialogHeader className="flex-shrink-0">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <DialogTitle className="font-mono text-cyber-neon-cyan">
+              <DialogTitle className="font-mono text-cyber-text-primary">
                 {file.name}
               </DialogTitle>
               <Badge variant="outline" className="font-mono text-[10px]">

@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-教学版回归测试：确保爬取/存储链路不再持久化可定位真人的用户个人信息。
+回归测试：确保爬取/存储链路不持久化禁用字段，且昵称按原文完整保留。
 
 覆盖：
 1. ORM 自省 —— database.models 中无禁用列、creator 档案表已删除、内容/评论表含 creator_hash。
 2. 提取层 —— 用 mock API/HTML payload 喂各平台提取器，断言输出 dict 不含禁用字段、
-   不含原始 user_id、昵称已脱敏且不等于原文。
+   不含原始 user_id、昵称与原文一致（已按需求取消脱敏）、头像 URL 原样保留。
 3. 仓库 grep 断言 —— store/ 与 media_platform/ 不再把禁用字段作为存储 dict 的 key。
 """
 import re
-import subprocess
 import pathlib
 
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# 统一的禁用字段名(键)。昵称字段(nickname/user_nickname/screen_name/name/user_name)允许保留(值需脱敏)。
+# 统一的禁用字段名(键)。昵称与头像字段按需求允许保留（原文展示）。
 FORBIDDEN_KEYS = {
     "user_id", "sec_uid", "short_user_id", "user_unique_id", "user_signature",
     "avatar", "user_avatar", "face", "sign", "profile_url", "user_link",
@@ -24,8 +23,10 @@ FORBIDDEN_KEYS = {
     "up_id", "fan_id", "up_name", "fan_name", "up_avatar", "fan_avatar",
     "up_sign", "fan_sign", "mid",
 }
+# 说明：author_avatar 是"平台原始头像 URL"的承载键（经 normalize_avatar 规范化），
+# 不属于上面的禁用键集合，测试扫描按整键精确匹配，不会误伤。
+AVATAR_ALLOWED_KEYS = {"author_avatar"}
 NICK_KEYS = {"nickname", "user_nickname", "screen_name", "name", "user_name"}
-MASK_RE = re.compile(r"^.?\*{1,4}.?$")
 
 
 # ----------------------------- ORM 自省 -----------------------------
@@ -73,27 +74,25 @@ def _check_no_forbidden_keys(d: dict, label: str):
     assert not hit, f"[{label}] 输出仍含禁用字段键: {hit}"
 
 
-def _check_nickname_masked(d: dict, raw: str, label: str):
+def _check_nickname_kept(d: dict, raw: str, label: str):
     nick_keys = set(d.keys()) & NICK_KEYS
-    assert nick_keys, f"[{label}] 未保留任何昵称字段(应保留并脱敏)"
+    assert nick_keys, f"[{label}] 未保留任何昵称字段(应保留原文)"
     for k in nick_keys:
         val = d[k]
         if val in ("", None):
             continue
-        assert val != raw, f"[{label}] {k} 未脱敏，仍为原文: {val}"
-        assert MASK_RE.match(val) or "*" in val, f"[{label}] {k} 未脱敏: {val}"
+        assert val == raw, f"[{label}] {k} 与原文不一致: {val!r} != {raw!r}"
 
 
-def test_mask_and_hash_tools():
+def test_hash_tool():
     from tools.user_hash import anonymize_user_id, mask_nickname
     h = anonymize_user_id("12345")
     assert h and h != "12345" and re.fullmatch(r"[0-9a-f]{16}", h)
     assert anonymize_user_id(None) == "" and anonymize_user_id("") == ""
-    # 昵称脱敏：首尾留1字、中间星号，且不等于原文
-    assert mask_nickname("张三丰") != "张三丰"
-    assert "*" in mask_nickname("张三丰")
+    # 昵称直通：取消脱敏后原样返回
+    assert mask_nickname("张三丰") == "张三丰"
     assert mask_nickname(None) == ""
-    assert mask_nickname("a") == "*"
+    assert mask_nickname("a") == "a"
 
 
 def test_xhs_note_extraction_masks_user_info():
@@ -126,7 +125,7 @@ def test_xhs_note_extraction_masks_user_info():
         xs.XhsStoreFactory.create_store = orig
     _check_no_forbidden_keys(captured, "xhs_note")
     assert captured.get("creator_hash") != "u123"
-    _check_nickname_masked(captured, "小红同学", "xhs_note")
+    _check_nickname_kept(captured, "小红同学", "xhs_note")
 
 
 def test_tieba_note_extraction_masks_user_info():
@@ -142,7 +141,7 @@ def test_tieba_note_extraction_masks_user_info():
     d = note.model_dump()
     _check_no_forbidden_keys(d, "tieba_note")
     assert d.get("creator_hash")  # user_link 已转哈希
-    _check_nickname_masked(d, "贴吧老哥", "tieba_note")
+    _check_nickname_kept(d, "贴吧老哥", "tieba_note")
 
 
 def test_tieba_comment_extraction_masks_user_info():
@@ -158,7 +157,7 @@ def test_tieba_comment_extraction_masks_user_info():
     assert comments
     d = comments[0].model_dump()
     _check_no_forbidden_keys(d, "tieba_comment")
-    _check_nickname_masked(d, "评论员", "tieba_comment")
+    _check_nickname_kept(d, "评论员", "tieba_comment")
 
 
 def test_zhihu_comment_extraction_masks_user_info():
@@ -176,7 +175,7 @@ def test_zhihu_comment_extraction_masks_user_info():
     d = comments[0].model_dump() if hasattr(comments[0], "model_dump") else vars(comments[0])
     _check_no_forbidden_keys(d, "zhihu_comment")
     assert "creator_hash" in d and d["creator_hash"]
-    _check_nickname_masked(d, "知乎答主", "zhihu_comment")
+    _check_nickname_kept(d, "知乎答主", "zhihu_comment")
 
 
 def test_bilibili_video_dict_masks_user_info():
@@ -208,31 +207,47 @@ def test_bilibili_video_dict_masks_user_info():
         bs.BiliStoreFactory.create_store = orig
     _check_no_forbidden_keys(captured, "bili_video")
     assert captured.get("creator_hash") != 777
-    _check_nickname_masked(captured, "UP主大人", "bili_video")
+    _check_nickname_kept(captured, "UP主大人", "bili_video")
 
 
-# ----------------------------- 仓库 grep 断言 -----------------------------
+# ----------------------------- 仓库扫描断言 -----------------------------
+# 说明：原实现用 subprocess 调 grep，在 Windows 上会挂起（grep 不在 Python
+# 子进程可见的 PATH 中）。改为 Python 原生遍历，跨平台可跑。
+
+_DICT_KEY_RE = re.compile(r'"(' + "|".join(FORBIDDEN_KEYS) + r')"\s*:')
+_ORM_IMPORT_RE = re.compile(
+    r"from database\.models import.*(XhsCreator|DyCreator|WeiboCreator|TiebaCreator|ZhihuCreator|BilibiliUpInfo|BilibiliContactInfo)"
+)
+
+
+def _scan_store() -> list:
+    """遍历 store/ 下所有 .py，返回 (路径, 行号, 行内容) 列表。"""
+    hits = []
+    for path in sorted((ROOT / "store").rglob("*.py")):
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            hits.append((str(path.relative_to(ROOT)), i, line))
+    return hits
+
 
 def test_store_no_forbidden_dict_keys():
     # store/ 下不得把禁用字段作为存储 dict 的 key("field": value 形式)
-    out = subprocess.run(
-        ["grep", "-rnE", '"(' + "|".join(FORBIDDEN_KEYS) + r')"\s*:', str(ROOT / "store")],
-        capture_output=True, text=True,
-    )
-    # 允许的例外：Mongo store_creator 里的 query={"user_id": ...} 已全部改为 pass，应为空
-    assert out.stdout.strip() == "", f"store/ 仍写入禁用字段键:\n{out.stdout}"
+    bad = [
+        f"{p}:{n}: {line.strip()}"
+        for p, n, line in _scan_store()
+        if _DICT_KEY_RE.search(line)
+    ]
+    assert not bad, "store/ 仍写入禁用字段键:\n" + "\n".join(bad)
 
 
 def test_store_no_creator_orm_imports():
     # 已删除的 creator ORM 表(XhsCreator/DyCreator/...)不得再从 database.models 导入。
     # 注意:model/m_*.py 里的同名 pydantic 类是内存类型，允许保留。
-    out = subprocess.run(
-        ["grep", "-rnE",
-         r"from database\.models import.*(XhsCreator|DyCreator|WeiboCreator|TiebaCreator|ZhihuCreator|BilibiliUpInfo|BilibiliContactInfo)",
-         str(ROOT / "store")],
-        capture_output=True, text=True,
-    )
-    assert out.stdout.strip() == "", f"store/ 仍 import 已删除的 creator ORM 表:\n{out.stdout}"
+    bad = [
+        f"{p}:{n}: {line.strip()}"
+        for p, n, line in _scan_store()
+        if _ORM_IMPORT_RE.search(line)
+    ]
+    assert not bad, "store/ 仍 import 已删除的 creator ORM 表:\n" + "\n".join(bad)
 
 
 if __name__ == "__main__":

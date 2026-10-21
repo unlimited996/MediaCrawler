@@ -1,0 +1,51 @@
+# 打镜像时不该进上下文的东西
+#
+# 重点：
+#  - .env 含数据库口令/中间件地址，**绝不能**打进镜像（运行时由 compose env_file 注入）
+#  - .venv / node_modules 是本机产物，进镜像只会拖慢构建
+#  - browser_data / data 是运行时数据，走 volume 挂载，不进镜像
+
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
+.workbuddy
+.pytest_cache
+.mypy_cache
+.pre-commit-config.yaml
+.python-version
+
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyi
+
+.venv
+venv
+node_modules
+webui/node_modules
+
+test
+tests
+_t_queue.py
+_test_queue_flow.py
+
+docs
+examples
+
+.env
+.env.*
+!.env.example
+
+*.log
+logs
+tmp
+.tmp
+cache
+
+# 运行时数据：容器里通过 volume 挂载，保持镜像干净
+browser_data
+data
+database/*.db

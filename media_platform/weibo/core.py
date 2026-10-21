@@ -387,6 +387,9 @@ class WeiboCrawler(AbstractCrawler):
     ) -> BrowserContext:
         """Launch browser and create browser context"""
         utils.logger.info("[WeiboCrawler.launch_browser] Begin create browser context ...")
+        from tools.crawler_util import chromium_launch_kwargs
+        # playwright 期望的 Chromium 版本缺失时回退到本机已装版本
+        fallback_kwargs = chromium_launch_kwargs(chromium)
         if config.SAVE_LOGIN_STATE:
             user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
             browser_context = await chromium.launch_persistent_context(
@@ -399,11 +402,12 @@ class WeiboCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
-                channel="chrome",  # Use system's Chrome stable version
+                **fallback_kwargs,
+                channel=None if fallback_kwargs else "chrome",  # Use system's Chrome stable version
             )
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel="chrome")  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel=None if fallback_kwargs else "chrome", **fallback_kwargs)  # type: ignore
             browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             return browser_context
 

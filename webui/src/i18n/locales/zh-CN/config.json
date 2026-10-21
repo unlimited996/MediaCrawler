@@ -25,7 +25,7 @@
     "startPage": "起始页",
     "keywords": "关键词",
     "keywordsHint": "输入关键词后按回车添加",
-    "keywordsPlaceholder": "输入关键词，按回车添加...",
+    "keywordsPlaceholder": "输入搜索关键词，多个用逗号分隔",
     "specifiedIds": "帖子/视频 ID",
     "specifiedIdsHint": "输入帖子或视频的ID/URL，每行一个或用逗号分隔",
     "specifiedIdsPlaceholder": {
@@ -58,7 +58,15 @@
     "downloadMedia": "下载媒体",
     "downloadMediaHint": "下载封面与视频（图文笔记下载图片），支持小红书/抖音/快手/B站/微博",
     "headlessMode": "无头模式",
-    "headlessModeHint": "无 GUI 运行浏览器"
+    "headlessModeHint": "无 GUI 运行浏览器",
+    "keywordsRequired": "请先输入搜索关键词",
+    "keywordsEnterHint": "多个关键词用英文逗号分隔，按回车直接开始搜索",
+    "linkDetected": "已识别{{platform}}链接，已自动切换平台并进入详情模式",
+    "linkUnknown": "无法识别该链接所属平台，请检查链接是否正确",
+    "linkHint": "支持直接粘贴帖子/视频链接：识别成功后自动切换平台并进入详情模式",
+    "specifiedIdsRequired": "请先输入笔记/视频 ID 或链接",
+    "creatorIdsRequired": "请先输入创作者 ID",
+    "saveOptionUnavailable": "当前选择的「{{option}}」不可用（未配置或连接失败），请重新选择"
   },
   "button": {
     "initiateScan": "开始爬虫",
@@ -69,5 +77,37 @@
   "warning": {
     "cookieSlider": "[提示] 小红书和抖音平台不建议使用 Cookie 登录，因为可能会触发滑块验证",
     "xhsToken": "[重要] 小红书 URL 必须包含 xsec_token 参数，请从浏览器复制完整 URL"
+  },
+  "saveOption": {
+    "jsonl": "JSONL 文件",
+    "json": "JSON 文件",
+    "csv": "CSV 文件",
+    "excel": "Excel 文件",
+    "sqlite": "SQLite 数据库",
+    "postgres": "PostgreSQL 数据库",
+    "db": "MySQL 数据库"
+  },
+  "queue": {
+    "title": "抓取队列",
+    "description": "爬虫忙时新任务自动排队，前一个跑完按顺序续跑",
+    "pending": "待执行",
+    "running": "执行中",
+    "done": "完成",
+    "failed": "失败",
+    "paused": "已暂停",
+    "add": "加入队列",
+    "addToQueue": "加入队列",
+    "noTarget": "请先在上方填写采集目标",
+    "addCount": "加入队列 ({{count}})",
+    "resume": "继续队列",
+    "retryFailed": "重试失败",
+    "clearDone": "清已完成",
+    "clearAll": "全部清空",
+    "empty": "队列为空",
+    "qrcodeTitle": "请使用小红书 App 扫描上方二维码",
+    "qrcodeHint": "扫码并确认后会自动继续抓取，无需其他操作。二维码 5 分钟内有效，过期请重新启动任务。",
+    "qrcodeWaiting": "等待扫码",
+    "qrcodeAlt": "登录二维码",
+    "emptyHint": "在左侧「目标配置」填好目标后点「加入队列」"
   }
 }

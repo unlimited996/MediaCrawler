@@ -45,6 +45,7 @@ from media_platform.xhs import XiaoHongShuCrawler
 from media_platform.zhihu import ZhihuCrawler
 from tools.async_file_writer import AsyncFileWriter
 from var import crawler_type_var
+from config.runtime_config import runtime_config
 
 
 class CrawlerFactory:
@@ -97,6 +98,24 @@ async def _generate_wordcloud_if_needed() -> None:
         print(f"[Main] Error generating wordcloud: {e}")
 
 
+async def _backfill_comment_links() -> None:
+    """抓取结束后补齐评论层级（parent_id / root_id / depth）。
+
+    实时同步时子评论经常先于父评论落库，写入阶段只能把父评论原始 ID 暂存在
+    ext.parent_comment_id，等父评论到达后再补关系。不补的后果：所有评论都平铺成
+    depth=0 且 root_id 为空，详情页按 root_id 取楼中楼时一条都取不到
+    ——表现就是「子评论抓了但一个都不显示」。幂等，可反复执行。
+    """
+    try:
+        from tools.v2_sync import backfill_comment_links
+
+        updated = await backfill_comment_links(config.PLATFORM)
+        if updated:
+            print(f"[Main] 评论层级回填：{updated} 条回复已挂到对应父评论下")
+    except Exception as e:
+        print(f"[Main] 评论层级回填失败（不影响已抓取数据）：{e}")
+
+
 async def main() -> None:
     global crawler
 
@@ -106,12 +125,27 @@ async def main() -> None:
         print(f"Database {args.init_db} initialized successfully.")
         return
 
+    # 搜索模式必须显式给关键词：没有默认值，不给就拒绝启动
+    if config.CRAWLER_TYPE == "search" and not (config.KEYWORDS or "").strip():
+        print("[错误] 搜索模式必须提供关键词，请用 --keywords 指定（多个用英文逗号分隔）。"
+              "项目不再内置默认关键词，避免误抓无关内容。")
+        return
+
     # 数据库保存模式下自动建表，避免首次运行时出现 no such table 错误
     if config.SAVE_DATA_OPTION in ("sqlite", "mysql", "db", "postgres"):
         await db.init_db(config.SAVE_DATA_OPTION)
 
+    # 加载运行时配置（库表优先，取不到时自动回退到 base_config 常量）
+    try:
+        await runtime_config.load()
+    except Exception as e:
+        print(f"[Main] 运行时配置加载失败，使用默认常量：{e}")
+
     crawler = CrawlerFactory.create_crawler(platform=config.PLATFORM)
     await crawler.start()
+
+    # 评论是零散落库的（子评论可能先于父评论到），父子关系要等抓完才能补齐
+    await _backfill_comment_links()
 
     _flush_excel_if_needed()
 

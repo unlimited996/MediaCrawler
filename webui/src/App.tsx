@@ -2,12 +2,19 @@ import { useState } from 'react'
 import { Toaster } from 'sonner'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { MainContent } from '@/components/layout/MainContent'
-import { AuthorFooter } from '@/components/layout/AuthorFooter'
-import { CrawlerConfigPanel } from '@/components/config/CrawlerConfigPanel'
+import { CrawlLeftPanel } from '@/components/layout/CrawlLeftPanel'
+import { LoginQrcodeFab } from '@/components/layout/LoginQrcodeFab'
 import { EnvironmentCheck, isEnvChecked } from '@/components/env/EnvironmentCheck'
 import { LicenseDisclaimer, isLicenseAccepted } from '@/components/license/LicenseDisclaimer'
+import { HotTimelineView } from '@/views/HotTimelineView'
+import { DataManagementView } from '@/views/DataManagementView'
+import { ScheduledTasksView } from '@/views/ScheduledTasksView'
+import { DataExplorer } from '@/components/data/DataExplorer'
+import type { MainView } from '@/components/layout/Sidebar'
 
 function App() {
+  // 主视图：抓取 / 热搜时光机 / 数据管理 / 数据浏览
+  const [view, setView] = useState<MainView>('crawl')
   // Initialize by checking localStorage if license has been accepted
   const [licenseAccepted, setLicenseAccepted] = useState(() => isLicenseAccepted())
   // Initialize by checking localStorage if env check has passed
@@ -41,21 +48,35 @@ function App() {
       )}
 
       {/* Header Bar */}
-      <Sidebar onShowDisclaimer={handleShowDisclaimer} />
+      <Sidebar
+        onShowDisclaimer={handleShowDisclaimer}
+        view={view}
+        onViewChange={setView}
+      />
 
       {/* Main Area */}
       <div className="flex-1 flex flex-col gap-4 p-4 overflow-hidden min-h-0">
-        {/* Config Panel - Primary Action Area (Always Expanded) */}
-        <div className="flex-shrink-0">
-          <CrawlerConfigPanel />
-        </div>
+        {view === 'crawl' ? (
+          <div className="flex-1 flex gap-4 overflow-hidden min-h-0">
+            {/* 左侧：配置 / 队列 互斥切换（不同时出现） */}
+            <CrawlLeftPanel />
 
-        {/* Console - Collapsible Terminal */}
-        <MainContent />
+            {/* 右侧：控制台独占，全屏 */}
+            <MainContent />
+          </div>
+        ) : view === 'discover' ? (
+          <HotTimelineView />
+        ) : view === 'tasks' ? (
+          <ScheduledTasksView />
+        ) : view === 'browser' ? (
+          <DataExplorer />
+        ) : (
+          <DataManagementView />
+        )}
       </div>
 
-      {/* Author Footer */}
-      <AuthorFooter />
+      {/* 扫码登录二维码：全局浮动可收纳，任何页面都能扫 */}
+      <LoginQrcodeFab />
 
       {/* Toast notifications - Theme-aware style */}
       <Toaster

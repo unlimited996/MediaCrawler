@@ -24,6 +24,17 @@ from .crawler import (
     CrawlerStartRequest,
     CrawlerStatusResponse,
     LogEntry,
+    QueueAddRequest,
+    QueueItem,
+    QueueListResponse,
+)
+from .scheduler import (
+    ScheduledTaskCreate,
+    ScheduledTaskUpdate,
+    ScheduledTaskOut,
+    ScheduledTaskRunOut,
+    SchedulerStatusOut,
+    TaskOptions,
 )
 
 __all__ = [
@@ -34,4 +45,13 @@ __all__ = [
     "CrawlerStartRequest",
     "CrawlerStatusResponse",
     "LogEntry",
+    "QueueAddRequest",
+    "QueueItem",
+    "QueueListResponse",
+    "ScheduledTaskCreate",
+    "ScheduledTaskUpdate",
+    "ScheduledTaskOut",
+    "ScheduledTaskRunOut",
+    "SchedulerStatusOut",
+    "TaskOptions",
 ]

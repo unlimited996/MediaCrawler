@@ -35,6 +35,7 @@ from constant import zhihu as zhihu_constant
 from model.m_zhihu import ZhihuComment, ZhihuContent, ZhihuCreator
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
+from tools.crawler_util import safe_int
 
 if TYPE_CHECKING:
     from proxy.proxy_ip_pool import ProxyIpPool
@@ -353,7 +354,8 @@ class ZhiHuClient(AbstractApiClient, ProxyRefreshMixin):
 
         all_sub_comments: List[ZhihuComment] = []
         for parment_comment in comments:
-            if parment_comment.sub_comment_count == 0:
+            # sub_comment_count 可能为空或字符串，直接 == 0 判断会把无回复的评论也请求一遍
+            if safe_int(parment_comment.sub_comment_count) <= 0:
                 continue
 
             is_end: bool = False

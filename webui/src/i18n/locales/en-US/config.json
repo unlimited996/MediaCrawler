@@ -25,7 +25,7 @@
     "startPage": "START_PAGE",
     "keywords": "KEYWORDS",
     "keywordsHint": "Press Enter to add keyword",
-    "keywordsPlaceholder": "Type keyword, press Enter to add...",
+    "keywordsPlaceholder": "Enter keywords, comma separated",
     "specifiedIds": "POST/VIDEO_ID",
     "specifiedIdsHint": "Enter post or video ID/URL, one per line or comma-separated",
     "specifiedIdsPlaceholder": {
@@ -58,7 +58,15 @@
     "downloadMedia": "DOWNLOAD_MEDIA",
     "downloadMediaHint": "Download cover and video (images for image posts). Supports xhs/dy/ks/bili/wb",
     "headlessMode": "HEADLESS_MODE",
-    "headlessModeHint": "Run browser without GUI"
+    "headlessModeHint": "Run browser without GUI",
+    "keywordsRequired": "Please enter search keywords first",
+    "keywordsEnterHint": "Separate keywords with commas, press Enter to start",
+    "linkDetected": "Detected {{platform}} link, platform switched and detail mode enabled",
+    "linkUnknown": "Cannot identify the platform of this link, please check the URL",
+    "linkHint": "Paste a post/video link: platform and detail mode switch automatically",
+    "specifiedIdsRequired": "Please enter note/video IDs or links first",
+    "creatorIdsRequired": "Please enter creator IDs first",
+    "saveOptionUnavailable": "Selected \"{{option}}\" is unavailable (not configured or unreachable), please pick another"
   },
   "button": {
     "initiateScan": "INITIATE SCAN",
@@ -69,5 +77,37 @@
   "warning": {
     "cookieSlider": "[Note] Cookie login is not recommended for Xiaohongshu and Douyin due to slider captcha",
     "xhsToken": "[Important] Xiaohongshu URLs must contain xsec_token parameter, please copy the full URL from browser"
+  },
+  "saveOption": {
+    "jsonl": "JSONL File",
+    "json": "JSON File",
+    "csv": "CSV File",
+    "excel": "Excel File",
+    "sqlite": "SQLite Database",
+    "postgres": "PostgreSQL Database",
+    "db": "MySQL Database"
+  },
+  "queue": {
+    "title": "Crawl Queue",
+    "description": "New targets queue up while the crawler is busy, and run in order",
+    "pending": "Pending",
+    "running": "Running",
+    "done": "Done",
+    "failed": "Failed",
+    "paused": "Paused",
+    "add": "Add to queue",
+    "addToQueue": "Add to queue",
+    "noTarget": "Fill in a target above first",
+    "addCount": "Add to queue ({{count}})",
+    "resume": "Resume",
+    "retryFailed": "Retry failed",
+    "clearDone": "Clear done",
+    "clearAll": "Clear all",
+    "empty": "Queue is empty",
+    "qrcodeTitle": "Scan the QR code above with the Xiaohongshu app",
+    "qrcodeHint": "After confirming, crawling resumes automatically. The code expires in 5 minutes; restart the task if it lapses.",
+    "qrcodeWaiting": "Waiting for scan",
+    "qrcodeAlt": "Login QR code",
+    "emptyHint": "Set a target on the left, then click \"Add to queue\""
   }
 }

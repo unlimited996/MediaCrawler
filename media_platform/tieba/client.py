@@ -32,6 +32,7 @@ from base.base_crawler import AbstractApiClient
 from model.m_baidu_tieba import TiebaComment, TiebaCreator, TiebaNote
 from proxy.proxy_ip_pool import ProxyIpPool
 from tools import utils
+from tools.crawler_util import safe_int
 
 from .field import SearchNoteType, SearchSortType
 from .help import TieBaExtractor
@@ -539,11 +540,13 @@ class BaiduTieBaClient(AbstractApiClient):
         all_sub_comments: List[TiebaComment] = []
 
         for parment_comment in comments:
-            if parment_comment.sub_comment_count == 0:
+            # sub_comment_count 可能是接口返回的字符串，"0" != 0 且不能整除，必须转 int
+            sub_comment_count = safe_int(parment_comment.sub_comment_count)
+            if sub_comment_count <= 0:
                 continue
 
             current_page = 1
-            max_sub_page_num = parment_comment.sub_comment_count // 10 + 1
+            max_sub_page_num = sub_comment_count // 10 + 1
 
             while max_sub_page_num >= current_page:
                 # Construct sub-comment URL

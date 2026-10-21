@@ -24,6 +24,7 @@ import os
 # import random  # Removed as we now use fixed config.CRAWLER_MAX_SLEEP_SEC intervals
 from asyncio import Task
 from typing import Dict, List, Optional, Tuple, cast
+from urllib.parse import quote
 
 from playwright.async_api import (
     BrowserContext,
@@ -123,14 +124,29 @@ class ZhihuCrawler(AbstractCrawler):
             utils.logger.info(
                 "[ZhihuCrawler.start] Zhihu navigating to search page to get search page cookies, this process takes about 5 seconds"
             )
+            # 原实现把搜索词写死成 python（只为拿搜索页 cookie），
+            # 导致浏览器里显示的搜索词和实际任务不一致，改用真实关键词
+            first_keyword = (config.KEYWORDS or "python").split(",")[0].strip() or "python"
             await self.context_page.goto(
-                f"{self.index_url}/search?q=python&search_source=Guess&utm_content=search_hot&type=content"
+                f"{self.index_url}/search?q={quote(first_keyword)}"
+                f"&search_source=Guess&utm_content=search_hot&type=content"
             )
             await asyncio.sleep(5)
             await self.zhihu_client.update_cookies(
                 browser_context=self.browser_context,
                 urls=self.cookie_urls,
             )
+
+            # 登录态同步到账号池：热榜抓取/无浏览器模式走 httpx，
+            # 需要的正是这里的 Cookie，不共享的话会 401
+            try:
+                from tools.cookie_sync import sync_login_to_pool
+
+                synced, sync_msg = await sync_login_to_pool(
+                    "zhihu", self.browser_context, self.cookie_urls)
+                utils.logger.info(f"[ZhihuCrawler] 登录态同步到账号池：{sync_msg}")
+            except Exception as e:
+                utils.logger.warning(f"[ZhihuCrawler] 登录态同步失败（不影响本次抓取）：{e}")
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
@@ -432,6 +448,9 @@ class ZhihuCrawler(AbstractCrawler):
         utils.logger.info(
             "[ZhihuCrawler.launch_browser] Begin create browser context ..."
         )
+        from tools.crawler_util import chromium_launch_kwargs
+        # playwright 期望的 Chromium 版本缺失时回退到本机已装版本
+        fallback_kwargs = chromium_launch_kwargs(chromium)
         if config.SAVE_LOGIN_STATE:
             # feat issue #14
             # we will save login state to avoid login every time
@@ -445,11 +464,12 @@ class ZhihuCrawler(AbstractCrawler):
                 proxy=playwright_proxy,  # type: ignore
                 viewport={"width": 1920, "height": 1080},
                 user_agent=user_agent,
-                channel="chrome",  # Use system Chrome stable version
+                **fallback_kwargs,
+                channel=None if fallback_kwargs else "chrome",  # Use system Chrome stable version
             )
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel="chrome")  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy, channel=None if fallback_kwargs else "chrome", **fallback_kwargs)  # type: ignore
             browser_context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080}, user_agent=user_agent
             )

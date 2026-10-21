@@ -39,6 +39,8 @@ class ZhihuContent(BaseModel):
     comment_count: int = Field(default=0, description="Comment count")
     source_keyword: str = Field(default="", description="Source keyword")
     creator_hash: str = Field(default="", description="Creator anonymized hash")
+    author_avatar: str = Field(default="", description="Author avatar URL")
+    author_url: str = Field(default="", description="Author profile URL")
     user_nickname: str = Field(default="", description="User nickname (masked)")
 
 
@@ -57,6 +59,8 @@ class ZhihuComment(BaseModel):
     content_id: str = Field(default="", description="Content ID")
     content_type: str = Field(default="", description="Content type (article | answer | zvideo)")
     creator_hash: str = Field(default="", description="Creator anonymized hash")
+    author_avatar: str = Field(default="", description="Author avatar URL")
+    author_url: str = Field(default="", description="Author profile URL")
     user_nickname: str = Field(default="", description="User nickname (masked)")
 
 
@@ -65,7 +69,11 @@ class ZhihuCreator(BaseModel):
     Zhihu creator (in-memory only; personal profile is no longer persisted)
     """
     creator_hash: str = Field(default="", description="Creator anonymized hash")
-    user_nickname: str = Field(default="", description="User nickname (masked)")
+    author_avatar: str = Field(default="", description="Author avatar URL")
+    author_url: str = Field(default="", description="Author profile URL")
+    user_nickname: str = Field(default="", description="User nickname")
+    author_avatar: str = Field(default="", description="User avatar URL")
+    author_url: str = Field(default="", description="User profile URL")
     follows: int = Field(default=0, description="Follows count")
     fans: int = Field(default=0, description="Fans count")
     anwser_count: int = Field(default=0, description="Answer count")

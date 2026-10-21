@@ -26,7 +26,8 @@ from typing import List
 
 import config
 from var import source_keyword_var
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, mask_nickname, pick_avatar, build_profile_url
+from tools.v2_sync import persist_to_v2
 
 from ._store_impl import *
 
@@ -65,7 +66,9 @@ async def update_kuaishou_video(video_item: Dict):
         "desc": photo_info.get("caption", "")[:500],
         "create_time": photo_info.get("timestamp"),
         "creator_hash": anonymize_user_id(user_info.get("id")),  # 创作者匿名哈希(不存原始 user_id)
-        "nickname": mask_nickname(user_info.get("name")),  # 用户昵称(已脱敏)
+        "nickname": mask_nickname(user_info.get("name")),  # 用户昵称
+        "author_avatar": pick_avatar(user_info),  # 作者头像 URL
+        "author_url": build_profile_url("ks", user_info),  # 用户主页 URL（跳转用）
         "liked_count": str(photo_info.get("realLikeCount")),
         "viewd_count": str(photo_info.get("viewCount")),
         "last_modify_ts": utils.get_current_timestamp(),
@@ -77,6 +80,7 @@ async def update_kuaishou_video(video_item: Dict):
     utils.logger.info(
         f"[store.kuaishou.update_kuaishou_video] Kuaishou video id:{video_id}, title:{save_content_item.get('title')}")
     await KuaishouStoreFactory.create_store().store_content(content_item=save_content_item)
+    await persist_to_v2("ks", save_content_item, "content")
 
 
 async def batch_update_ks_video_comments(video_id: str, comments: List[Dict]):
@@ -99,8 +103,10 @@ async def update_ks_video_comment(video_id: str, comment_item: Dict):
         "content": comment_item.get("content"),
         # 创作者匿名哈希(不存原始 user_id)：V2: author_id, Old: authorId
         "creator_hash": anonymize_user_id(comment_item.get("author_id") or comment_item.get("authorId")),
-        # 用户昵称(已脱敏)：V2: author_name, Old: authorName
+        # 用户昵称：V2: author_name, Old: authorName
         "nickname": mask_nickname(comment_item.get("author_name") or comment_item.get("authorName")),
+        # 用户主页 URL（快手评论的 user 信息扁平在顶层，没有 user dict，走 fallback_id）
+        "author_url": build_profile_url("ks", {}, comment_item.get("author_id") or comment_item.get("authorId")),
         # V2: commentCount, Old: subCommentCount
         "sub_comment_count": str(comment_item.get("commentCount") or comment_item.get("subCommentCount", 0)),
         "last_modify_ts": utils.get_current_timestamp(),
@@ -108,6 +114,7 @@ async def update_ks_video_comment(video_id: str, comment_item: Dict):
     utils.logger.info(
         f"[store.kuaishou.update_ks_video_comment] Kuaishou video comment: {comment_id}, content: {save_comment_item.get('content')}")
     await KuaishouStoreFactory.create_store().store_comment(comment_item=save_comment_item)
+    await persist_to_v2("ks", save_comment_item, "comment")
 
 async def save_creator(user_id: str, creator: Dict):
     # 教学版：创作者个人资料(昵称/性别/头像/签名/IP/粉丝数等)不再落库，防骚扰。

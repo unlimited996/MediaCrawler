@@ -1,0 +1,102 @@
+# MediaCrawler 容器编排
+#
+# 常用命令：
+#   docker compose up -d            # 构建并后台启动
+#   docker compose logs -f          # 看日志
+#   docker compose ps               # 看状态/健康度
+#   docker compose down             # 停止
+#
+# 外部 PostgreSQL（默认）：写好 .env 里的 POSTGRES_DB_* 即可，无需改动本文件
+# 内置 PostgreSQL（离线自测）：docker compose --profile with-db up -d
+#
+# 详见 docs/DOCKER.md
+
+services:
+  mediacrawler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 桥接 NAT 下某些网络环境下载会中断/极慢（本机实测 Debian 索引 <40KB/s
+      # 且会 IncompleteRead，换 host 网络后 ~1MB/s）。网络正常的环境可改回 bridge。
+      network: ${BUILD_NETWORK:-bridge}
+      args:
+        # 宿主机已构建过前端（api/webui 已存在）时可设 1，省掉 npm ci/build
+        SKIP_WEBUI_BUILD: ${SKIP_WEBUI_BUILD:-0}
+        # 拉不到 Docker Hub 时改这里，例如 docker.m.daocloud.io/（结尾斜杠别漏）
+        DOCKER_MIRROR: ${DOCKER_MIRROR:-docker.io/}
+        # npm / pip 源，国内网络慢或连不上时换成镜像站
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    image: ${IMAGE_NAME:-mediacrawler}:${IMAGE_TAG:-latest}
+    container_name: ${CONTAINER_NAME:-mediacrawler}
+    restart: unless-stopped
+
+    ports:
+      - "${APP_PORT:-8081}:8081"
+
+    # 数据库地址/口令/中间件都在 .env 里；该文件已被 .dockerignore 排除，
+    # 不会进镜像，避免把凭据打进 layer
+    env_file:
+      - .env
+
+    environment:
+      TZ: Asia/Shanghai
+      PORT: 8081
+      # 容器内无图形界面：必须无头 + Chromium 关沙箱（否则 root 下启不来浏览器）
+      HEADLESS: "true"
+      PLAYWRIGHT_NO_SANDBOX: "1"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      # 启动前先等依赖端口就绪（留空则跳过等待）。
+      # 用外部 PG 时在 .env 里写 WAIT_FOR_DB_HOST/WAIT_FOR_DB_PORT；
+      # 用内置 PG（--profile with-db）建议填 WAIT_FOR_DB_HOST=postgres WAIT_FOR_DB_PORT=5432
+      WAIT_FOR_DB_HOST: ${WAIT_FOR_DB_HOST:-}
+      WAIT_FOR_DB_PORT: ${WAIT_FOR_DB_PORT:-5432}
+      WAIT_FOR_DB_TIMEOUT: ${WAIT_FOR_DB_TIMEOUT:-60}
+
+    volumes:
+      # 抓取下载的媒体文件
+      - ./data:/app/data
+      # 浏览器登录态（扫码一次之后不用反复扫）—— 删掉这个目录等于重新登录
+      - ./browser_data:/app/browser_data
+      # sqlite / 导出文件等
+      - ./database:/app/database
+
+    # 注意：这里**故意不加** depends_on: postgres —— short syntax 会把 with-db
+    # profile 自动拉起（每次都多跑一个 PG 容器）。想用内置 PG 请在 .env 里写
+    #   WAIT_FOR_DB_HOST=postgres  WAIT_FOR_DB_PORT=5432
+    # 由 entrypoint 轮询端口就绪后再启动应用，效果等价于健康检查依赖。
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 可选：内置 PostgreSQL（仅在想完全离线跑通时用)
+  #   docker compose --profile with-db up -d
+  # 注意它会用掉本地 5433 端口，且数据是空的（需把 .env 的 PG 指向它）
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: ${DOCKER_MIRROR:-docker.io/}postgres:16-alpine
+    profiles: ["with-db"]
+    container_name: mediacrawler-pg
+    restart: unless-stopped
+    ports:
+      - "${PG_LOCAL_PORT:-5433}:5432"
+    environment:
+      POSTGRES_USER: ${PG_LOCAL_USER:-im}
+      POSTGRES_PASSWORD: ${PG_LOCAL_PASSWORD:-mediacrawler}
+      POSTGRES_DB: ${PG_LOCAL_DB:-imdb}
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_LOCAL_USER:-im} -d ${PG_LOCAL_DB:-imdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

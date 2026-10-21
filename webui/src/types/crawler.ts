@@ -20,6 +20,48 @@ export interface CrawlerStatus {
   crawler_type: string | null
   started_at: string | null
   error_message: string | null
+  queue_pending: number
+  queue_running: number
+}
+
+export type QueueItemStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
+
+export interface QueueItem {
+  id: number
+  url: string
+  platform: string
+  crawler_type: string
+  status: QueueItemStatus
+  added_at: string | null
+  started_at: string | null
+  finished_at: string | null
+  error: string | null
+  batch_id: number | null
+}
+
+export interface QueueList {
+  items: QueueItem[]
+  pending: number
+  running: number
+  done: number
+  failed: number
+  cancelled: number
+  auto_run: boolean
+  batch_size: number
+}
+
+export interface QueueAddPayload {
+  urls: string[]
+  platform: string
+  crawler_type: string
+  login_type?: string
+  start_page?: number
+  enable_comments?: boolean
+  enable_sub_comments?: boolean
+  enable_media?: boolean
+  save_option?: string
+  cookies?: string
+  headless?: boolean
 }
 
 export interface LogEntry {

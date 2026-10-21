@@ -9,6 +9,8 @@ import zhTerminal from './locales/zh-CN/terminal.json'
 import zhData from './locales/zh-CN/data.json'
 import zhEnv from './locales/zh-CN/env.json'
 import zhLicense from './locales/zh-CN/license.json'
+import zhDiscover from './locales/zh-CN/discover.json'
+import zhScheduler from './locales/zh-CN/scheduler.json'
 
 // 英文翻译
 import enCommon from './locales/en-US/common.json'
@@ -17,6 +19,8 @@ import enTerminal from './locales/en-US/terminal.json'
 import enData from './locales/en-US/data.json'
 import enEnv from './locales/en-US/env.json'
 import enLicense from './locales/en-US/license.json'
+import enDiscover from './locales/en-US/discover.json'
+import enScheduler from './locales/en-US/scheduler.json'
 
 const resources = {
   'zh-CN': {
@@ -26,6 +30,8 @@ const resources = {
     data: zhData,
     env: zhEnv,
     license: zhLicense,
+    discover: zhDiscover,
+    scheduler: zhScheduler,
   },
   'en-US': {
     common: enCommon,
@@ -34,6 +40,8 @@ const resources = {
     data: enData,
     env: enEnv,
     license: enLicense,
+    discover: enDiscover,
+    scheduler: enScheduler,
   },
 }
 

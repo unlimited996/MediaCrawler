@@ -184,3 +184,6 @@ debug_tools
 
 database/*.db
 .omx/
+# 临时调试脚本 / Agent 工作记忆
+_t_*.py
+.workbuddy/

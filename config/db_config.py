@@ -19,6 +19,12 @@
 
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 加载项目根目录的 .env（可选）。已存在的系统环境变量优先，不会被 .env 覆盖。
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 # mysql config
 MYSQL_DB_PWD = os.getenv("MYSQL_DB_PWD", "123456")
@@ -67,6 +73,22 @@ mongodb_config = {
     "password": MONGODB_PWD,
     "db_name": MONGODB_DB_NAME,
 }
+
+# 配置表与任务元数据的存储库（独立于"抓取结果落到哪"）。
+# 留空则跟随 SAVE_DATA_OPTION；若 SAVE_DATA_OPTION 是文件模式（json/jsonl/csv），
+# 自动回退到 sqlite，保证配置功能始终可用。
+CONFIG_DB_TYPE = os.getenv("CONFIG_DB_TYPE", "")
+
+
+def resolve_config_db_type() -> str:
+    """解析配置/任务元数据使用的数据库类型。"""
+    import config
+
+    db_type = (CONFIG_DB_TYPE or "").strip() or config.SAVE_DATA_OPTION
+    if db_type in ("json", "jsonl", "csv"):
+        return "sqlite"
+    return db_type
+
 
 # postgres config
 POSTGRES_DB_PWD = os.getenv("POSTGRES_DB_PWD", "123456")

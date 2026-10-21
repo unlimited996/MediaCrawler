@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 router = APIRouter(prefix="/data", tags=["data"])
 
@@ -42,6 +42,10 @@ def get_file_info(file_path: Path) -> dict:
                 data = json.load(f)
                 if isinstance(data, list):
                     record_count = len(data)
+        elif file_path.suffix == ".jsonl":
+            # 每行一条记录（默认存储格式），空行不计
+            with open(file_path, "r", encoding="utf-8") as f:
+                record_count = sum(1 for line in f if line.strip())
         elif file_path.suffix == ".csv":
             with open(file_path, "r", encoding="utf-8") as f:
                 record_count = sum(1 for _ in f) - 1  # Subtract header row
@@ -65,7 +69,7 @@ async def list_data_files(platform: Optional[str] = None, file_type: Optional[st
         return {"files": []}
 
     files = []
-    supported_extensions = {".json", ".csv", ".xlsx", ".xls"}
+    supported_extensions = {".json", ".jsonl", ".csv", ".xlsx", ".xls"}
 
     for root, dirs, filenames in os.walk(DATA_DIR):
         root_path = Path(root)
@@ -121,6 +125,22 @@ async def get_file_content(file_path: str, preview: bool = True, limit: int = 10
                     if isinstance(data, list):
                         return {"data": data[:limit], "total": len(data)}
                     return {"data": data, "total": 1}
+            elif full_path.suffix == ".jsonl":
+                # 每行一条 JSON（项目默认存储格式）
+                rows = []
+                total = 0
+                with open(full_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        total += 1
+                        if len(rows) < limit:
+                            try:
+                                rows.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                continue
+                return {"data": rows, "total": total}
             elif full_path.suffix == ".csv":
                 import csv
                 with open(full_path, "r", encoding="utf-8") as f:
@@ -187,6 +207,30 @@ async def download_file(file_path: str):
     )
 
 
+@router.delete("/files/{file_path:path}")
+async def delete_data_file(file_path: str):
+    """删除数据文件（仅限 data 目录内的单个文件，不可删目录）。"""
+    full_path = DATA_DIR / file_path
+
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if not full_path.is_file():
+        raise HTTPException(status_code=400, detail="Not a file")
+
+    # 安全校验：必须落在 DATA_DIR 内，防止 ../ 穿越
+    try:
+        full_path.resolve().relative_to(DATA_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        full_path.unlink()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+
+    return {"success": True, "deleted": str(file_path)}
+
+
 @router.get("/stats")
 async def get_data_stats():
     """Get data statistics"""
@@ -200,7 +244,7 @@ async def get_data_stats():
         "by_type": {}
     }
 
-    supported_extensions = {".json", ".csv", ".xlsx", ".xls"}
+    supported_extensions = {".json", ".jsonl", ".csv", ".xlsx", ".xls"}
 
     for root, dirs, filenames in os.walk(DATA_DIR):
         root_path = Path(root)
@@ -228,3 +272,119 @@ async def get_data_stats():
                 continue
 
     return stats
+
+
+@router.get("/media/{platform}/{content_id}/{filename}")
+async def serve_local_media(platform: str, content_id: str, filename: str):
+    """服务本地已下载的媒体文件（图片/视频封面等）。
+
+    存在的意义：小红书/B站等 CDN 有防盗链，浏览器 <img> 直连原始 URL
+    会吃 403。爬虫下载到本地的文件通过这个路由吐出，详情页就能正常显示。
+    """
+    # 防目录穿越：只允许纯文件名
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise HTTPException(status_code=400, detail="非法文件名")
+    if "/" in content_id or "\\" in content_id or content_id.startswith("."):
+        raise HTTPException(status_code=400, detail="非法内容ID")
+
+    file_path = DATA_DIR / platform / "media" / content_id / filename
+    try:
+        file_path = file_path.resolve()
+        base = (DATA_DIR / platform / "media").resolve()
+        file_path.relative_to(base)   # 不在许可目录内则抛 ValueError
+    except (ValueError, OSError):
+        raise HTTPException(status_code=400, detail="非法路径")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    # 媒体文件不可变（按内容ID+序号命名），允许长缓存
+    return FileResponse(
+        file_path,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@router.get("/avatar-proxy")
+async def avatar_proxy(url: str):
+    """代理平台头像图片。
+
+    头像 CDN（如 xhscdn）与图片 CDN 一样有防盗链，浏览器 <img> 直连吃 403。
+    本路由在服务端带头部 cookie 请求后转发（实测 200），前端用它显示头像。
+
+    安全：仅允许 http/https 目标；单次请求超时 15s；大小上限 5MB。
+    """
+    from urllib.parse import urlparse
+
+    import httpx
+
+    from account.crypto import decrypt_cookie
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="非法 URL")
+
+    # 按域名猜平台，取对应账号池 cookie（没有就匿名请求）
+    cookie = ""
+    host = parsed.netloc.lower()
+    platform_guess = None
+    if "xhscdn" in host or "xiaohongshu" in host:
+        platform_guess = "xhs"
+    elif "douyin" in host or "douyinvod" in host:
+        platform_guess = "dy"
+    elif "zhimg" in host or "zhihu" in host:
+        platform_guess = "zhihu"
+    elif "weibo" in host or "sinaimg" in host:
+        platform_guess = "wb"
+
+    if platform_guess:
+        try:
+            from sqlalchemy import select
+            from sqlalchemy.ext.asyncio import AsyncSession
+
+            from config.db_config import resolve_config_db_type
+            from database.db_session import get_async_engine
+            from database.models_v2 import Account
+
+            engine = get_async_engine(resolve_config_db_type())
+            if engine is not None:
+                try:
+                    async with AsyncSession(engine, expire_on_commit=False) as session:
+                        row = (await session.execute(
+                            select(Account).where(Account.platform == platform_guess,
+                                                  Account.status == "active")
+                        )).scalars().first()
+                        if row is not None and row.cookie_cipher:
+                            cookie = decrypt_cookie(row.cookie_cipher)
+                finally:
+                    # 必须 dispose：否则连接不还池，连续请求会耗尽连接池导致超时
+                    await engine.dispose()
+        except Exception as e:
+            print(f"[avatar_proxy] 取 cookie 失败: {e}")
+
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/131.0.0.0 Safari/537.36"),
+        "Referer": "https://www.xiaohongshu.com/",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"上游请求失败: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="上游拒绝")
+
+    if len(resp.content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="图片过大")
+
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type", "image/jpeg"),
+        headers={"Cache-Control": "public, max-age=86400"},
+    )

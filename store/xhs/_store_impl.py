@@ -139,6 +139,7 @@ class XhsDbStoreImplement(AbstractStore):
         note = XhsNote(
             creator_hash=content_item.get("creator_hash"),
             nickname=content_item.get("nickname"),
+            author_avatar=content_item.get("author_avatar"),
             add_ts=add_ts,
             last_modify_ts=last_modify_ts,
             note_id=content_item.get("note_id"),
@@ -171,6 +172,12 @@ class XhsDbStoreImplement(AbstractStore):
             "share_count": str(content_item.get("share_count")),
             "last_update_time": content_item.get("last_update_time"),
         }
+        # 以下字段同样会变（作者改昵称/换头像、笔记被编辑），
+        # 只在有新值时覆盖，避免把已有数据擦成空
+        for key in ("nickname", "author_avatar", "title", "desc", "image_list", "tag_list"):
+            value = content_item.get(key)
+            if value:
+                update_data[key] = value
         stmt = update(XhsNote).where(XhsNote.note_id == note_id).values(**update_data)
         await session.execute(stmt)
 
@@ -197,6 +204,7 @@ class XhsDbStoreImplement(AbstractStore):
         comment = XhsNoteComment(
             creator_hash=comment_item.get("creator_hash"),
             nickname=comment_item.get("nickname"),
+            author_avatar=comment_item.get("author_avatar"),
             add_ts=add_ts,
             last_modify_ts=last_modify_ts,
             comment_id=comment_item.get("comment_id"),
@@ -218,6 +226,11 @@ class XhsDbStoreImplement(AbstractStore):
             "like_count": str(comment_item.get("like_count")),
             "sub_comment_count": int(comment_item.get("sub_comment_count", 0) or 0),
         }
+        # 头像/昵称后到（首次抓取时评论接口可能还没返回），有新值就补
+        for key in ("nickname", "author_avatar"):
+            value = comment_item.get(key)
+            if value:
+                update_data[key] = value
         stmt = update(XhsNoteComment).where(XhsNoteComment.comment_id == comment_id).values(**update_data)
         await session.execute(stmt)
 

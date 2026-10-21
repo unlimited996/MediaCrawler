@@ -25,7 +25,8 @@
 import re
 from typing import List
 
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, mask_nickname, pick_avatar, build_profile_url
+from tools.v2_sync import persist_to_v2
 from var import source_keyword_var
 
 from ._store_impl import *
@@ -100,10 +101,13 @@ async def update_weibo_note(note_item: Dict):
         # 创作者信息（匿名化/脱敏，不含原始 user_id/avatar/gender/profile_url/ip_location）
         "creator_hash": anonymize_user_id(user_info.get("id")),
         "nickname": mask_nickname(user_info.get("screen_name", "")),
+        "author_avatar": pick_avatar(user_info),  # 作者头像 URL
+        "author_url": build_profile_url("wb", user_info),  # 用户主页 URL（跳转用）
         "source_keyword": source_keyword_var.get(),
     }
     utils.logger.info(f"[store.weibo.update_weibo_note] weibo note id:{note_id}, title:{save_content_item.get('content')[:24]} ...")
     await WeibostoreFactory.create_store().store_content(content_item=save_content_item)
+    await persist_to_v2("wb", save_content_item, "content")
 
 
 async def batch_update_weibo_note_comments(note_id: str, comments: List[Dict]):
@@ -154,9 +158,11 @@ async def update_weibo_note_comment(note_id: str, comment_item: Dict):
         # 创作者信息（匿名化/脱敏，不含原始 user_id/avatar/gender/profile_url/ip_location）
         "creator_hash": anonymize_user_id(user_info.get("id")),
         "nickname": mask_nickname(user_info.get("screen_name", "")),
+        "author_url": build_profile_url("wb", user_info),  # 用户主页 URL（跳转用）
     }
     utils.logger.info(f"[store.weibo.update_weibo_note_comment] Weibo note comment: {comment_id}, content: {save_comment_item.get('content', '')[:24]} ...")
     await WeibostoreFactory.create_store().store_comment(comment_item=save_comment_item)
+    await persist_to_v2("wb", save_comment_item, "comment")
 
 
 async def save_creator(user_id: str, user_info: Dict):

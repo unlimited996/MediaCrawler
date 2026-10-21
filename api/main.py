@@ -18,8 +18,9 @@
 
 """
 MediaCrawler WebUI API Server
-Start command: uvicorn api.main:app --port 8080 --reload
-Or: python -m api.main
+默认端口 8081（8080 常被本机其它守护进程占用）：
+    uvicorn api.main:app --host 127.0.0.1 --port 8081
+或：python -m api.main
 """
 import asyncio
 import os
@@ -32,7 +33,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from .routers import crawler_router, data_router, websocket_router
+import config as config_module
+
+from .routers import (crawler_router, data_router, websocket_router, export_router,
+                      config_router, story_router, discover_router, accounts_router,
+                      scheduler_router)
 
 # Project root directory (used for running subprocesses like uv run main.py)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -45,6 +50,66 @@ app = FastAPI(
 
 # Get webui static files directory
 WEBUI_DIR = os.path.join(os.path.dirname(__file__), "webui")
+
+
+def _ignore_connection_reset(loop, context):
+    """忽略客户端断开引发的 ConnectionResetError。
+
+    Windows 的 asyncio Proactor 在客户端直接断开时，会在 _call_connection_lost
+    回调里抛 ConnectionResetError(10054)，这不是业务错误，刷屏无意义。
+    """
+    import asyncio
+
+    exc = context.get("exception")
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+        return
+    loop.default_exception_handler(context)
+
+
+@app.on_event("startup")
+async def _install_loop_exception_handler():
+    import asyncio
+
+    asyncio.get_running_loop().set_exception_handler(_ignore_connection_reset)
+
+    # 预热存储方式探测缓存（含 MySQL 等连不上的库的探测），
+    # 避免第一个打开配置页的用户干等探测超时
+    from .services.storage_probe import warmup
+
+    asyncio.create_task(warmup())
+
+    # 定时拉取任务调度器：建表 + 恢复调度 + 起循环。
+    # 任何失败都不能影响 API 主流程，所以整体 try 包裹。
+    try:
+        from .services.task_scheduler import task_scheduler
+
+        if config_module.SCHEDULER_ENABLED:
+            ok = await task_scheduler.start()
+            if not ok:
+                print(f"[scheduler] 启动失败：{task_scheduler.last_error}")
+        else:
+            print("[scheduler] SCHEDULER_ENABLED=0，调度器未启动（手动触发仍可用）")
+    except Exception as e:
+        print(f"[scheduler] 启动异常（不影响 API）：{e}")
+
+    # 评论情感/立场回填：老数据入库时还没有这些判定，后台补一次，
+    # 让评论区的筛选/赞同度统计对所有历史数据立即可用
+    try:
+        from tools.v2_sync import (backfill_comment_sentiments,
+                                   backfill_comment_stances)
+
+        async def _backfill_bg():
+            try:
+                n1 = await backfill_comment_sentiments()
+                n2 = await backfill_comment_stances()
+                if n1 or n2:
+                    print(f"[stance] 启动回填完成：情感 {n1} 条，立场 {n2} 条")
+            except Exception as e:
+                print(f"[stance] 启动回填失败（不影响使用，查询时会按需补齐）：{e}")
+
+        asyncio.create_task(_backfill_bg())
+    except Exception as e:
+        print(f"[stance] 回填任务启动失败（不影响 API）：{e}")
 
 # CORS configuration - allow frontend dev server access
 app.add_middleware(
@@ -64,11 +129,17 @@ app.add_middleware(
 app.include_router(crawler_router, prefix="/api")
 app.include_router(data_router, prefix="/api")
 app.include_router(websocket_router, prefix="/api")
+app.include_router(export_router, prefix="/api")
+app.include_router(config_router, prefix="/api")
+app.include_router(story_router, prefix="/api")
+app.include_router(discover_router, prefix="/api")
+app.include_router(accounts_router, prefix="/api")
+app.include_router(scheduler_router, prefix="/api")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def serve_frontend():
-    """Return frontend page"""
+    """Return frontend page（同时支持 HEAD，便于健康检查/预览探测）"""
     index_path = os.path.join(WEBUI_DIR, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
@@ -89,14 +160,16 @@ async def health_check():
 async def check_environment():
     """Check if MediaCrawler environment is configured correctly"""
     try:
-        # Run uv run main.py --help command to check environment
+        # Run main.py --help with the current interpreter to check environment.
+        # 用当前 Python 解释器（通常是项目 venv），不依赖 uv：
+        # `uv run` 会重新解析/同步整个依赖，在无 uv 缓存的环境里会卡满超时。
         # Use PROJECT_ROOT so it works regardless of where uvicorn was started
         if sys.platform == "win32":
             loop = asyncio.get_running_loop()
             process = await loop.run_in_executor(
                 None,
                 lambda: subprocess.run(
-                    ["uv", "run", "main.py", "--help"],
+                    [sys.executable, "main.py", "--help"],
                     capture_output=True,
                     timeout=30.0,
                     cwd=str(PROJECT_ROOT)
@@ -105,7 +178,7 @@ async def check_environment():
             stdout, stderr = process.stdout, process.stderr  # bytes
         else:
             process = await asyncio.create_subprocess_exec(
-                "uv", "run", "main.py", "--help",
+                sys.executable, "main.py", "--help",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=str(PROJECT_ROOT)  # Project root directory
@@ -136,8 +209,8 @@ async def check_environment():
     except FileNotFoundError:
         return {
             "success": False,
-            "message": "uv command not found",
-            "error": "Please ensure uv is installed and configured in system PATH"
+            "message": "python interpreter not found",
+            "error": "Please ensure the Python interpreter used by the API server is available"
         }
     except Exception as e:
         return {
@@ -165,7 +238,24 @@ async def get_platforms():
 
 @app.get("/api/config/options")
 async def get_config_options():
-    """Get all configuration options"""
+    """Get all configuration options
+
+    save_options 按"此刻是否真的能用"动态探测（见 services/storage_probe）：
+    没配或连不上的数据库不出现，避免用户选了就报错。
+    """
+    from .services.storage_probe import available_save_options
+
+    try:
+        storage = await available_save_options()
+    except Exception as e:
+        # 探测本身失败时退化为"仅文件类"，保证配置页始终可用
+        storage = {"items": [
+            {"value": v, "label": l} for v, l in [
+                ("jsonl", "JSONL File"), ("json", "JSON File"),
+                ("csv", "CSV File"), ("excel", "Excel File"),
+            ]
+        ], "hidden": []}
+
     return {
         "login_types": [
             {"value": "qrcode", "label": "QR Code Login"},
@@ -176,15 +266,8 @@ async def get_config_options():
             {"value": "detail", "label": "Detail Mode"},
             {"value": "creator", "label": "Creator Mode"},
         ],
-        "save_options": [
-            {"value": "jsonl", "label": "JSONL File"},
-            {"value": "json", "label": "JSON File"},
-            {"value": "csv", "label": "CSV File"},
-            {"value": "excel", "label": "Excel File"},
-            {"value": "sqlite", "label": "SQLite Database"},
-            {"value": "db", "label": "MySQL Database"},
-            {"value": "mongodb", "label": "MongoDB Database"},
-        ],
+        "save_options": storage["items"],
+        "save_options_hidden": storage["hidden"],
     }
 
 
@@ -197,6 +280,16 @@ if os.path.exists(WEBUI_DIR):
     logos_dir = os.path.join(WEBUI_DIR, "logos")
     if os.path.exists(logos_dir):
         app.mount("/logos", StaticFiles(directory=logos_dir), name="logos")
+    # 通用挂载：webui 下其余一级目录（emoji/ 等前端静态资源）自动挂到同名路径。
+    # 避免每加一个 public 子目录都要回来改代码。
+    _reserved = {"assets", "logos", "index.html"}
+    for _entry in sorted(os.listdir(WEBUI_DIR)):
+        _full = os.path.join(WEBUI_DIR, _entry)
+        if _entry in _reserved or not os.path.isdir(_full):
+            continue
+        if any(r.path == f"/{_entry}" for r in app.routes):
+            continue
+        app.mount(f"/{_entry}", StaticFiles(directory=_full), name=f"webui-{_entry}")
     # Mount other static files (e.g., vite.svg)
     app.mount("/static", StaticFiles(directory=WEBUI_DIR), name="webui-static")
 

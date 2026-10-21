@@ -22,15 +22,17 @@ import os
 import random
 from asyncio import Task
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
-from playwright.async_api import (
-    BrowserContext,
-    BrowserType,
-    Page,
-    Playwright,
-    async_playwright,
-)
 from tenacity import RetryError
+
+# Playwright 只在真正需要浏览器时才导入 —— 无浏览器模式（#3）下不装也能跑
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查
+    from playwright.async_api import BrowserContext, BrowserType, Page, Playwright
+else:
+    BrowserContext = BrowserType = Page = Playwright = object  # 运行时占位
 
 import config
 from base.base_crawler import AbstractCrawler
@@ -39,6 +41,7 @@ from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
 from tools import utils
+from tools.crawler_util import chromium_launch_kwargs, system_playwright_proxy
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -69,6 +72,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
         self._media_downloader: Optional[MediaDownloader] = None
+        self.task_id: Optional[int] = None  # 断点续爬任务 ID（未开启时为 None）
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -76,6 +80,43 @@ class XiaoHongShuCrawler(AbstractCrawler):
             self.ip_proxy_pool = await create_ip_pool(config.IP_PROXY_POOL_COUNT, enable_validate_ip=True)
             ip_proxy_info: IpInfoModel = await self.ip_proxy_pool.get_proxy()
             playwright_proxy_format, httpx_proxy_format = utils.format_proxy_info(ip_proxy_info)
+        else:
+            # 未配代理池时回退系统代理：Chromium 不读 http_proxy 环境变量，
+            # 不显式传代理会导致浏览器打不开目标站点（Page.goto 超时）
+            playwright_proxy_format = system_playwright_proxy()
+            if playwright_proxy_format:
+                utils.logger.info(f"[{self.__class__.__name__}] 使用系统代理: {playwright_proxy_format['server']}")
+                # TCP 端口在监听 ≠ 代理能出网：代理软件没开上游 / 规则拦截时，
+                # Chromium 会一路卡到 Page.goto 超时，整个抓取崩在第一步。
+                # 先用 httpx 花几秒探一下，不通就让浏览器直连。
+                if not await self._probe_reachable(playwright_proxy_format):
+                    if await self._probe_reachable(None):
+                        utils.logger.warning(
+                            f"[{self.__class__.__name__}] 系统代理 {playwright_proxy_format['server']} "
+                            f"无法访问 {self.index_url}，但直连可用 —— 本次改用直连")
+                        playwright_proxy_format = None
+                        self._disable_system_proxy_env()
+                    else:
+                        utils.logger.warning(
+                            f"[{self.__class__.__name__}] 系统代理 {playwright_proxy_format['server']} "
+                            f"与直连均无法访问 {self.index_url}：请检查网络或代理软件")
+
+        # 无浏览器模式（#3 去 Playwright）：直接用 Cookie 发请求，不启动任何浏览器
+        # 注意：_browser_required 是 async，漏了 await 会拿到协程对象（恒为真），
+        # 无浏览器模式永远进不去，还会抛 "coroutine was never awaited"。
+        if not await self._browser_required():
+            utils.logger.info("[XiaoHongShuCrawler] 无浏览器模式：直接使用配置的 Cookie")
+            self.browser_context = None
+            self.context_page = None
+            self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
+            if not await self.xhs_client.pong():
+                raise RuntimeError(
+                    "无浏览器模式下登录态无效：请先在配置里填入有效 Cookie "
+                    "（config.COOKIES 或配置表 crawl.cookies），或关闭无浏览器模式改用扫码登录")
+            await self._dispatch_crawl()
+            return
+
+        from playwright.async_api import async_playwright
 
         async with async_playwright() as playwright:
             # Choose launch mode based on configuration
@@ -101,7 +142,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
             self.context_page = await self.browser_context.new_page()
-            await self.context_page.goto(self.index_url)
+            await self._goto_index_page()
 
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
@@ -119,20 +160,192 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     urls=self.cookie_urls,
                 )
 
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
-                # Search for notes and retrieve their comment information.
-                await self.search()
-            elif config.CRAWLER_TYPE == "detail":
-                # Get the information and comments of the specified post
-                await self.get_specified_notes()
-            elif config.CRAWLER_TYPE == "creator":
-                # Get creator's information and their notes and comments
-                await self.get_creators_and_notes()
+                # Cookie 模式只是把 web_session 塞进浏览器上下文，既不校验也不弹二维码。
+                # Cookie 过期时表现为"没让扫码就直接抓 → 全部跳过 → 显示成功"，
+                # 用户根本不知道是登录态挂了。这里二次校验，仍无效就回退扫码。
+                if not await self.xhs_client.pong():
+                    headless_now = config.CDP_HEADLESS if config.ENABLE_CDP_MODE else config.HEADLESS
+                    if headless_now:
+                        utils.logger.warning(
+                            "[XiaoHongShuCrawler] 登录态无效（Cookie 已过期），当前为无头模式无法扫码。"
+                            "请更新 Cookie，或关闭无头模式后重试（届时会弹出扫码）")
+                    else:
+                        utils.logger.warning(
+                            "[XiaoHongShuCrawler] 登录态无效（Cookie 已过期），回退到扫码登录："
+                            "请在弹出的浏览器窗口中扫描二维码 ...")
+                        # 先清掉失效 Cookie 再刷新，否则页面停在"有 session 但服务端不认"的
+                        # 假登录态，登录弹窗不出来，login_by_qrcode 会直接 sys.exit()
+                        try:
+                            await self.browser_context.clear_cookies()
+                            await self.context_page.reload()
+                            await asyncio.sleep(2)
+                        except Exception as e:
+                            utils.logger.warning(
+                                f"[XiaoHongShuCrawler] 清理失效 Cookie 失败（继续尝试扫码）：{e}")
+                        await login_obj.login_by_qrcode()
+                        await self.xhs_client.update_cookies(
+                            browser_context=self.browser_context,
+                            urls=self.cookie_urls,
+                        )
+                        if not await self.xhs_client.pong():
+                            utils.logger.warning(
+                                "[XiaoHongShuCrawler] 扫码后登录态仍无效，本次抓取可能拿不到数据")
+
+            # 登录态同步到账号池（无论本次是否触发登录流程）：
+            # 热榜抓取/无浏览器模式走 httpx，需要这里的 Cookie。
+            # 只在服务端确认有效时才写回——looks_logged_in 只看 Cookie 里有没有
+            # web_session 这个键，过期 Cookie 也能通过，会拿死 Cookie 污染账号池，
+            # 下次启动又被取出来注入，表现为"每次都登录失败还查不出原因"。
+            if await self.xhs_client.pong():
+                try:
+                    from tools.cookie_sync import sync_login_to_pool
+
+                    synced, sync_msg = await sync_login_to_pool(
+                        "xhs", self.browser_context, self.cookie_urls)
+                    utils.logger.info(f"[XiaoHongShuCrawler] 登录态同步到账号池：{sync_msg}")
+                except Exception as e:
+                    utils.logger.warning(f"[XiaoHongShuCrawler] 登录态同步失败（不影响本次抓取）：{e}")
             else:
-                pass
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler] 登录态无效，跳过账号池同步（避免把失效 Cookie 写回账号池）")
+
+            await self._dispatch_crawl()
 
             utils.logger.info("[XiaoHongShuCrawler.start] Xhs Crawler finished ...")
+
+    async def _probe_reachable(self, proxy: Optional[Dict]) -> bool:
+        """实测能否访问目标站。
+
+        只做 TCP 连通性判断不够：代理软件在监听但上游不通 / 规则拦截时，
+        端口照样连得上，可 Chromium 的 Page.goto 会一路卡到超时。
+        这里用 httpx 花几秒真发一次请求。
+
+        proxy=None 表示「强制直连」（trust_env=False，忽略环境变量里的代理）。
+        """
+        import httpx
+
+        kwargs: Dict = {"timeout": 10, "follow_redirects": True, "verify": False}
+        if proxy:
+            server = proxy.get("server", "")
+            kwargs["proxy"] = server if "://" in server else f"http://{server}"
+        else:
+            kwargs["trust_env"] = False
+
+        try:
+            async with httpx.AsyncClient(**kwargs) as client:
+                resp = await client.get(self.index_url)
+            ok = resp.status_code < 500
+            utils.logger.info(
+                f"[XiaoHongShuCrawler] {'系统代理' if proxy else '直连'}探测"
+                f"{'可用' if ok else '异常'}：HTTP {resp.status_code}")
+            return ok
+        except Exception as e:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler] {'系统代理' if proxy else '直连'}探测失败："
+                f"{type(e).__name__}: {str(e)[:160]}")
+            return False
+
+    def _disable_system_proxy_env(self) -> None:
+        """清掉进程内的代理环境变量。
+
+        浏览器可以靠「不传 proxy」单独绕开，但 httpx 默认 trust_env=True，
+        不清理的话 HTTP 客户端仍会走那个坏代理，抓详情照样崩。
+        """
+        removed = [k for k in ("http_proxy", "https_proxy", "HTTP_PROXY",
+                               "HTTPS_PROXY", "all_proxy", "ALL_PROXY") if os.environ.pop(k, None)]
+        if removed:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler] 已在本进程内清除代理环境变量：{', '.join(removed)}")
+
+    async def _goto_index_page(self) -> None:
+        """打开首页（带重试 + 更宽松的等待条件）。
+
+        Playwright 默认 wait_until='load'，要等首页所有图片/脚本下载完。小红书首页
+        资源多，弱网或代理环境下经常卡到 30s 超时，抓取直接崩在第一步。
+        改成 domcontentloaded 并重试 3 次；全部失败时抛出带诊断信息的错误，
+        而不是一句看不懂的 Timeout 30000ms exceeded。
+        """
+        timeout_ms = int(getattr(config, "PAGE_GOTO_TIMEOUT_SEC", 45) * 1000)
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                await self.context_page.goto(
+                    self.index_url,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_ms,
+                )
+                if attempt > 1:
+                    utils.logger.info(f"[XiaoHongShuCrawler] 第 {attempt} 次尝试打开首页成功")
+                return
+            except Exception as e:
+                last_err = e
+                utils.logger.warning(
+                    f"[XiaoHongShuCrawler] 打开 {self.index_url} 失败（第 {attempt}/3 次）："
+                    f"{type(e).__name__}: {str(e)[:200]}")
+                await asyncio.sleep(2)
+
+        proxy_env = (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+                     or os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY") or "无")
+        raise RuntimeError(
+            f"打开 {self.index_url} 连续 3 次失败：{type(last_err).__name__}: {last_err}。"
+            f"当前系统代理 = {proxy_env}；"
+            f"请确认代理软件已启动且能访问小红书，不需要代理时清空 "
+            f"http_proxy/https_proxy 环境变量后重试（或调大 config.PAGE_GOTO_TIMEOUT_SEC）")
+
+    async def _browser_required(self) -> bool:
+        """是否需要启动浏览器。
+
+        配置 browser.enable_browser=false 时走无浏览器模式（#3），
+        此时签名走纯算法、Cookie 由配置提供，常规抓取不启动任何浏览器。
+        """
+        try:
+            from config.runtime_config import runtime_config
+
+            return runtime_config.get_bool("enable_browser", True)
+        except Exception:
+            return True
+
+    async def _dispatch_crawl(self) -> None:
+        """按抓取类型分发（浏览器模式与无浏览器模式共用）。"""
+        crawler_type_var.set(config.CRAWLER_TYPE)
+        if config.CRAWLER_TYPE == "search":
+            # Search for notes and retrieve their comment information.
+            await self.search()
+        elif config.CRAWLER_TYPE == "detail":
+            # Get the information and comments of the specified post
+            await self.get_specified_notes()
+        elif config.CRAWLER_TYPE == "creator":
+            # Get creator's information and their notes and comments
+            await self.get_creators_and_notes()
+        else:
+            pass
+
+    async def _init_checkpoint_task(self, crawl_type: str) -> Optional[int]:
+        """开启断点续爬时创建/复用任务并返回 task_id；未开启或失败返回 None。"""
+        try:
+            from config.runtime_config import runtime_config
+            from store import checkpoint
+
+            if not runtime_config.get_bool("enable_checkpoint", False):
+                return None
+
+            params = {
+                "keywords": config.KEYWORDS,
+                "start_page": config.START_PAGE,
+                "max_notes": config.CRAWLER_MAX_NOTES_COUNT,
+                "sort_type": getattr(config, "SORT_TYPE", ""),
+            }
+            task_code = checkpoint.make_task_code("xhs", crawl_type, params)
+            task_id = await checkpoint.ensure_task(task_code, "xhs", crawl_type, params)
+            if task_id:
+                pending = await checkpoint.get_pending(task_id, "search_page")
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler] 断点续爬开启 task_code={task_code} "
+                    f"task_id={task_id} 待补页数={len(pending)}")
+            return task_id
+        except Exception as e:
+            utils.logger.warning(f"[XiaoHongShuCrawler] 断点续爬初始化失败，按普通模式执行：{e}")
+            return None
 
     async def search(self) -> None:
         """Search for notes and retrieve their comment information."""
@@ -141,6 +354,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
         if config.CRAWLER_MAX_NOTES_COUNT < xhs_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = xhs_limit_count
         start_page = config.START_PAGE
+
+        # 断点续爬：相同参数生成相同 task_code，重跑即续跑
+        from store import checkpoint
+
+        self.task_id = await self._init_checkpoint_task("search")
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[XiaoHongShuCrawler.search] Current search keyword: {keyword}")
@@ -149,6 +367,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
             while (page - start_page + 1) * xhs_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
                 if page < start_page:
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Skip page {page}")
+                    page += 1
+                    continue
+
+                # 断点续爬：已抓过的页直接跳过
+                if self.task_id and await checkpoint.is_done(self.task_id, "search_page", keyword, page):
+                    utils.logger.info(
+                        f"[XiaoHongShuCrawler.search] Skip page {page} (checkpoint done)")
                     page += 1
                     continue
 
@@ -182,6 +407,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             await self.download_media(note_detail)
                             note_ids.append(note_detail.get("note_id"))
                             xsec_tokens.append(note_detail.get("xsec_token"))
+                    # 断点续爬：标记本页完成（必须在 page += 1 之前，用当前页码）
+                    if self.task_id:
+                        await checkpoint.mark_done(
+                            self.task_id, "search_page", keyword, page,
+                            fetched_count=len(note_ids),
+                        )
                     page += 1
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Note details: {note_details}")
                     await self.batch_get_note_comments(note_ids, xsec_tokens)
@@ -191,6 +422,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
                 except DataFetchError:
                     utils.logger.error("[XiaoHongShuCrawler.search] Get note detail error")
+                    if self.task_id:
+                        await checkpoint.mark_error(
+                            self.task_id, "search_page", keyword, page, "DataFetchError")
                     break
 
     async def get_creators_and_notes(self) -> None:
@@ -224,6 +458,22 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             # Use fixed crawling interval
             crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
+            # 增量模式（定时任务默认）：预读该作者已入库的 note_id，
+            # 翻到整页旧笔记就停止翻页，只抓新帖，避免每次全量重跑
+            known_note_ids = None
+            if os.getenv("XHS_CREATOR_INCREMENTAL", "").strip().lower() in ("1", "true", "yes", "on"):
+                try:
+                    from tools.v2_sync import get_content_index
+
+                    index = await get_content_index("xhs", user_id=user_id)
+                    known_note_ids = set(index.keys())
+                    utils.logger.info(
+                        f"[XiaoHongShuCrawler.get_creators_and_notes] 增量模式："
+                        f"作者 {user_id} 已入库 {len(known_note_ids)} 条笔记")
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[XiaoHongShuCrawler] 增量预读失败，退化为全量翻页: {e}")
+                    known_note_ids = None
             # Get all note information of the creator
             all_notes_list = await self.xhs_client.get_all_notes_by_creator(
                 user_id=user_id,
@@ -231,6 +481,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 callback=self.fetch_creator_notes_detail,
                 xsec_token=creator_info.xsec_token,
                 xsec_source=creator_info.xsec_source,
+                known_note_ids=known_note_ids,
             )
 
             note_ids = []
@@ -317,6 +568,33 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     note_detail = await self.xhs_client.get_note_by_id_from_html(note_id, xsec_source, xsec_token,
                                                                                  enable_cookie=True)
                     if not note_detail:
+                        # 带 Cookie 还失败，多半是登录态已失效、页面被登录墙拦了。
+                        # 分享链接的详情页本身是 SSR（免登录可读），去掉 Cookie 再试一次，
+                        # 否则一条本可抓到的内容会因为失效 Cookie 白白丢掉。
+                        note_detail = await self.xhs_client.get_note_by_id_from_html(
+                            note_id, xsec_source, xsec_token, enable_cookie=False)
+                    if not note_detail:
+                        # 最后兜底：走免登录 SSR 通道（media_platform/xhs/ssr.py）。
+                        # 它用干净的浏览器 UA 直取页面，不带 x-s 签名头、不带失效 Cookie，
+                        # 实测在登录态失效时仍能拿到正文/图片/作者/互动数。
+                        try:
+                            from media_platform.xhs.ssr import fetch_note_by_url
+
+                            ssr_url = (f"{self.xhs_client._domain}/explore/{note_id}"
+                                       f"?xsec_token={quote(str(xsec_token), safe='')}"
+                                       f"&xsec_source={xsec_source}")
+                            ssr_data = await fetch_note_by_url(ssr_url)
+                            note_detail = ssr_data.get("note_item") or None
+                            if note_detail:
+                                utils.logger.info(
+                                    f"[get_note_detail_async_task] 免登录 SSR 通道兜底成功: {note_id}")
+                        except Exception as ssr_exc:
+                            utils.logger.info(f"[get_note_detail_async_task] SSR 兜底失败: {ssr_exc}")
+                    if not note_detail:
+                        # 注意：空结果只代表"这次没抓到"（风控/token 过期/网络），
+                        # 不代表内容已删除。已删除由下面的 NoteNotFoundError
+                        # （平台明确返回 NOTE_NOT_FOUND/ABNORMAL 错误码）分支标记，
+                        # 这里绝不碰本地数据，否则会把活的内容误标成已删除。
                         utils.logger.warning(f"[skip] Failed to get note detail, Id: {note_id}, 跳过继续")
                         return None
 
@@ -330,6 +608,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             except NoteNotFoundError as ex:
                 utils.logger.warning(f"[XiaoHongShuCrawler.get_note_detail_async_task] Note not found: {note_id}, {ex}")
+                await self._mark_content_deleted(note_id)
                 return None
             except (IPBlockError, PlatformAccessError) as ex:
                 # Access restricted (IP block / rate limit / account security).
@@ -346,6 +625,17 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
                 return None
 
+    async def _mark_content_deleted(self, note_id: str) -> None:
+        """平台侧内容不存在（已删/私密）时，把 v2 里的对应 story 标记 deleted。
+
+        只在配置库是数据库模式时才有意义；失败只记日志，不影响抓取主流程。
+        """
+        try:
+            from tools.v2_sync import mark_story_deleted
+            await mark_story_deleted("xhs", note_id)
+        except Exception as e:
+            utils.logger.warning(f"[xhs] 标记内容删除失败 {note_id}: {e}")
+
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""
         if not config.ENABLE_GET_COMMENTS:
@@ -361,7 +651,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 name=note_id,
             )
             task_list.append(task)
-        await asyncio.gather(*task_list)
+        await asyncio.gather(*task_list, return_exceptions=True)
 
     async def get_comments(self, note_id: str, xsec_token: str, semaphore: asyncio.Semaphore):
         """Get note comments with keyword filtering and quantity limitation"""
@@ -369,13 +659,25 @@ class XiaoHongShuCrawler(AbstractCrawler):
             utils.logger.info(f"[XiaoHongShuCrawler.get_comments] Begin get note id comments {note_id}")
             # Use fixed crawling interval
             crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
-            await self.xhs_client.get_note_all_comments(
-                note_id=note_id,
-                xsec_token=xsec_token,
-                crawl_interval=crawl_interval,
-                callback=xhs_store.batch_update_xhs_note_comments,
-                max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
-            )
+            try:
+                await self.xhs_client.get_note_all_comments(
+                    note_id=note_id,
+                    xsec_token=xsec_token,
+                    crawl_interval=crawl_interval,
+                    callback=xhs_store.batch_update_xhs_note_comments,
+                    max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
+                )
+            except RetryError as e:
+                # 评论接口必须带登录态（x-s 签名），登录失效时会被 tenacity 重试到
+                # RetryError 抛出。这里必须拦住：一条笔记的评论抓不到，
+                # 不应该让整轮抓取直接崩掉（正文/图片已经入库了）。
+                utils.logger.warning(
+                    f"[XiaoHongShuCrawler.get_comments] 评论抓取失败（多为登录态失效），跳过 {note_id}: {e}")
+                return
+            except Exception as e:
+                utils.logger.warning(
+                    f"[XiaoHongShuCrawler.get_comments] 评论抓取异常，跳过 {note_id}: {type(e).__name__} {e}")
+                return
 
             # Sleep after fetching comments
             await asyncio.sleep(crawl_interval)
@@ -384,10 +686,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
     async def create_xhs_client(self, httpx_proxy: Optional[str]) -> XiaoHongShuClient:
         """Create Xiaohongshu client"""
         utils.logger.info("[XiaoHongShuCrawler.create_xhs_client] Begin create Xiaohongshu API client ...")
-        cookie_str, cookie_dict = await utils.convert_browser_context_cookies(
-            self.browser_context,
-            urls=self.cookie_urls,
-        )
+        if self.browser_context:
+            cookie_str, cookie_dict = await utils.convert_browser_context_cookies(
+                self.browser_context,
+                urls=self.cookie_urls,
+            )
+        else:
+            # 无浏览器模式（#3）：Cookie 由配置提供
+            cookie_str = config.COOKIES or ""
+            cookie_dict = utils.convert_str_cookie_to_dict(cookie_str)
         xhs_client_obj = XiaoHongShuClient(
             proxy=httpx_proxy,
             headers={
@@ -423,6 +730,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
     ) -> BrowserContext:
         """Launch browser and create browser context"""
         utils.logger.info("[XiaoHongShuCrawler.launch_browser] Begin create browser context ...")
+        # playwright 版本与本机浏览器版本不匹配时（要 1228 只有 1194），
+        # 回退到已安装的最高版本 Chromium，避免 "Executable doesn't exist" 直接崩
+        fallback_kwargs = chromium_launch_kwargs(chromium)
+        fallback_exe = fallback_kwargs.get("executable_path")
+        if fallback_exe:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler.launch_browser] 回退使用本机 Chromium: "
+                f"{fallback_exe}（建议执行 python -m playwright install chromium）")
         if config.SAVE_LOGIN_STATE:
             # feat issue #14
             # we will save login state to avoid login every time
@@ -437,10 +752,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
+                **fallback_kwargs,
             )
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy,
+                                            **fallback_kwargs)  # type: ignore
             browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             return browser_context
 

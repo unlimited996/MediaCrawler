@@ -1,4 +1,7 @@
 import axios from 'axios'
+import type { QueueList, QueueAddPayload } from '@/types/crawler'
+import type { ScheduledTask, ScheduledTaskRun, SchedulerStatus,
+              ScheduledTaskPayload } from '@/types/scheduler'
 
 const api = axios.create({
   baseURL: '/api',
@@ -7,6 +10,19 @@ const api = axios.create({
     'Content-Type': 'application/json',
   },
 })
+
+// 把后端返回的具体错误（detail）提升为 error.message，
+// 否则所有失败提示都是千篇一律的 "Request failed with status code 400"
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const detail = error?.response?.data?.detail
+    if (detail && typeof detail === 'string') {
+      error.message = detail
+    }
+    return Promise.reject(error)
+  },
+)
 
 // Types
 export interface CrawlerConfig {
@@ -70,6 +86,26 @@ export const crawlerApi = {
   stop: () => api.post('/crawler/stop'),
   getStatus: () => api.get<CrawlerStatus>('/crawler/status'),
   getLogs: (limit = 100) => api.get<{ logs: LogEntry[] }>('/crawler/logs', { params: { limit } }),
+  // 扫码登录二维码（后台服务用户看不到浏览器窗口，推到页面上扫）
+  getQrcode: () => api.get<{ qr: string | null; at?: string }>('/crawler/qrcode'),
+}
+
+/** 抓取队列：爬虫忙时提交的任务排队，前一个跑完自动续跑 */
+export const crawlerQueueApi = {
+  list: (status?: string) =>
+    api.get<QueueList>('/crawler/queue', { params: status ? { status } : {} }),
+  add: (payload: QueueAddPayload) =>
+    api.post<{ status: string; added: number[]; duplicates: string[]; message: string }>(
+      '/crawler/queue/add', payload),
+  remove: (id: number) =>
+    api.delete<{ status: string; removed: number }>(`/crawler/queue/${id}`),
+  clear: (statuses?: string[]) =>
+    api.post<{ status: string; removed: number; ids: number[] }>(
+      '/crawler/queue/clear', { statuses }),
+  retry: (payload: { ids?: number[]; all?: boolean }) =>
+    api.post<{ status: string; requeued: number; ids: number[] }>(
+      '/crawler/queue/retry', payload),
+  resume: () => api.post<{ status: string; message: string }>('/crawler/queue/resume'),
 }
 
 export const dataApi = {
@@ -79,6 +115,160 @@ export const dataApi = {
     api.get<FilePreviewResponse>('/data/files/' + path, { params: { preview: true, limit } }),
   getStats: () => api.get('/data/stats'),
   getDownloadUrl: (path: string) => `/api/data/download/${path}`,
+  deleteFile: (path: string) => api.delete<{ success: boolean; deleted: string }>(
+    '/data/files/' + path),
+}
+
+export interface ExportPdfResult {
+  success: boolean
+  name: string
+  size: number
+  record_count: number
+  image_count: number
+  download_url: string
+}
+
+export const exportApi = {
+  exportPdf: (payload: { file_path: string; limit?: number; embed_images?: boolean }) =>
+    api.post<ExportPdfResult>('/export/pdf', payload),
+  getDownloadUrl: (name: string) => `/api/export/download/${name}`,
+}
+
+export interface HotItem {
+  rank_no: number
+  title: string
+  hot_value: number | null
+  hot_value_text: string | null
+  content_url: string | null
+  tag: string | null
+}
+
+export interface HotBoard {
+  board_id: number
+  platform: string
+  board_code: string
+  board_name: string
+  /** 东八区 ISO 字符串（带 +08:00 偏移） */
+  captured_at: string
+  /** 东八区展示值：'2026-10-16 16:42' */
+  captured_at_local: string
+  items: HotItem[]
+}
+
+export interface HotSnapshot {
+  board_id: number
+  platform: string
+  board_code: string
+  board_name: string
+  /** 东八区 ISO 字符串（带 +08:00 偏移） */
+  captured_at: string
+  /** 东八区展示值：'2026-10-16 16:42' */
+  captured_at_local: string
+  /** 东八区简短值：'10-16 16:42'，时间轴节点用 */
+  captured_at_short: string
+  /** 0=今天 1=昨天 2=前天 …（按东八区日历日） */
+  day_offset: number
+  hour: number
+  item_count: number
+}
+
+export const discoverApi = {
+  boards: () => api.get<{
+    hot: { platform: string; board_code: string; board_name: string }[]
+    homefeed: string[]
+  }>('/discover/boards'),
+  // 不传 limit = 取平台返回的全部热搜（最大值）
+  capture: (platform: string, limit?: number) =>
+    api.post<{ code: number; data?: { board_id: number; item_count: number }; message?: string }>(
+      '/discover/hot/capture', null, { params: { platform, limit } }),
+  hotBoard: (boardId: number) => api.get<{ code: number; data?: HotBoard }>(`/discover/hot/board/${boardId}`),
+  history: (platform?: string, limit = 100) =>
+    api.get<{ items: HotSnapshot[] }>('/discover/hot/history', { params: { platform, limit } }),
+  compare: (boardA: number, boardB: number) => api.get<{
+    code: number
+    data?: {
+      new: string[]; gone: string[]
+      moved: { title: string; from: number; to: number; delta: number }[]
+      unchanged_count: number
+    }
+  }>('/discover/hot/compare', { params: { board_a: boardA, board_b: boardB } }),
+  deleteBoard: (boardId: number) =>
+    api.delete<{ code: number; data?: { deleted: number }; message?: string }>(
+      `/discover/hot/board/${boardId}`),
+}
+
+export interface AccountRow {
+  id: number
+  platform: string
+  account_name: string
+  status: string
+  health_score: number
+  fail_count: number
+  success_count: number
+  cooldown_until: string | null
+  has_cookie: boolean
+}
+
+export interface StoryRow {
+  id: number
+  title: string
+  summary: string
+  cover_url: string | null
+  category: string | null
+  platform: string | null
+  like_count: number
+  comment_count: number
+  heat_score: number
+  publish_ts: number | null
+  tags: string[]
+}
+
+export const storyApi = {
+  list: (params: {
+    platform?: string; keyword?: string; tag?: string; sort?: string
+    start_ts?: number; end_ts?: number; page?: number; page_size?: number
+  }) => api.get<{ items: StoryRow[]; total: number; page: number; page_size: number }>(
+    '/stories', { params }),
+  detail: (id: number) => api.get<Record<string, any>>(`/stories/${id}`),
+  remove: (id: number) =>
+    api.delete<{ success: boolean; deleted_id: number }>(`/stories/${id}`),
+  /** 批量硬删除（物理删除，含章节/评论/标签/附件与本地媒体文件） */
+  removeMany: (ids: number[], purge_files = true) =>
+    api.post<{
+      success: boolean; deleted_count: number; requested: number
+      cascade: Record<string, number>
+      failed: { id: number; error: string }[]
+    }>('/stories/batch-delete', { ids, purge_files }),
+  /** stance：按立场筛选 agree/neutral/oppose（相对发帖人核心观点，后端自动判定） */
+  comments: (id: number, sort = 'like', page = 1, page_size = 50, reply_limit = 20,
+             stance?: string, sentiment?: string) =>
+    api.get<{ items: any[]; total: number; page: number; page_size: number;
+              stance_stats?: { agree: number; neutral: number; oppose: number;
+                               total: number; agreement: string };
+              sentiment_stats?: { positive: number; neutral: number; negative: number;
+                                  total: number } }>(
+      `/stories/${id}/comments`,
+      { params: { sort, page, page_size, reply_limit, stance, sentiment } }),
+  /** 单条主评论的全部楼中楼：前端展开回复时按需拉取（默认接口只给前 20 条） */
+  commentReplies: (id: number, commentId: number, page = 1, page_size = 500) =>
+    api.get<{ items: any[]; total: number; page: number; page_size: number }>(
+      `/stories/${id}/comments/${commentId}/replies`, { params: { page, page_size } }),
+  tags: (limit = 50) =>
+    api.get<{ items: { name: string; count: number }[] }>('/stories/tags/list', { params: { limit } }),
+  stats: () => api.get<Record<string, any>>('/stories/stats/overview'),
+  /** 按勾选的 ID 导出 PDF */
+  exportSelected: (ids: number[], embed_images = true) =>
+    api.post<{ success: boolean; name: string; size: number; record_count: number; download_url: string }>(
+      '/export/stories', { ids, embed_images }),
+}
+
+export const accountsApi = {
+  list: (platform?: string) =>
+    api.get<{ code: number; data?: { items: AccountRow[]; total: number } }>(
+      '/accounts', { params: { platform } }),
+  upsert: (payload: { platform: string; account_name?: string; cookie: string }) =>
+    api.post<{ code: number; data?: { id: number } }>('/accounts', payload),
+  remove: (id: number) => api.delete<{ code: number }>(`/accounts/${id}`),
 }
 
 export const configApi = {
@@ -88,6 +278,8 @@ export const configApi = {
       login_types: ConfigOption[]
       crawler_types: ConfigOption[]
       save_options: ConfigOption[]
+      /** 当前不可用而被隐藏的存储方式（仅作提示，不出现在下拉里） */
+      save_options_hidden?: ConfigOption[]
     }>('/config/options'),
 }
 
@@ -103,3 +295,28 @@ export const envApi = {
 }
 
 export default api
+
+// ---------------- 定时拉取任务 ----------------
+export const schedulerApi = {
+  status: () => api.get<SchedulerStatus>('/scheduler/status'),
+  listTasks: () => api.get<ScheduledTask[]>('/scheduler/tasks'),
+  getTask: (id: number) => api.get<ScheduledTask>(`/scheduler/tasks/${id}`),
+  createTask: (payload: ScheduledTaskPayload) =>
+    api.post<ScheduledTask>('/scheduler/tasks', payload),
+  updateTask: (id: number, payload: Partial<ScheduledTaskPayload>) =>
+    api.put<ScheduledTask>(`/scheduler/tasks/${id}`, payload),
+  deleteTask: (id: number) =>
+    api.delete<{ status: string; deleted: number }>(`/scheduler/tasks/${id}`),
+  toggleTask: (id: number, enabled: boolean) =>
+    api.post<ScheduledTask>(`/scheduler/tasks/${id}/toggle`, { enabled }),
+  runTask: (id: number) =>
+    api.post<{ status: string; reason?: string; message?: string; new_count?: number;
+                updated_count?: number; run_id?: number; error?: string }>(
+      `/scheduler/tasks/${id}/run`),
+  listRuns: (taskId?: number, limit = 50) =>
+    api.get<ScheduledTaskRun[]>('/scheduler/runs', {
+      params: { task_id: taskId, limit },
+    }),
+  listTaskRuns: (taskId: number, limit = 50) =>
+    api.get<ScheduledTaskRun[]>(`/scheduler/tasks/${taskId}/runs`, { params: { limit } }),
+}

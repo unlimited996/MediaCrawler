@@ -160,6 +160,15 @@ class BrowserLauncher:
         if user_data_dir:
             args.append(f"--user-data-dir={user_data_dir}")
 
+        # 系统代理：Chromium 不像 httpx 那样读 http_proxy 环境变量，
+        # 必须显式传 --proxy-server，否则在需要代理的网络环境下
+        # 浏览器打不开目标站点（Page.goto 超时，整个抓取崩溃）。
+        proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") \
+            or os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+        if proxy:
+            args.append(f"--proxy-server={proxy}")
+            utils.logger.info(f"[BrowserLauncher] Using system proxy: {proxy}")
+
         utils.logger.info(f"[BrowserLauncher] Launching browser: {browser_path}")
         utils.logger.info(f"[BrowserLauncher] Debug port: {debug_port}")
         utils.logger.info(f"[BrowserLauncher] Headless mode: {headless}")

@@ -26,7 +26,8 @@ from typing import List
 import config
 from media_platform.xhs.media import extract_video_urls
 from var import source_keyword_var
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, mask_nickname, pick_avatar, build_profile_url
+from tools.v2_sync import persist_to_v2
 
 from ._store_impl import *
 
@@ -81,7 +82,9 @@ async def update_xhs_note(note_item: Dict):
         "time": note_item.get("time"),  # Note publish time
         "last_update_time": note_item.get("last_update_time", 0),  # Note last update time
         "creator_hash": anonymize_user_id(user_info.get("user_id")),  # 创作者匿名哈希(不存原始 user_id)
-        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
+        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称
+        "author_avatar": pick_avatar(user_info),  # 作者头像 URL
+        "author_url": build_profile_url("xhs", user_info),  # 用户主页 URL（跳转用）
         "liked_count": interact_info.get("liked_count"),  # Like count
         "collected_count": interact_info.get("collected_count"),  # Collection count
         "comment_count": interact_info.get("comment_count"),  # Comment count
@@ -95,6 +98,7 @@ async def update_xhs_note(note_item: Dict):
     }
     utils.logger.info(f"[store.xhs.update_xhs_note] xhs note: {local_db_item}")
     await XhsStoreFactory.create_store().store_content(local_db_item)
+    await persist_to_v2("xhs", local_db_item, "content")
 
 
 async def batch_update_xhs_note_comments(note_id: str, comments: List[Dict]):
@@ -133,7 +137,9 @@ async def update_xhs_note_comment(note_id: str, comment_item: Dict):
         "note_id": note_id,  # Note ID
         "content": comment_item.get("content"),  # Comment content
         "creator_hash": anonymize_user_id(user_info.get("user_id")),  # 创作者匿名哈希(不存原始 user_id)
-        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
+        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称
+        "author_avatar": pick_avatar(user_info),  # 作者头像 URL
+        "author_url": build_profile_url("xhs", user_info),  # 用户主页 URL（跳转用）
         "sub_comment_count": comment_item.get("sub_comment_count", 0),  # Sub-comment count
         "pictures": ",".join(comment_pictures),  # Comment pictures
         "parent_comment_id": target_comment.get("id", ""),  # Parent comment ID
@@ -142,6 +148,7 @@ async def update_xhs_note_comment(note_id: str, comment_item: Dict):
     }
     utils.logger.info(f"[store.xhs.update_xhs_note_comment] xhs note comment:{local_db_item}")
     await XhsStoreFactory.create_store().store_comment(local_db_item)
+    await persist_to_v2("xhs", local_db_item, "comment")
 
 
 async def save_creator(user_id: str, creator: Dict):

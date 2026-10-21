@@ -17,5 +17,9 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 from .crawler_manager import CrawlerManager, crawler_manager
+from .crawl_queue import CrawlQueue, QueueItem as QueueTask, crawl_queue
+from .task_scheduler import TaskScheduler, task_scheduler
 
-__all__ = ["CrawlerManager", "crawler_manager"]
+__all__ = ["CrawlerManager", "crawler_manager",
+           "CrawlQueue", "QueueTask", "crawl_queue",
+           "TaskScheduler", "task_scheduler"]

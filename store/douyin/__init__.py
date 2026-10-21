@@ -26,7 +26,8 @@ from typing import List
 import config
 from media_platform.douyin.media import extract_cover_url, extract_image_urls, extract_video_urls
 from var import source_keyword_var
-from tools.user_hash import anonymize_user_id, mask_nickname
+from tools.user_hash import anonymize_user_id, mask_nickname, pick_avatar, build_profile_url
+from tools.v2_sync import persist_to_v2
 
 from ._store_impl import *
 
@@ -102,7 +103,9 @@ async def update_douyin_aweme(aweme_item: Dict):
         "desc": aweme_item.get("desc", ""),
         "create_time": aweme_item.get("create_time"),
         "creator_hash": anonymize_user_id(user_info.get("uid")),  # 创作者匿名哈希(不存原始 uid)
-        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
+        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称
+        "author_avatar": pick_avatar(user_info),  # 作者头像 URL
+        "author_url": build_profile_url("dy", user_info),  # 用户主页 URL（跳转用）
         "liked_count": str(interact_info.get("digg_count")),
         "collected_count": str(interact_info.get("collect_count")),
         "comment_count": str(interact_info.get("comment_count")),
@@ -117,6 +120,7 @@ async def update_douyin_aweme(aweme_item: Dict):
     }
     utils.logger.info(f"[store.douyin.update_douyin_aweme] douyin aweme id:{aweme_id}, title:{save_content_item.get('title')}")
     await DouyinStoreFactory.create_store().store_content(content_item=save_content_item)
+    await persist_to_v2("dy", save_content_item, "content")
 
 
 async def batch_update_dy_aweme_comments(aweme_id: str, comments: List[Dict]):
@@ -140,7 +144,9 @@ async def update_dy_aweme_comment(aweme_id: str, comment_item: Dict):
         "aweme_id": aweme_id,
         "content": comment_item.get("text"),
         "creator_hash": anonymize_user_id(user_info.get("uid")),  # 创作者匿名哈希(不存原始 uid)
-        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
+        "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称
+        "author_avatar": pick_avatar(user_info),  # 作者头像 URL
+        "author_url": build_profile_url("dy", user_info),  # 用户主页 URL（跳转用）
         "sub_comment_count": str(comment_item.get("reply_comment_total", 0)),
         "like_count": (comment_item.get("digg_count") if comment_item.get("digg_count") else 0),
         "last_modify_ts": utils.get_current_timestamp(),
@@ -150,6 +156,7 @@ async def update_dy_aweme_comment(aweme_id: str, comment_item: Dict):
     utils.logger.info(f"[store.douyin.update_dy_aweme_comment] douyin aweme comment: {comment_id}, content: {save_comment_item.get('content')}")
 
     await DouyinStoreFactory.create_store().store_comment(comment_item=save_comment_item)
+    await persist_to_v2("dy", save_comment_item, "comment")
 
 
 async def save_creator(user_id: str, creator: Dict):

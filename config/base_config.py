@@ -17,6 +17,34 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+import os
+
+
+def _env_int(name: str, default: int) -> int:
+    """读整数型环境变量（非法值回退默认）。
+
+    容器部署时没法改这份文件，只能通过环境变量注入，所以关键数值参数都走这里。
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """读布尔型环境变量（1/true/yes/on 都算真）。
+
+    容器部署时没法改这份文件，只能通过环境变量注入，所以关键开关都走这里。
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 # Basic configuration
 PLATFORM = "xhs"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
 
@@ -24,7 +52,9 @@ PLATFORM = "xhs"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
 # 开启后 API 走 webapi.rednote.com，cookie 域使用 .rednote.com
 XHS_INTERNATIONAL = False
 
-KEYWORDS = "编程副业,编程兼职"  # Keyword search configuration, separated by English commas
+# 搜索关键词：**不设默认值**。搜索模式下为空会直接拒绝启动，
+# 避免出现"用户没填却默默用内置关键词抓取"的诡异行为。
+KEYWORDS = ""  # Keyword search configuration, separated by English commas
 LOGIN_TYPE = "qrcode"  # qrcode or phone or cookie
 COOKIES = ""
 CRAWLER_TYPE = (
@@ -47,7 +77,8 @@ STATIC_PROXY_URL = ""
 # Setting False will open a browser
 # If Xiaohongshu keeps scanning the code to log in but fails, open the browser and manually pass the sliding verification code.
 # If Douyin keeps prompting failure, open the browser and see if mobile phone number verification appears after scanning the QR code to log in. If it does, manually go through it and try again.
-HEADLESS = False
+# 支持环境变量覆盖：容器里没有图形界面，必须 headless（Dockerfile / compose 里设 HEADLESS=true）
+HEADLESS = _env_bool("HEADLESS", False)
 
 # Whether to save login status
 SAVE_LOGIN_STATE = True
@@ -56,7 +87,7 @@ SAVE_LOGIN_STATE = True
 # 是否启用 CDP 模式 - 使用用户本地的 Chrome/Edge 浏览器进行爬取，具有更好的反检测能力
 # 开启后，会自动检测并启动用户的 Chrome/Edge 浏览器，通过 CDP 协议进行控制
 # 该方式使用真实浏览器环境，包括用户的扩展、Cookie 和设置，大幅降低被风控检测的风险
-ENABLE_CDP_MODE = True
+ENABLE_CDP_MODE = False
 
 # CDP 调试端口，用于与浏览器通信
 # 如果端口被占用，系统会自动尝试下一个可用端口
@@ -99,10 +130,13 @@ USER_DATA_DIR = "%s_user_data_dir"  # %s will be replaced by platform name
 START_PAGE = 1
 
 # Control the number of crawled videos/posts
-CRAWLER_MAX_NOTES_COUNT = 15
+# 主页/创作者全量拉取时默认不限量（翻页到 has_more=false 为止），
+# 定时任务可在任务配置里单独覆盖
+CRAWLER_MAX_NOTES_COUNT = _env_int("CRAWLER_MAX_NOTES_COUNT", 15)
 
 # Controlling the number of concurrent crawlers
-MAX_CONCURRENCY_NUM = 1
+# 定时任务按任务的「并发数」配置通过环境变量注入
+MAX_CONCURRENCY_NUM = _env_int("MAX_CONCURRENCY_NUM", 1)
 
 # 是否启用媒体下载（封面、视频，以及图文帖的图片），默认关闭。
 # 开启后媒体文件按 {SAVE_DATA_PATH 或 data}/{platform}/media/{内容ID}/ 目录聚合存放。
@@ -114,7 +148,9 @@ ENABLE_GET_MEDIA = False
 ENABLE_GET_COMMENTS = True
 
 # Control the number of crawled first-level comments (single video/post)
-CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 10
+# 原默认 10 只覆盖小红书评论接口的第一页，热门帖（上千条评论）几乎必然漏采。
+# 30 = 首页 + 一页翻页的典型量，请求数可控。需要更多可在配置面板/CLI 覆盖。
+CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 30
 
 # Whether to enable the mode of crawling second-level comments. By default, crawling of second-level comments is not enabled.
 # If the old version of the project uses db, you need to refer to schema/tables.sql line 287 to add table fields.
@@ -137,7 +173,28 @@ STOP_WORDS_FILE = "./docs/hit_stopwords.txt"
 FONT_PATH = "./docs/STZHONGS.TTF"
 
 # Crawl interval
-CRAWLER_MAX_SLEEP_SEC = 2
+# 主页翻页 / 详情请求之间的 sleep 秒数，即「限流」间隔。
+# 定时任务按任务的「限流间隔」配置通过环境变量注入。
+CRAWLER_MAX_SLEEP_SEC = _env_int("CRAWLER_MAX_SLEEP_SEC", 2)
+
+# 打开首页的超时时间（秒）。弱网 / 代理环境下小红书首页资源多，
+# Playwright 默认的 30s + wait_until='load' 经常卡死导致整个抓取崩在第一步。
+# 代码里已改成 domcontentloaded 并重试 3 次，这里只控制单次等待上限。
+PAGE_GOTO_TIMEOUT_SEC = 45
+
+# ---------------------------------------------------------------------------
+# 定时拉取任务（api/services/task_scheduler.py）
+# ---------------------------------------------------------------------------
+# 调度器总开关：关掉后已存任务不自动执行（手动触发仍可用）
+SCHEDULER_ENABLED = _env_bool("SCHEDULER_ENABLED", True)
+# 同时执行的定时任务上限。抓取是单子进程模型，默认 1 最稳
+SCHEDULER_MAX_CONCURRENCY = _env_int("SCHEDULER_MAX_CONCURRENCY", 1)
+# 调度循环粒度（秒）：每个 tick 检查哪些任务到点
+SCHEDULER_TICK_SEC = _env_int("SCHEDULER_TICK_SEC", 15)
+# 到点时爬虫正忙：等待腾出抓取通道的最长时间（秒），超时记 skipped
+SCHEDULER_BUSY_WAIT_SEC = _env_int("SCHEDULER_BUSY_WAIT_SEC", 300)
+# 单次执行的运行记录保留条数（按任务）
+SCHEDULER_RUN_HISTORY = _env_int("SCHEDULER_RUN_HISTORY", 100)
 
 # 是否禁用 SSL 证书验证。仅在使用企业代理、Burp Suite、mitmproxy 等会注入自签名证书的中间人代理时设为 True。
 # 警告：禁用 SSL 验证将使所有流量暴露于中间人攻击风险，请勿在生产环境中开启。

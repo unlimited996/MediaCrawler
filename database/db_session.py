@@ -20,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 from .models import Base
 import config
 from config.db_config import mysql_db_config, sqlite_db_config, postgres_db_config
@@ -28,17 +29,41 @@ from config.db_config import mysql_db_config, sqlite_db_config, postgres_db_conf
 _engines = {}
 
 
+def _build_db_url(driver: str, host, port, user, password, db_name: str = "") -> str:
+    """拼接数据库 URL，并对用户名/密码做百分号转义。
+
+    密码里的 @ # : / ? 等字符若不转义会让 URL 解析错位会被当成
+    host 分隔符，导致认证信息整体错位），必须转义。
+    """
+    auth = f"{quote(str(user), safe='')}:{quote(str(password), safe='')}"
+    netloc = f"{auth}@{host}:{port}"
+    return f"{driver}://{netloc}/{db_name}" if db_name else f"{driver}://{netloc}"
+
+
 async def create_database_if_not_exists(db_type: str):
     if db_type == "mysql" or db_type == "db":
         # Connect to the server without a database
-        server_url = f"mysql+asyncmy://{mysql_db_config['user']}:{mysql_db_config['password']}@{mysql_db_config['host']}:{mysql_db_config['port']}"
+        server_url = _build_db_url(
+            "mysql+asyncmy",
+            mysql_db_config["host"],
+            mysql_db_config["port"],
+            mysql_db_config["user"],
+            mysql_db_config["password"],
+        )
         engine = create_async_engine(server_url, echo=False)
         async with engine.connect() as conn:
             await conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {mysql_db_config['db_name']}"))
         await engine.dispose()
     elif db_type == "postgres":
         # Connect to the default 'postgres' database
-        server_url = f"postgresql+asyncpg://{postgres_db_config['user']}:{postgres_db_config['password']}@{postgres_db_config['host']}:{postgres_db_config['port']}/postgres"
+        server_url = _build_db_url(
+            "postgresql+asyncpg",
+            postgres_db_config["host"],
+            postgres_db_config["port"],
+            postgres_db_config["user"],
+            postgres_db_config["password"],
+            "postgres",
+        )
         print(f"[init_db] Connecting to Postgres: host={postgres_db_config['host']}, port={postgres_db_config['port']}, user={postgres_db_config['user']}, dbname=postgres")
         # Isolation level AUTOCOMMIT is required for CREATE DATABASE
         engine = create_async_engine(server_url, echo=False, isolation_level="AUTOCOMMIT")
@@ -63,9 +88,23 @@ def get_async_engine(db_type: str = None):
     if db_type == "sqlite":
         db_url = f"sqlite+aiosqlite:///{sqlite_db_config['db_path']}"
     elif db_type == "mysql" or db_type == "db":
-        db_url = f"mysql+asyncmy://{mysql_db_config['user']}:{mysql_db_config['password']}@{mysql_db_config['host']}:{mysql_db_config['port']}/{mysql_db_config['db_name']}"
+        db_url = _build_db_url(
+            "mysql+asyncmy",
+            mysql_db_config["host"],
+            mysql_db_config["port"],
+            mysql_db_config["user"],
+            mysql_db_config["password"],
+            mysql_db_config["db_name"],
+        )
     elif db_type == "postgres":
-        db_url = f"postgresql+asyncpg://{postgres_db_config['user']}:{postgres_db_config['password']}@{postgres_db_config['host']}:{postgres_db_config['port']}/{postgres_db_config['db_name']}"
+        db_url = _build_db_url(
+            "postgresql+asyncpg",
+            postgres_db_config["host"],
+            postgres_db_config["port"],
+            postgres_db_config["user"],
+            postgres_db_config["password"],
+            postgres_db_config["db_name"],
+        )
     else:
         raise ValueError(f"Unsupported database type: {db_type}")
 

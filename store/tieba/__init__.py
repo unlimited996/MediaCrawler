@@ -24,6 +24,7 @@ from typing import List
 from model.m_baidu_tieba import TiebaComment, TiebaCreator, TiebaNote
 from var import source_keyword_var
 
+from tools.v2_sync import persist_to_v2
 from ._store_impl import *
 
 
@@ -78,6 +79,7 @@ async def update_tieba_note(note_item: TiebaNote):
     utils.logger.info(f"[store.tieba.update_tieba_note] tieba note: {save_note_item}")
 
     await TieBaStoreFactory.create_store().store_content(save_note_item)
+    await persist_to_v2("tieba", save_note_item, "content")
 
 
 async def batch_update_tieba_note_comments(note_id: str, comments: List[TiebaComment]):
@@ -110,6 +112,7 @@ async def update_tieba_note_comment(note_id: str, comment_item: TiebaComment):
     save_comment_item.update({"last_modify_ts": utils.get_current_timestamp()})
     utils.logger.info(f"[store.tieba.update_tieba_note_comment] tieba note id: {note_id} comment:{save_comment_item}")
     await TieBaStoreFactory.create_store().store_comment(save_comment_item)
+    await persist_to_v2("tieba", save_comment_item, "comment")
 
 
 async def save_creator(user_info: TiebaCreator):

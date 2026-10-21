@@ -192,6 +192,11 @@ class XiaoHongShuLogin(AbstractLogin):
         _, cookie_dict = utils.convert_cookies(current_cookie)
         no_logged_in_session = cookie_dict.get("web_session")
 
+        # 把二维码推给 WebUI：后台服务里用户看不到 PIL 弹出的图片窗口，
+        # 也没有终端。用带 [QRCODE] 前缀的日志行输出 base64，
+        # API 服务解析后存起来，前端轮询展示，用户直接在页面上扫。
+        utils.logger.info(f"[QRCODE]{base64_qrcode_img}")
+
         # show login qrcode
         # fix issue #12
         # we need to use partial function to call show_qrcode function and run in executor

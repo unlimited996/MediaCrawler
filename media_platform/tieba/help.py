@@ -107,7 +107,7 @@ class TieBaExtractor:
         return f"{const.TIEBA_URL}/home/main?id={quote(str(portrait))}"
 
     @staticmethod
-    def _api_user_avatar(user: Dict) -> str:
+    def _api_author_avatar(user: Dict) -> str:
         image_data = (
             (user or {})
             .get("user_show_info", {})
@@ -179,6 +179,8 @@ class TieBaExtractor:
             ),
             creator_hash=anonymize_user_id(self._api_user_link(author)),
             user_nickname=mask_nickname(author.get("name_show") or author.get("name") or ""),
+            author_avatar=self._api_author_avatar(author),
+            author_url=self._api_user_link(author),
             tieba_name=tieba_name,
             tieba_link=self._tieba_link_from_name(tieba_name),
             total_replay_num=thread.get("reply_num") or 0,
@@ -210,6 +212,8 @@ class TieBaExtractor:
                 note_url=note_detail.note_url,
                 creator_hash=anonymize_user_id(self._api_user_link(user)),
                 user_nickname=mask_nickname(user.get("name_show") or user.get("name") or ""),
+                author_avatar=self._api_author_avatar(user),
+                author_url=self._api_user_link(user),
                 tieba_id=tieba_id,
                 tieba_name=tieba_name,
                 tieba_link=tieba_link,
@@ -581,12 +585,12 @@ class TieBaExtractor:
             ).get(default="").strip()
             ip_location, publish_time = self.extract_ip_and_pub_time(other_info_content)
             user_selector = comment_selector.xpath(f".//a[{self._class_contains('p_author_name')}][1]")
-            user_avatar = comment_selector.xpath(
+            author_avatar = comment_selector.xpath(
                 f".//a[{self._class_contains('p_author_face')}]//img/@src"
             ).get(default="").strip()
-            if not user_avatar and comment_field_value.get("author", {}).get("portrait"):
+            if not author_avatar and comment_field_value.get("author", {}).get("portrait"):
                 portrait = comment_field_value["author"]["portrait"]
-                user_avatar = (
+                author_avatar = (
                     "https://gss0.bdstatic.com/6LZ1dD3d1sgCo2Kml5_Y_D3/sys/portrait/item/"
                     f"{portrait}"
                 )

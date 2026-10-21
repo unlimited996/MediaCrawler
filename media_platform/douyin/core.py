@@ -37,6 +37,7 @@ from media_downloader import MediaDownloader
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
+from tools.crawler_util import system_playwright_proxy
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
@@ -73,6 +74,11 @@ class DouYinCrawler(AbstractCrawler):
             self.ip_proxy_pool = await create_ip_pool(config.IP_PROXY_POOL_COUNT, enable_validate_ip=True)
             ip_proxy_info: IpInfoModel = await self.ip_proxy_pool.get_proxy()
             playwright_proxy_format, httpx_proxy_format = utils.format_proxy_info(ip_proxy_info)
+        else:
+            # 未配代理池时回退系统代理（Chromium 不读 http_proxy 环境变量）
+            playwright_proxy_format = system_playwright_proxy()
+            if playwright_proxy_format:
+                utils.logger.info(f"[{self.__class__.__name__}] 使用系统代理: {playwright_proxy_format['server']}")
 
         async with async_playwright() as playwright:
             # Select startup mode based on configuration
@@ -339,6 +345,9 @@ class DouYinCrawler(AbstractCrawler):
         headless: bool = True,
     ) -> BrowserContext:
         """Launch browser and create browser context"""
+        from tools.crawler_util import chromium_launch_kwargs
+        # playwright 期望的 Chromium 版本缺失时回退到本机已装版本
+        fallback_kwargs = chromium_launch_kwargs(chromium)
         if config.SAVE_LOGIN_STATE:
             user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
             browser_context = await chromium.launch_persistent_context(
@@ -351,10 +360,12 @@ class DouYinCrawler(AbstractCrawler):
                     "height": 1080
                 },
                 user_agent=user_agent,
+                **fallback_kwargs,
             )  # type: ignore
             return browser_context
         else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
+            browser = await chromium.launch(headless=headless, proxy=playwright_proxy,
+                                                **fallback_kwargs)  # type: ignore
             browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
             return browser_context
 

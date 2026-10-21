@@ -1,0 +1,162 @@
+# -*- coding: utf-8 -*-
+"""定时拉取任务的 API 数据模型。"""
+
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+from .crawler import LoginTypeEnum, PlatformEnum, SaveDataOptionEnum
+
+
+MIN_INTERVAL_SEC = 60          # 1 分钟
+MAX_INTERVAL_SEC = 2592000     # 30 天
+
+
+class TaskOptions(BaseModel):
+    """任务的抓取选项（与手动抓取配置保持一致）。"""
+    login_type: LoginTypeEnum = LoginTypeEnum.COOKIE
+    enable_comments: bool = True
+    enable_sub_comments: bool = False
+    enable_media: bool = False
+    save_option: SaveDataOptionEnum = SaveDataOptionEnum.POSTGRES
+    headless: bool = True
+    cookies: str = ""
+    max_comments_count: Optional[int] = Field(default=None, ge=1, le=10000)
+
+
+class ScheduledTaskCreate(BaseModel):
+    """创建定时任务。"""
+    name: str = Field(min_length=1, max_length=128)
+    platform: PlatformEnum
+    task_type: Literal["profile", "note"]
+    target: str = Field(min_length=1)
+    mode: Literal["full", "incremental"] = "incremental"
+    schedule_type: Literal["interval", "cron"] = "interval"
+    interval_sec: Optional[int] = Field(default=3600, ge=MIN_INTERVAL_SEC,
+                                        le=MAX_INTERVAL_SEC)
+    cron_expr: Optional[str] = None
+    max_concurrency: int = Field(default=1, ge=1, le=10)
+    timeout_sec: int = Field(default=1800, ge=60, le=86400)
+    retry_count: int = Field(default=1, ge=0, le=5)
+    retry_delay_sec: int = Field(default=60, ge=0, le=3600)
+    rate_interval_sec: int = Field(default=3, ge=0, le=60)
+    options: TaskOptions = Field(default_factory=TaskOptions)
+    enabled: bool = True
+
+    @field_validator("target")
+    @classmethod
+    def _strip_target(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("目标地址不能为空")
+        if len(v) > 2000:
+            raise ValueError("目标地址过长（>2000 字符）")
+        return v
+
+    @field_validator("cron_expr")
+    @classmethod
+    def _validate_cron(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        # 复用调度器的解析器，非法表达式在入口就拦掉
+        from ..services.task_scheduler import parse_cron
+        try:
+            parse_cron(v)
+        except Exception as e:
+            raise ValueError(f"cron 表达式无效：{e}")
+        return v
+
+    def model_post_init(self, __context) -> None:
+        # 调度方式与参数的交叉校验（pydantic v2 的 model_validator 替代写法）
+        if self.schedule_type == "interval" and not self.interval_sec:
+            raise ValueError("interval 调度必须提供 interval_sec")
+        if self.schedule_type == "cron" and not self.cron_expr:
+            raise ValueError("cron 调度必须提供 cron_expr")
+
+
+class ScheduledTaskUpdate(BaseModel):
+    """更新定时任务（只传要改的字段）。"""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    target: Optional[str] = None
+    mode: Optional[Literal["full", "incremental"]] = None
+    schedule_type: Optional[Literal["interval", "cron"]] = None
+    interval_sec: Optional[int] = Field(default=None, ge=MIN_INTERVAL_SEC,
+                                        le=MAX_INTERVAL_SEC)
+    cron_expr: Optional[str] = None
+    max_concurrency: Optional[int] = Field(default=None, ge=1, le=10)
+    timeout_sec: Optional[int] = Field(default=None, ge=60, le=86400)
+    retry_count: Optional[int] = Field(default=None, ge=0, le=5)
+    retry_delay_sec: Optional[int] = Field(default=None, ge=0, le=3600)
+    rate_interval_sec: Optional[int] = Field(default=None, ge=0, le=60)
+    options: Optional[TaskOptions] = None
+    enabled: Optional[bool] = None
+
+    @field_validator("cron_expr")
+    @classmethod
+    def _validate_cron(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not v.strip():
+            return None
+        from ..services.task_scheduler import parse_cron
+        try:
+            parse_cron(v.strip())
+        except Exception as e:
+            raise ValueError(f"cron 表达式无效：{e}")
+        return v.strip()
+
+
+class ScheduledTaskOut(BaseModel):
+    id: int
+    task_code: str
+    name: str
+    platform: str
+    task_type: str
+    target: str
+    mode: str
+    schedule_type: str
+    interval_sec: Optional[int] = None
+    cron_expr: Optional[str] = None
+    max_concurrency: int = 1
+    timeout_sec: int = 1800
+    retry_count: int = 1
+    retry_delay_sec: int = 60
+    rate_interval_sec: int = 3
+    options: dict = Field(default_factory=dict)
+    enabled: bool = True
+    status: str = "idle"
+    last_run_at: Optional[str] = None
+    last_status: Optional[str] = None
+    last_error: Optional[str] = None
+    next_run_at: Optional[str] = None
+    run_count: int = 0
+    created_at: Optional[str] = None
+
+
+class ScheduledTaskRunOut(BaseModel):
+    id: int
+    task_id: int
+    trigger_type: str
+    status: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    duration_ms: Optional[int] = None
+    new_count: int = 0
+    updated_count: int = 0
+    skipped_count: int = 0
+    attempt_count: int = 1
+    error_message: Optional[str] = None
+    log_tail: list = Field(default_factory=list)
+
+
+class SchedulerStatusOut(BaseModel):
+    started: bool = False
+    enabled: bool = True
+    max_concurrency: int = 1
+    tick_sec: int = 15
+    total_tasks: int = 0
+    enabled_tasks: int = 0
+    running_tasks: int = 0
+    last_tick_at: Optional[str] = None
+    last_error: str = ""

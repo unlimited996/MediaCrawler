@@ -30,7 +30,7 @@ import re
 import urllib
 import urllib.parse
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import httpx
 from PIL import Image, ImageDraw, ImageShow
@@ -186,6 +186,41 @@ def match_interact_info_count(count_str: str) -> int:
         return 0
 
 
+def safe_int(value, default: int = 0) -> int:
+    """把平台接口返回的计数字段安全地转成 int。
+
+    平台返回的计数经常是**字符串**（如 "0"），直接 `x == 0` 判断会漏掉它
+    （Python 中非空字符串 truthy 且 "0" != 0），再拿去 `//` 整除会直接 TypeError。
+    结果是：对没有回复的评论也逐个发起请求，白白放大请求量并触发风控。
+
+    另外平台爱用中文万/亿或 k/w 缩写做展示值（小红书 "2万"、B站 "1.2万"），
+    这类值必须按单位换算，否则 "2万" 会变成 2，排序/统计全错。
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        pass
+    # 形如 "1.2万" / "3k" / "1,234" 的展示值：提取数值并按单位换算
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(亿|万|w|W|k|K|千)?", str(value))
+    if not match:
+        return default
+    num = float(match.group(1))
+    unit = match.group(2)
+    if unit == "亿":
+        num *= 100_000_000
+    elif unit in ("万", "w", "W"):
+        num *= 10_000
+    elif unit in ("k", "K", "千"):
+        num *= 1_000
+    return int(num)
+
+
 def format_proxy_info(ip_proxy_info) -> Tuple[Optional[Dict], Optional[str]]:
     """format proxy info for playwright and httpx"""
     # fix circular import issue
@@ -231,3 +266,105 @@ def extract_url_params_to_dict(url: str) -> Dict:
     parsed_url = urllib.parse.urlparse(url)
     url_params_dict = dict(urllib.parse.parse_qsl(parsed_url.query))
     return url_params_dict
+
+
+def system_playwright_proxy() -> Optional[Dict]:
+    """无代理池配置时，回退读取系统代理环境变量，转成 playwright proxy 格式。
+
+    背景：Chromium 不像 httpx/requests 那样读 http_proxy 环境变量。在需要
+    代理的网络环境（公司网络/软路由/科学上网）下，不显式给浏览器传代理会导致
+    Page.goto 超时、整个抓取崩溃；而同一环境里 httpx 客户端却能正常走代理，
+    故障现象非常割裂（头像代理成功、浏览器打不开网页）。
+    """
+    import os
+    from urllib.parse import urlparse
+
+    raw = (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+           or os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+           or "").strip()
+    if not raw or raw.lower() in ("none", "direct"):
+        return None
+    parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+    if not parsed.hostname or not parsed.port:
+        return None
+    proxy: Dict[str, str] = {"server": f"{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        proxy["username"] = parsed.username
+    if parsed.password:
+        proxy["password"] = parsed.password or ""
+    return proxy
+
+
+def chromium_launch_kwargs(browser_type=None) -> Dict[str, Any]:
+    """给 chromium.launch*() 补启动参数。
+
+    两件事：
+    1. 容器内以 root 跑 Chromium 必须关沙箱，否则进程直接退出（报 "Target closed"
+       或 "Running as root without --no-sandbox is not supported"）。
+       由环境变量 PLAYWRIGHT_NO_SANDBOX=1 打开，本地 Windows 不设就不受影响。
+    2. 解决「浏览器版本对不上」——见下方原注释。
+
+    用法：
+        kwargs = chromium_launch_kwargs(chromium)
+        await chromium.launch_persistent_context(..., **kwargs)
+    """
+    import os
+
+    kwargs: Dict[str, Any] = {}
+
+    # ① 容器（Docker / root）环境：关沙箱 + 避坑选项
+    if str(os.environ.get("PLAYWRIGHT_NO_SANDBOX", "")).strip().lower() in ("1", "true", "yes", "on"):
+        kwargs["args"] = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",  # 容器 /dev/shm 默认 64M，不关会崩
+            "--disable-gpu",
+        ]
+
+    # ② 浏览器可执行文件路径兜底
+    expected = None
+    if browser_type is not None:
+        try:
+            expected = browser_type.executable_path  # playwright 期望的路径（未必存在）
+        except Exception:
+            expected = None
+    if expected and os.path.exists(expected):
+        return kwargs                                 # 版本匹配，用默认即可
+
+    candidates: List[Tuple[int, str]] = []
+
+    def _add(path: str, rank: int) -> None:
+        if path and os.path.exists(path):
+            candidates.append((rank, path))
+
+    # 1) ms-playwright 目录下所有 chromium-<rev>
+    #    Windows 布局是 chrome-win/chrome.exe，Linux 是 chrome-linux/chrome
+    root = (os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+            or os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright"))
+    if os.path.isdir(root):
+        for name in os.listdir(root):
+            if not name.startswith("chromium-"):
+                continue
+            try:
+                rev = int(name.split("-", 1)[1])
+            except (IndexError, ValueError):
+                rev = 0
+            base = os.path.join(root, name)
+            for sub in ("chrome-win", "chrome-win64", "chrome-linux"):
+                _add(os.path.join(base, sub, "chrome.exe"), rev)
+                _add(os.path.join(base, sub, "chrome"), rev)
+
+    # 2) 系统安装的 Chrome / Edge（兜底）
+    for p in (os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                           "Google", "Chrome", "Application", "chrome.exe"),
+              os.path.join(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                           "Google", "Chrome", "Application", "chrome.exe"),
+              os.path.join(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                           "Microsoft", "Edge", "Application", "msedge.exe")):
+        _add(p, -1)
+
+    if not candidates:
+        return kwargs
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    kwargs["executable_path"] = candidates[0][1]
+    return kwargs
