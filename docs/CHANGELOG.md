@@ -49,11 +49,21 @@
 ### 验证
 - 小红书配置加载：CDP=True / HEADLESS=False / CONNECT_EXISTING=True /
   AUTO_CLOSE=False / 并发=1 / 间隔 5-15 随机，全部生效；
+- CDP 实连测试：程序自行拉起 Chrome 154 → connect_over_cdp → 打开小红书首页；
+  `cleanup(auto_close=False)` 确认浏览器进程保持常开（修复了 keep_open
+  语义写反的 bug：曾把 auto_close 的值直接赋给 keep_open）；
 - 调度窗口：凌晨 3 点判定不在窗口、下次开窗=当日 06:00，23:30 在窗口内；
 - PDF 导入：单文件链路（正文+互动数+155 条评论+配图+楼中楼 86 条链接+
-  自动入 S3 备份 uploaded）全部验证通过；全量 10 篇（momo 9 篇 +
-  另 1 篇）导入中；
-- 前端 `tsc -b` 与 `npm run build` 通过。
+  自动入 S3 备份 uploaded）全部验证通过；全量导入 6/10 篇完成
+  （momo 5 篇 + 根目录 1 篇，约 4200 条评论、75 张配图，图片已自动入 S3）；
+  剩余 4 篇进行中时 **joyeuse.cn:5432 数据库侧故障**（同主机 S3 3900 正常，
+  DNS 正常，PG 端口 TCP 超时，API 与导入同时受影响），属外部不可用，
+  数据库恢复后重跑同一命令即可幂等续导：
+  `python scripts/import_pdf_archive.py --dir "C:\Users\11826\WorkBuddy\2026-10-14-11-20-16"`；
+- 6 条评论曾因 PDF 抽取带入的 NUL 字节入库失败，脚本已加 `_clean_str`
+  清洗（NUL/C0 控制符/孤立代理项），重跑时自动补入；
+- 前端 `tsc -b` 与 `npm run build` 通过；浏览器冒烟 0 控制台错误；
+  网格「已备份」纯图标徽标、无编辑记录时「编辑记录」禁用均实测通过。
 
 ---
 

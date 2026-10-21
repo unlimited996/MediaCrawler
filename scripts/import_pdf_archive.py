@@ -113,6 +113,28 @@ def _parse_date(text: str, ref: Optional[datetime] = None,
     return None
 
 
+def _clean_str(s: Any) -> Any:
+    """清洗 PDF 抽取文本里的非法字符。
+
+    PostgreSQL UTF8 不接受 NUL（\\x00），PDF 文本抽取偶发带入；
+    其它 C0 控制字符（换行/制表符除外）一并去掉，避免入库报
+    CharacterNotInRepertoireError 整条丢弃。
+    """
+    if not isinstance(s, str):
+        return s
+    if not s:
+        return s
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if ch in ("\n", "\r", "\t") or o >= 0x20:
+            # 孤立代理项同样无法编码进 UTF8
+            if 0xD800 <= o <= 0xDFFF:
+                continue
+            out.append(ch)
+    return "".join(out)
+
+
 def _page1_parse(lines: List[str]) -> Dict[str, Any]:
     """解析第 1 页头部：标题 / 作者 / 发布时间 / IP / 互动数 / 正文起点。"""
     # 去掉首行留档标识（「小红书 · 帖子留档 第 1 / 9 篇」等）
@@ -222,13 +244,14 @@ def _parse_comment_blocks(text: str, ref_now: Optional[datetime],
         item = {
             "id": cmt_id,
             "note_id": "",
-            "content": "".join(content_lines),
+            "content": _clean_str("".join(content_lines)),
             "create_time": create_ms,
             "like_count": like_count,
             "sub_comment_count": 0,
             "pictures": [],
-            "user_info": {"user_id": user_id, "nickname": nickname,
-                          "image": "", "region": region},
+            "user_info": {"user_id": _clean_str(user_id),
+                          "nickname": _clean_str(nickname),
+                          "image": "", "region": _clean_str(region)},
             "target_comment": {"id": parent_id} if is_reply else {"id": ""},
         }
         out.append(item)
@@ -382,12 +405,12 @@ async def import_note(parsed: Dict[str, Any], save_images: bool = True,
     note_item = {
         "note_id": note_id,
         "type": "normal",
-        "title": parsed["title"],
-        "desc": parsed["content"],
+        "title": _clean_str(parsed["title"]) or "",
+        "desc": _clean_str(parsed["content"]) or "",
         "time": parsed["publish_ms"],
         "last_update_time": parsed["publish_ms"],
         "ip_location": parsed["ip_location"],
-        "user": {"user_id": user_id, "nickname": parsed["nickname"],
+        "user": {"user_id": user_id, "nickname": _clean_str(parsed["nickname"]) or "",
                  "avatar": f"/api/data/raw/{avatar_rel}" if avatar_rel else "",
                  "xsec_token": ""},
         "interact_info": {
