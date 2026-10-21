@@ -4,9 +4,12 @@
 GET /api/stories              列表（平台/标签/关键词筛选，热度/时间/点赞排序，分页）
 GET /api/stories/{id}         详情（含章节、标签、附件）
 GET /api/stories/{id}/comments 评论树（主楼分页 + 楼中楼按时间）
+GET /api/stories/{id}/watch    关注状态（关注此贴 / 关注此人）
+POST /api/stories/{id}/watch/{kind}  开关关注（kind=note|author）
 GET /api/stats/overview       总览统计
 GET /api/tags                 标签列表
 """
+import asyncio
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -693,3 +696,197 @@ async def delete_story(story_id: int, purge_files: bool = True):
     finally:
         await session.close()
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 关注（定时更新）
+#
+# 详情页的【关注此贴】/【关注此人】：复用现有定时调度器（api/services/
+# task_scheduler.py，纯 asyncio，无第三方依赖）建一条「每天跑一次」的任务，
+# 抓取参数与详情页「重新拉取」完全一致（平台 / 原文链接 / 开评论+子评论+
+# 媒体 / 直写 PG）。任务编码固定为 watch-note-{id} / watch-author-{平台}-{作者}，
+# 同一个对象反复开关只会复用同一条任务，不会堆积。
+# ---------------------------------------------------------------------------
+
+#: 关注任务的周期：每天一次
+WATCH_INTERVAL_SEC = 86400
+
+
+async def _load_watch_targets(story_id: int) -> Optional[Dict[str, Any]]:
+    """取建关注任务需要的信息：平台、原文链接、作者主页。"""
+    engine, session = await _session()
+    if session is None:
+        return None
+    try:
+        story = (await session.execute(
+            select(Story).where(Story.id == story_id, Story.deleted_at.is_(None))
+        )).scalar_one_or_none()
+        if not story:
+            return None
+
+        platform_code = None
+        if story.primary_site_id:
+            platform_code = (await session.execute(
+                select(SourceSite.code).where(SourceSite.id == story.primary_site_id)
+            )).scalar()
+
+        # 原文链接：优先章节上的（详情页「重新拉取」用的就是它）
+        source_url = (await session.execute(
+            select(StoryChapter.source_url).where(
+                StoryChapter.story_id == story_id,
+                StoryChapter.source_url.isnot(None),
+            ).order_by(StoryChapter.seq_no).limit(1)
+        )).scalar() or ""
+
+        author_url = ""
+        author_name = ""
+        if story.author_id:
+            row = (await session.execute(
+                select(Author.nickname, Author.profile_url)
+                .where(Author.id == story.author_id)
+            )).first()
+            if row:
+                author_name = row[0] or ""
+                author_url = row[1] or ""
+
+        return {
+            "story_id": story_id,
+            "title": story.title or "",
+            "platform": platform_code or "",
+            "source_url": source_url,
+            "author_id": story.author_id,
+            "author_name": author_name,
+            "author_url": author_url,
+        }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+def _watch_codes(info: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "note": f"watch-note-{info['story_id']}",
+        "author": f"watch-author-{info['platform']}-{info.get('author_id') or 0}",
+    }
+
+
+def _watch_view(task: Optional[Dict[str, Any]], supported: bool) -> Dict[str, Any]:
+    """任务行 → 前端开关状态。任务不存在 = 未关注。"""
+    if not task:
+        return {"enabled": False, "task_id": None, "supported": supported,
+                "last_run_at": None, "last_status": None, "last_error": None,
+                "next_run_at": None, "stopped": False, "stop_reason": ""}
+    opts = task.get("options") or {}
+    return {
+        "enabled": bool(task.get("enabled")),
+        "task_id": task.get("id"),
+        "supported": supported,
+        "last_run_at": task.get("last_run_at"),
+        "last_status": task.get("last_status"),
+        "last_error": task.get("last_error"),
+        "next_run_at": task.get("next_run_at"),
+        # stopped：任务被自动停了（目标没了），不是用户手动关的
+        "stopped": bool(opts.get("auto_stopped")) and not task.get("enabled"),
+        "stop_reason": opts.get("auto_stop_reason") or "",
+    }
+
+
+def _watch_options() -> Dict[str, Any]:
+    """抓取选项：与详情页「重新拉取」保持一致。"""
+    return {
+        "login_type": "cookie",
+        "enable_comments": True,
+        "enable_sub_comments": True,
+        "enable_media": True,
+        "save_option": "postgres",
+        "headless": True,
+        "cookies": "",
+        "max_comments_count": None,
+    }
+
+
+@router.get("/{story_id}/watch")
+async def get_story_watch(story_id: int):
+    """关注状态：【关注此贴】/【关注此人】两个开关的当前状态。"""
+    info = await _load_watch_targets(story_id)
+    if info is None:
+        return {"detail": "not found"}
+    from ..services.task_scheduler import task_scheduler
+
+    codes = _watch_codes(info)
+    note = await task_scheduler.get_task_by_code(codes["note"])
+    author = await task_scheduler.get_task_by_code(codes["author"])
+    return {
+        "note": _watch_view(note, bool(info["source_url"])),
+        "author": _watch_view(author, bool(info["author_url"])),
+    }
+
+
+@router.post("/{story_id}/watch/{kind}")
+async def set_story_watch(story_id: int, kind: str,
+                          payload: Dict[str, Any] = Body(default={})):
+    """开关关注。kind=note | author，body: {"enabled": true|false}"""
+    if kind not in ("note", "author"):
+        raise HTTPException(status_code=400, detail="kind 只能是 note 或 author")
+    enabled = bool(payload.get("enabled", True))
+
+    info = await _load_watch_targets(story_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail="内容不存在")
+
+    from ..services.task_scheduler import task_scheduler
+
+    codes = _watch_codes(info)
+    code = codes[kind]
+    if kind == "note":
+        if not info["source_url"]:
+            raise HTTPException(status_code=400, detail="该内容没有原文链接，无法关注此贴")
+        target = info["source_url"]
+        task_type = "note"
+        name = f"关注此贴：{(info['title'] or '未命名')[:24]}"
+    else:
+        if not info["author_url"]:
+            raise HTTPException(status_code=400, detail="该作者没有主页链接，无法关注此人")
+        target = info["author_url"]
+        task_type = "profile"
+        name = f"关注此人：{(info['author_name'] or '未知作者')[:24]}"
+
+    task = await task_scheduler.get_task_by_code(code)
+
+    if task is None:
+        if not enabled:
+            return {kind: _watch_view(None, True), "kind": kind}
+        task = await task_scheduler.create_task({
+            "task_code": code,
+            "name": name,
+            "platform": info["platform"],
+            "task_type": task_type,
+            "target": target,
+            "mode": "incremental",
+            "schedule_type": "interval",
+            "interval_sec": WATCH_INTERVAL_SEC,
+            "options": _watch_options(),
+            "enabled": True,
+        })
+    else:
+        # 手动开关一律清掉「自动停止」标记：用户重新关注即视为已知情，
+        # 手动关闭也不该再提示「已自动停止」
+        opts = dict(task.get("options") or {})
+        for k in ("auto_stopped", "auto_stop_reason", "auto_stopped_at"):
+            opts.pop(k, None)
+        task = await task_scheduler.update_task(
+            task["id"], {"enabled": enabled, "options": opts,
+                         "target": target, "name": name}) or task
+
+    if enabled and bool(payload.get("run_now", True)):
+        # 立刻拉一次，关注后不用等明天才看到数据。
+        # 放到后台跑：抓取动辄几分钟，绝不能挂在这个请求上（否则前端一直转圈）
+        async def _kickoff() -> None:
+            try:
+                await task_scheduler.trigger(task["id"])
+            except Exception as e:  # 立即执行失败不影响开关状态，下次调度仍会跑
+                print(f"[watch] 关注后首次拉取失败 task={task['id']}: {e}")
+
+        asyncio.create_task(_kickoff())
+
+    return {"kind": kind, kind: _watch_view(task, True)}

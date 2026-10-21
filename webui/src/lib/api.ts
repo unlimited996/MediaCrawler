@@ -223,6 +223,21 @@ export interface StoryRow {
   tags: string[]
 }
 
+/** 详情页关注开关状态（对应后端 /stories/{id}/watch） */
+export interface WatchState {
+  enabled: boolean
+  task_id: number | null
+  /** 该对象是否具备建任务的条件（有原文链接 / 有作者主页） */
+  supported: boolean
+  last_run_at: string | null
+  last_status: string | null
+  last_error: string | null
+  next_run_at: string | null
+  /** 任务因目标失效（帖子被删/无权限）被自动停止 */
+  stopped: boolean
+  stop_reason: string
+}
+
 export const storyApi = {
   list: (params: {
     platform?: string; keyword?: string; tag?: string; sort?: string
@@ -256,6 +271,13 @@ export const storyApi = {
   tags: (limit = 50) =>
     api.get<{ items: { name: string; count: number }[] }>('/stories/tags/list', { params: { limit } }),
   stats: () => api.get<Record<string, any>>('/stories/stats/overview'),
+  /** 关注状态：【关注此贴】(note) / 【关注此人】(author) */
+  watch: (id: number) =>
+    api.get<{ note: WatchState; author: WatchState }>(`/stories/${id}/watch`),
+  /** 开关关注；开启时会立即拉取一次，之后每天一次 */
+  setWatch: (id: number, kind: 'note' | 'author', enabled: boolean) =>
+    api.post<{ kind: string; note?: WatchState; author?: WatchState }>(
+      `/stories/${id}/watch/${kind}`, { enabled }),
   /** 按勾选的 ID 导出 PDF */
   exportSelected: (ids: number[], embed_images = true) =>
     api.post<{ success: boolean; name: string; size: number; record_count: number; download_url: string }>(

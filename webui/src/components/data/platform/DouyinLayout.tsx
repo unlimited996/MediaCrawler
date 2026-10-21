@@ -125,7 +125,6 @@ export function DouyinLayout({ d, comments, commentsTotal, commentsToolbar, t, t
                     containerClassName="mt-2 space-y-1.5 rounded-lg bg-white/5 p-2.5"
                     mutedClassName="text-white/50"
                     textClassName="text-white/70"
-                    dark
                   />
                 </div>
               </li>

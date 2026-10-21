@@ -228,7 +228,7 @@ export { RichText, renderEmoji, useEmojiMap } from './EmojiText'
  * 没有 author_url 时退化为不带链接的普通渲染（不留死链）。
  */
 export function AuthorLink({
-  url, name, avatar, theme, size = 28, square = false,
+  url, name, avatar, theme, size = 28, square = false, className = '',
 }: {
   url?: string | null
   name?: string | null
@@ -236,14 +236,18 @@ export function AuthorLink({
   theme: PlatformTheme
   size?: number
   square?: boolean
+  /** 附加样式（子评论头像等需要额外对齐时用） */
+  className?: string
 }) {
   const avatarEl = (
     <PlatformAvatar name={name} avatar={avatar} theme={theme} size={size} square={square} />
   )
-  if (!url || !/^https?:\/\//.test(url)) return avatarEl
+  if (!url || !/^https?:\/\//.test(url)) {
+    return <span className={`flex-shrink-0 ${className}`}>{avatarEl}</span>
+  }
   return (
     <a href={url} target="_blank" rel="noopener noreferrer"
-       className="flex-shrink-0" title={`访问 ${name || '用户'} 的主页`}>
+       className={`flex-shrink-0 ${className}`} title={`访问 ${name || '用户'} 的主页`}>
       {avatarEl}
     </a>
   )
@@ -384,6 +388,10 @@ const REPLY_MAX_PAGES = 6
  *
  * 一条主评论动辄上千条回复，全量下发 + 全量渲染会把详情页拖死，
  * 所以：列表接口只给前 20 条并附总数，展开时才按需拉全量。
+ *
+ * 子评论不参与「内容赞同度」：赞同度统计的口径是主评论（depth=0）对发帖人
+ * 观点的立场，楼中楼多数是在跟其他评论者对话，判定基准都不一样，
+ * 硬凑进分母只会稀释指标，因此这里不展示立场徽标。
  */
 export function CommentReplies({
   replies, replyCount, commentId, theme, t,
@@ -391,8 +399,6 @@ export function CommentReplies({
   mutedClassName = 'text-cyber-text-muted',
   textClassName = 'text-cyber-text-secondary',
   replyToPrefix,
-  dark = false,
-  showStance = true,
 }: {
   /** 列表接口附带的前 N 条回复 */
   replies?: any[]
@@ -410,10 +416,6 @@ export function CommentReplies({
   textClassName?: string
   /** 微博等平台用「回复 @xxx：」，小红书直接「xxx：」 */
   replyToPrefix?: string
-  /** 深色舞台（抖音）：徽标改用半透明白底 */
-  dark?: boolean
-  /** 子评论是否显示立场徽标 */
-  showStance?: boolean
 }) {
   const { showReplies, storyId } = useContext(RepliesContext)
   const [override, setOverride] = useState<boolean | null>(null)
@@ -480,23 +482,21 @@ export function CommentReplies({
         <div className={containerClassName}>
           {list.map((r: any, i: number) => (
             <div key={r.id ?? `${r.author}-${i}`} className="flex items-start gap-1.5 text-xs leading-5">
-              {/* 子评论头像：后端 author_avatar（旧数据兼容 avatar），
-                  走 toAvatarSrc 代理绕 CDN 防盗链，加载失败回落到字母头像 */}
-              <PlatformAvatar
+              {/* 子评论头像：与主评论一致，走 AuthorLink 包一层主页链接，
+                  点击跳转该用户主页；头像走本地代理绕 CDN 防盗链，裂图回落字母头像 */}
+              <AuthorLink
+                url={r.author_url}
                 name={r.author || r.author_name || '-'}
                 avatar={r.author_avatar || r.avatar}
                 theme={theme || FALLBACK_THEME}
                 size={18}
-                className="mt-0.5"
+                className="mt-[3px]"
               />
               <div className="min-w-0 flex-1">
                 <span className={mutedClassName}>
                   {replyToPrefix ? `${replyToPrefix} ` : ''}{r.author || '-'}：
                 </span>
                 <span className={textClassName}>{r.content}</span>
-                {showStance && (
-                  <StanceBadge stance={r.stance} t={t} size="xs" dark={dark} className="ml-1 align-middle" />
-                )}
               </div>
             </div>
           ))}

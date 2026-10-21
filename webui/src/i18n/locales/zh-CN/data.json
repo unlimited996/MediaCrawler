@@ -159,7 +159,20 @@
       "stanceHint": "相对发帖人核心观点的立场（自动判定）",
       "agreeHint": "赞同度 = 赞同 / (赞同 + 反对)，中立评论不参与；共 {{total}} 条主评论",
       "stanceBreakdown": "赞同 {{agree}} · 中立 {{neutral}} · 反对 {{oppose}}",
-      "agreeRatio": "表态评论中 {{pct}}% 赞同（{{decided}} 条表态）"
-    }
+      "agreeRatio": "表态评论中 {{pct}}% 赞同（{{decided}} 条表态）",
+      "subReplies": "子评论",
+      "subRepliesOn": "展开",
+      "subRepliesOff": "收起"
+    },
+    "watchNote": "关注此贴",
+    "watchNoteHint": "每天定时拉取一次这条内容并更新（复用当前抓取参数）",
+    "watchNoteUnsupported": "该内容没有原文链接，无法关注",
+    "watchAuthor": "关注此人",
+    "watchAuthorHint": "每天定时拉取一次该作者的内容并更新",
+    "watchAuthorUnsupported": "该作者没有主页链接，无法关注",
+    "watchOn": "已开启关注：立即更新一次，之后每天一次",
+    "watchOff": "已取消关注",
+    "watchFail": "关注设置失败",
+    "watchStopped": "已自动停止关注"
   }
 }

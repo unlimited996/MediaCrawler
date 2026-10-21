@@ -155,6 +155,59 @@ def parse_cron(expr: str) -> CronSpec:
     return CronSpec((expr or "").strip())
 
 
+# ---------------------------------------------------------------------------
+# 目标失效检测
+#
+# 关注类任务（关注此贴 / 关注此人）盯的是「同一个对象」，一旦对象本身没了
+# （帖子被删、作者注销、内容转私密无权限），每天再拉也只是重复失败。
+# 命中这些特征就自动停用任务，并把原因写进 options，前端据此关掉开关并提示。
+# ---------------------------------------------------------------------------
+
+#: (匹配串, 给用户的停任务原因)
+FATAL_TARGET_PATTERNS = (
+    ("帖子不存在", "帖子不存在"),
+    ("笔记不存在", "笔记不存在"),
+    ("作品不存在", "作品不存在"),
+    ("内容不存在", "内容不存在"),
+    ("文章不存在", "文章不存在"),
+    ("视频不存在", "视频不存在"),
+    ("动态不存在", "动态不存在"),
+    ("用户不存在", "用户不存在"),
+    ("主页不存在", "主页不存在"),
+    ("页面不存在", "页面不存在"),
+    ("已被删除", "内容已被删除"),
+    ("已被作者删除", "内容已被作者删除"),
+    ("内容已失效", "内容已失效"),
+    ("笔记已失效", "笔记已失效"),
+    ("链接已失效", "链接已失效"),
+    ("无权限访问", "无权限访问"),
+    ("没有权限", "没有权限访问"),
+    ("权限不足", "权限不足"),
+    ("无权查看", "无权查看"),
+    ("私密", "内容已设为私密"),
+    ("仅粉丝可见", "内容仅粉丝可见"),
+    ("note not found", "帖子不存在"),
+    ("content not found", "内容不存在"),
+    ("user not found", "用户不存在"),
+)
+
+
+def detect_fatal_target_error(*texts: Any) -> Optional[str]:
+    """从错误信息 / 日志尾部判断是否「目标没了」。命中返回原因，否则 None。
+
+    只看 Chinese/英文的确定性表述，避免把网络抖动、超时、登录失效误判成
+    目标消失（后者重试还有救，前者重试纯属浪费）。
+    """
+    blob = " \n ".join(str(t or "") for t in texts)
+    if not blob.strip():
+        return None
+    low = blob.lower()
+    for pattern, reason in FATAL_TARGET_PATTERNS:
+        if pattern.lower() in low:
+            return reason
+    return None
+
+
 @asynccontextmanager
 async def _session():
     """调度器专用的 v2 库会话（与 tools/v2_sync 同一套 engine 缓存）。"""
@@ -338,8 +391,12 @@ class TaskScheduler:
     # ---------- 任务 CRUD ----------
 
     async def create_task(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """创建定时任务。data 已通过 schema 校验。"""
-        task_code = f"sched-{uuid.uuid4().hex[:12]}"
+        """创建定时任务。data 已通过 schema 校验。
+
+        task_code 可外部指定：关注类任务用它做业务锚点（`watch-note-12`），
+        保证同一个对象的关注任务幂等，不会重复建。
+        """
+        task_code = (data.get("task_code") or "").strip() or f"sched-{uuid.uuid4().hex[:12]}"
         async with _session() as session:
             if session is None:
                 raise RuntimeError("数据库不可用，无法创建定时任务")
@@ -388,7 +445,8 @@ class TaskScheduler:
             if "options" in data:
                 row.options_json = data.get("options") or {}
             # 调度配置变了就重算下次触发，避免沿用旧周期
-            sched_keys = {"schedule_type", "interval_sec", "cron_expr"}
+            # enabled 也算：重新启用时要立刻排下一次，停用则由 tick 跳过
+            sched_keys = {"schedule_type", "interval_sec", "cron_expr", "enabled"}
             if sched_keys & set(data.keys()):
                 row.next_run_at = self._compute_next(row)
             await session.commit()
@@ -436,6 +494,16 @@ class TaskScheduler:
             if session is None:
                 return None
             row = await session.get(ScheduledTask, task_id)
+            return self._task_dict(row) if row else None
+
+    async def get_task_by_code(self, task_code: str) -> Optional[Dict[str, Any]]:
+        """按业务编码查任务（关注类任务用固定 code 做幂等锚点）。"""
+        async with _session() as session:
+            if session is None:
+                return None
+            row = (await session.execute(
+                select(ScheduledTask).where(ScheduledTask.task_code == task_code)
+            )).scalar_one_or_none()
             return self._task_dict(row) if row else None
 
     async def list_runs(self, task_id: Optional[int] = None,
@@ -586,6 +654,24 @@ class TaskScheduler:
                     task.run_count = int(task.run_count or 0) + 1
                     task.status = "error" if (mark_task_error or
                                               summary.get("status") == "failed") else "idle"
+
+                    # 目标没了（帖子被删 / 作者注销 / 无权限）：再拉也只是重复失败，
+                    # 直接停用任务并把原因落到 options，前端据此关开关 + 提示用户
+                    if summary.get("status") == "failed":
+                        reason = detect_fatal_target_error(
+                            summary.get("error") or "",
+                            "\n".join(str(x) for x in (log_tail or [])))
+                        if reason:
+                            task.enabled = False
+                            opts = dict(task.options_json or {})
+                            opts["auto_stopped"] = True
+                            opts["auto_stop_reason"] = reason
+                            opts["auto_stopped_at"] = cst_now().isoformat()
+                            task.options_json = opts
+                            task.last_error = f"{reason}（已自动停止该定时任务）"
+                            if run_id is not None and run is not None:
+                                run.error_message = task.last_error
+
                     task.next_run_at = self._compute_next(task)
                 await session.commit()
                 await self._trim_runs(session, task_id)

@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { ArrowLeft, Loader2, MessageSquare, RefreshCw, Trash2 } from 'lucide-react'
+import {
+  ArrowLeft, Loader2, RefreshCw, Trash2, Bell, BellOff, UserPlus, UserCheck,
+} from 'lucide-react'
 import { crawlerApi, storyApi } from '@/lib/api'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -120,8 +122,57 @@ export function PlatformStoryDetail({
   const clientFiltered = cmtHasReplies !== 'all' || cmtKeyword.trim().length > 0
   const filteredTotal = clientFiltered ? comments.length : serverTotal
 
-  // ---------- 子评论开关：默认隐藏，只显示条数，点击展开全部 ----------
+  // ---------- 子评论开关：默认隐藏，只显示条数（开关在评论区筛选栏） ----------
   const [showReplies, setShowReplies] = useState(false)
+
+  // ---------- 关注（定时更新）：复用定时调度器，每天一次 ----------
+  const watchQ = useQuery({
+    queryKey: ['storyWatch', storyId],
+    queryFn: async () => (await storyApi.watch(storyId)).data,
+    // 30s 轮询：定时任务跑到一半或触发自动停止时能及时反映到开关上
+    refetchInterval: 30_000,
+  })
+
+  const watchM = useMutation({
+    mutationFn: ({ kind, enabled }: { kind: 'note' | 'author'; enabled: boolean }) =>
+      storyApi.setWatch(storyId, kind, enabled),
+    onSuccess: (_res, vars) => {
+      qc.invalidateQueries({ queryKey: ['storyWatch', storyId] })
+      qc.invalidateQueries({ queryKey: ['schedulerTasks'] })
+      toast.success(vars.enabled
+        ? (t('manage.watchOn', { defaultValue: '已开启关注：立即更新一次，之后每天一次' }))
+        : (t('manage.watchOff', { defaultValue: '已取消关注' })))
+    },
+    onError: (e: any) => toast.error(
+      `${t('manage.watchFail', { defaultValue: '关注设置失败' })}: ${e?.response?.data?.detail || e?.message || ''}`),
+  })
+
+  const toggleWatch = (kind: 'note' | 'author') => {
+    const cur = watchQ.data?.[kind]
+    if (!cur?.supported) return
+    watchM.mutate({ kind, enabled: !cur.enabled })
+  }
+
+  // 目标失效（帖子被删 / 作者注销 / 无权限）时任务会自动停用，这里提示一次
+  const stoppedNotified = useRef('')
+  useEffect(() => {
+    const data = watchQ.data
+    if (!data) return
+    for (const kind of ['note', 'author'] as const) {
+      const w = data[kind]
+      if (!w?.stopped) continue
+      const key = `${kind}:${w.task_id}:${w.stop_reason}`
+      if (stoppedNotified.current === key) continue
+      stoppedNotified.current = key
+      const label = kind === 'note'
+        ? t('manage.watchNote', { defaultValue: '关注此贴' })
+        : t('manage.watchAuthor', { defaultValue: '关注此人' })
+      toast.error(
+        `${t('manage.watchStopped', { defaultValue: '已自动停止关注' })}｜${label}：${w.stop_reason}`,
+        { duration: 8000 },
+      )
+    }
+  }, [watchQ.data, t])
 
   // ---------- 滚动加载：到底自动翻页 ----------
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -220,10 +271,12 @@ export function PlatformStoryDetail({
       stance={cmtStance}
       hasReplies={cmtHasReplies}
       keyword={cmtKeyword}
+      showReplies={showReplies}
       onSort={setCmtSort}
       onStance={setCmtStance}
       onHasReplies={setCmtHasReplies}
       onKeyword={setCmtKeyword}
+      onToggleReplies={() => setShowReplies((v) => !v)}
     />
   )
 
@@ -272,30 +325,50 @@ export function PlatformStoryDetail({
           {t('manage.back')}
         </Button>
 
-        {/* 子评论开关：默认关闭（只显示条数），打开后每条评论的回复全部展开 */}
+        {/* 关注：【关注此贴】每天定时更新这条内容；【关注此人】每天定时更新该作者 */}
         <button
           type="button"
-          onClick={() => setShowReplies((v) => !v)}
-          className={`flex h-8 items-center gap-1.5 rounded border px-2 font-mono text-[11px] transition-all ${
-            showReplies
+          onClick={() => toggleWatch('note')}
+          disabled={!watchQ.data?.note?.supported || watchM.isPending}
+          className={`flex h-8 items-center gap-1.5 rounded border px-2 font-mono text-[11px] transition-all disabled:opacity-40 ${
+            watchQ.data?.note?.enabled
               ? 'border-cyber-neon-cyan/60 bg-cyber-neon-cyan/10 text-cyber-neon-cyan'
               : 'border-cyber-border-DEFAULT text-cyber-text-secondary hover:border-cyber-neon-cyan/40 hover:text-cyber-neon-cyan'
           }`}
-          title={t('manage.repliesToggleHint', { defaultValue: '子评论默认收起，打开后全部展开' })}
+          title={watchQ.data?.note?.supported
+            ? (watchQ.data.note.stopped
+                ? `${t('manage.watchStopped', { defaultValue: '已自动停止关注' })}：${watchQ.data.note.stop_reason}`
+                : t('manage.watchNoteHint', { defaultValue: '每天定时拉取一次这条内容并更新' }))
+            : t('manage.watchNoteUnsupported', { defaultValue: '该内容没有原文链接，无法关注' })}
         >
-          <MessageSquare className="h-3.5 w-3.5" />
-          {t('manage.replies', { defaultValue: '子评论' })}
-          <span
-            className={`ml-0.5 h-3.5 w-6 rounded-full p-[2px] transition-colors ${
-              showReplies ? 'bg-cyber-neon-cyan/40' : 'bg-cyber-border-DEFAULT'
-            }`}
-          >
-            <span
-              className={`block h-2.5 w-2.5 rounded-full bg-cyber-text-primary transition-transform ${
-                showReplies ? 'translate-x-2.5' : ''
-              }`}
-            />
-          </span>
+          {watchQ.data?.note?.enabled ? (
+            <Bell className="h-3.5 w-3.5" />
+          ) : (
+            <BellOff className="h-3.5 w-3.5" />
+          )}
+          {t('manage.watchNote', { defaultValue: '关注此贴' })}
+        </button>
+        <button
+          type="button"
+          onClick={() => toggleWatch('author')}
+          disabled={!watchQ.data?.author?.supported || watchM.isPending}
+          className={`flex h-8 items-center gap-1.5 rounded border px-2 font-mono text-[11px] transition-all disabled:opacity-40 ${
+            watchQ.data?.author?.enabled
+              ? 'border-cyber-neon-cyan/60 bg-cyber-neon-cyan/10 text-cyber-neon-cyan'
+              : 'border-cyber-border-DEFAULT text-cyber-text-secondary hover:border-cyber-neon-cyan/40 hover:text-cyber-neon-cyan'
+          }`}
+          title={watchQ.data?.author?.supported
+            ? (watchQ.data.author.stopped
+                ? `${t('manage.watchStopped', { defaultValue: '已自动停止关注' })}：${watchQ.data.author.stop_reason}`
+                : t('manage.watchAuthorHint', { defaultValue: '每天定时拉取一次该作者的内容并更新' }))
+            : t('manage.watchAuthorUnsupported', { defaultValue: '该作者没有主页链接，无法关注' })}
+        >
+          {watchQ.data?.author?.enabled ? (
+            <UserCheck className="h-3.5 w-3.5" />
+          ) : (
+            <UserPlus className="h-3.5 w-3.5" />
+          )}
+          {t('manage.watchAuthor', { defaultValue: '关注此人' })}
         </button>
 
         <Button

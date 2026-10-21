@@ -159,7 +159,20 @@
       "stanceHint": "Stance relative to the poster's main point (auto-detected)",
       "agreeHint": "Agreement = agree / (agree + oppose); neutral excluded. {{total}} top-level comments",
       "stanceBreakdown": "{{agree}} agree · {{neutral}} neutral · {{oppose}} oppose",
-      "agreeRatio": "{{pct}}% agree among {{decided}} stance-taking comments"
-    }
+      "agreeRatio": "{{pct}}% agree among {{decided}} stance-taking comments",
+      "subReplies": "Replies",
+      "subRepliesOn": "Expanded",
+      "subRepliesOff": "Collapsed"
+    },
+    "watchNote": "Follow post",
+    "watchNoteHint": "Re-crawl this post once a day and refresh the view",
+    "watchNoteUnsupported": "No source URL, cannot follow this post",
+    "watchAuthor": "Follow author",
+    "watchAuthorHint": "Re-crawl this author once a day and refresh the view",
+    "watchAuthorUnsupported": "No profile URL, cannot follow this author",
+    "watchOn": "Following: updating now, then once a day",
+    "watchOff": "Unfollowed",
+    "watchFail": "Failed to update follow setting",
+    "watchStopped": "Follow task stopped automatically"
   }
 }

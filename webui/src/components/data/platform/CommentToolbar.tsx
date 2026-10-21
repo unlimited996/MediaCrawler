@@ -69,10 +69,12 @@ export function CommentToolbar({
   stance,
   hasReplies,
   keyword,
+  showReplies,
   onSort,
   onStance,
   onHasReplies,
   onKeyword,
+  onToggleReplies,
 }: {
   filteredTotal: number
   stats: StanceStats
@@ -80,10 +82,13 @@ export function CommentToolbar({
   stance: StanceFilter
   hasReplies: HasRepliesFilter
   keyword: string
+  /** 子评论全局展开开关（默认关闭，只显示条数） */
+  showReplies: boolean
   onSort: (v: CommentSort) => void
   onStance: (v: StanceFilter) => void
   onHasReplies: (v: HasRepliesFilter) => void
   onKeyword: (v: string) => void
+  onToggleReplies: () => void
 }) {
   const { t } = useTranslation('data')
 
@@ -190,6 +195,30 @@ export function CommentToolbar({
               </button>
             ))}
           </div>
+        </div>
+
+        {/* 子评论展开开关：默认收起（只显示条数），打开后各条评论的回复全部展开 */}
+        <div className="flex items-center gap-1">
+          <span className="text-[10px] font-mono text-cyber-text-muted">
+            {t('manage.cmt.subReplies', { defaultValue: '子评论' })}
+          </span>
+          <button
+            type="button"
+            onClick={onToggleReplies}
+            className={`flex h-7 items-center gap-1 rounded border px-1.5 text-[11px] font-mono transition-all ${
+              showReplies
+                ? 'border-cyber-neon-cyan/60 bg-cyber-neon-cyan/10 text-cyber-neon-cyan'
+                : 'border-cyber-border-subtle text-cyber-text-muted hover:text-cyber-text-primary'
+            }`}
+            title={t('manage.repliesToggleHint', {
+              defaultValue: '子评论默认收起，打开后全部展开',
+            })}
+          >
+            <MessageSquare className="h-3 w-3" />
+            {showReplies
+              ? t('manage.cmt.subRepliesOn', { defaultValue: '展开' })
+              : t('manage.cmt.subRepliesOff', { defaultValue: '收起' })}
+          </button>
         </div>
 
         {/* 关键词搜索（客户端过滤） */}

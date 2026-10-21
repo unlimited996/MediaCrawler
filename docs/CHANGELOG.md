@@ -7,6 +7,54 @@
 
 ---
 
+## [2026-10-21] 详情页关注（定时更新）+ 子评论交互收敛
+
+### 新增
+- **【关注此贴】/【关注此人】**（详情页顶部）：复用现有定时调度器
+  （`api/services/task_scheduler.py`，纯 asyncio，未引入任何第三方调度依赖）
+  建一条「每 24 小时一次」的任务；抓取参数与详情页「重新拉取」完全一致
+  （平台 / 原文链接或作者主页 / 开评论+子评论+媒体 / 直写 PG / headless /
+  cookie 走账号池）。
+- 接口：
+  - `GET /api/stories/{id}/watch` —— 返回 note / author 两个开关的状态
+    （enabled / task_id / supported / last_run_at / last_status / last_error /
+    next_run_at / stopped / stop_reason）；
+  - `POST /api/stories/{id}/watch/{kind}` —— `kind=note|author`，
+    body `{"enabled": bool, "run_now": bool=true}`。
+- 任务编码固定 `watch-note-{story_id}` / `watch-author-{平台}-{作者id}`：
+  同一对象反复开关只复用同一条任务，不会堆积；开关状态落 `scheduled_task`
+  表，服务重启后自动恢复。开启后会**立即后台拉取一次**（`asyncio.create_task`，
+  不挂在请求上），之后每天一次。
+- **目标失效自动停任务**：`task_scheduler.detect_fatal_target_error()` 识别
+  「帖子/笔记/用户不存在、已被删除、已失效、无权限访问、私密、仅粉丝可见」等
+  表述，命中即在 `_finish_run` 里把任务置 `enabled=False` 并写入
+  `options.auto_stopped / auto_stop_reason`；前端 30s 轮询到 `stopped=true`
+  时弹出明确提示（含原因），按钮自动回到关闭态。重新关注会清除该标记。
+
+### 变更
+- 子评论不再参与「内容赞同度」：赞同度口径本身就是主评论（depth=0）对发帖人
+  观点的立场，楼中楼多在跟其他评论者对话，判定基准不同；前端移除子评论的
+  立场徽标，后端统计本来就只算主评论。
+- 子评论的显示开关从详情页顶部栏**移到评论区筛选栏**（排序 / 立场 / 回复 /
+  子评论 / 搜索 同一行）。
+- 子评论头像点击行为与主评论一致：改走 `AuthorLink`，有 `author_url` 时包
+  `<a>` 跳转该用户主页，没有则退化为不带链接的头像（不留死链）。
+- `task_scheduler.create_task()` 支持外部指定 `task_code`（关注任务的幂等锚点）；
+  `update_task()` 在 `enabled` 变化时也重算 `next_run_at`。
+
+### 验证
+- `GET /stories/50/watch` → note/author 均 `supported=true`、未关注；
+- 开启 → 建任务 `watch-note-50`（note / interval 86400 / 目标为原文链接，
+  选项含 enable_comments+sub_comments+media、save_option=postgres），
+  `next_run_at` 为次日；
+- 模拟一次「帖子不存在」的失败执行 → 任务自动 `enabled=false`、
+  `stopped=true`、`stop_reason=帖子不存在`、`last_error=帖子不存在（已自动停止该定时任务）`；
+- 重新开启 → 自动停止标记清空；取消关注 → `enabled=false`；
+- 子评论接口确认每条回复都带 `author_avatar` 与 `author_url`；
+- 验证用的两条测试任务已从调度器删除。
+
+---
+
 ## [2026-10-21] 内容赞同度（立场判定）重构 + 海外平台差异化布局
 
 ### 新增
