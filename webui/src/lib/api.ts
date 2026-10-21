@@ -216,6 +216,10 @@ export interface StoryRow {
   cover_url: string | null
   category: string | null
   platform: string | null
+  author_id: number | null
+  author: string
+  author_avatar: string
+  author_url: string
   like_count: number
   comment_count: number
   heat_score: number
@@ -242,8 +246,14 @@ export const storyApi = {
   list: (params: {
     platform?: string; keyword?: string; tag?: string; sort?: string
     start_ts?: number; end_ts?: number; page?: number; page_size?: number
+    /** 发帖人多选：命中任一即展示（后端 author_ids 重复参数） */
+    author_ids?: number[]
   }) => api.get<{ items: StoryRow[]; total: number; page: number; page_size: number }>(
-    '/stories', { params }),
+    '/stories', { params, paramsSerializer: { indexes: null } }),
+  /** 发帖人候选（多选筛选用）：按发帖量倒序，支持平台与昵称关键词收敛 */
+  authors: (params: { platform?: string; keyword?: string; limit?: number } = {}) =>
+    api.get<{ items: { id: number; name: string; avatar: string; url: string; story_count: number }[];
+              total: number }>('/stories/authors/list', { params }),
   detail: (id: number) => api.get<Record<string, any>>(`/stories/${id}`),
   remove: (id: number) =>
     api.delete<{ success: boolean; deleted_id: number }>(`/stories/${id}`),

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import {
-  Database, Search, FileDown, Loader2,
+  Database, Search, FileDown, Loader2, Users, X,
   Heart, MessageSquare, Tag as TagIcon, Eye, Trash2,
 } from 'lucide-react'
 import { storyApi } from '@/lib/api'
@@ -12,7 +12,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { toast } from 'sonner'
 import { PlatformStoryDetail } from '@/components/data/platform/PlatformDetail'
 import { getPlatformTheme } from '@/components/data/platform/platformTheme'
-import { splitTopics } from '@/components/data/platform/shared'
+import { splitTopics, PlatformAvatar } from '@/components/data/platform/shared'
 
 type TimeRange = 'all' | 'today' | 'week' | 'month'
 
@@ -50,7 +50,10 @@ export function DataManagementView({
   const [searchInput, setSearchInput] = useState('')
   const [tag, setTag] = useState('')
   const [range, setRange] = useState<TimeRange>('all')
-  const [sort, setSort] = useState('heat')
+  // 默认按发布时间倒序（最新在前）
+  const [sort, setSort] = useState('publish')
+  /** 发帖人筛选：多选，空数组 = 不筛选 */
+  const [authorIds, setAuthorIds] = useState<number[]>([])
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [detailId, setDetailId] = useState<number | null>(null)
@@ -65,10 +68,42 @@ export function DataManagementView({
     queryFn: async () => (await storyApi.tags(30)).data.items,
   })
 
+  // 发帖人候选：跟着平台走，作者表几千行，靠关键词/平台收敛（下拉不做全量）
+  const [authorOpen, setAuthorOpen] = useState(false)
+  const [authorKw, setAuthorKw] = useState('')
+  const authorsQ = useQuery({
+    queryKey: ['storyAuthors', platform, authorKw],
+    queryFn: async () => (await storyApi.authors({
+      platform: platform || undefined,
+      keyword: authorKw.trim() || undefined,
+      limit: 50,
+    })).data.items,
+    staleTime: 30_000,
+  })
+
+  // 点击面板外部收起发帖人筛选
+  const authorBoxRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!authorOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (authorBoxRef.current && !authorBoxRef.current.contains(e.target as Node)) {
+        setAuthorOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [authorOpen])
+
+  const toggleAuthor = (id: number) => {
+    setAuthorIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+    setPage(1)
+  }
+
   // 平台切换（顶部入口或页内下拉）都要回到第一页，否则会停在空页
   useEffect(() => {
     setPage(1)
     setSelected(new Set())
+    setAuthorIds([])
   }, [platform])
 
   const tsRange = useMemo(() => {
@@ -79,13 +114,16 @@ export function DataManagementView({
     return {}
   }, [range])
 
+  // 发帖人 id 排序后入 key，避免勾选顺序不同导致缓存不命中
+  const authorKey = [...authorIds].sort((a, b) => a - b).join(',')
   const listQ = useQuery({
-    queryKey: ['stories', platform, keyword, tag, range, sort, page],
+    queryKey: ['stories', platform, keyword, tag, range, sort, page, authorKey],
     queryFn: async () => (await storyApi.list({
       platform: platform || undefined,
       keyword: keyword || undefined,
       tag: tag || undefined,
       sort, page, page_size: pageSize,
+      author_ids: authorIds.length ? authorIds : undefined,
       ...tsRange,
     })).data,
   })
@@ -202,12 +240,96 @@ export function DataManagementView({
           ))}
         </select>
 
+        {/* 发帖人筛选（多选）：勾选后只展示这些用户的帖子，清空即恢复全部 */}
+        <div className="relative" ref={authorBoxRef}>
+          <button
+            type="button"
+            onClick={() => setAuthorOpen((v) => !v)}
+            className={`flex h-8 items-center gap-1 rounded-md border px-2 text-xs font-mono transition-all ${
+              authorIds.length > 0
+                ? 'border-cyber-neon-cyan/60 bg-cyber-neon-cyan/10 text-cyber-neon-cyan'
+                : 'border-cyber-border-subtle bg-cyber-bg-tertiary text-cyber-text-primary hover:border-cyber-neon-cyan/40'
+            }`}
+          >
+            <Users className="w-3.5 h-3.5" />
+            {t('manage.authorFilter', { defaultValue: '发帖人' })}
+            {authorIds.length > 0 && (
+              <span className="rounded-full bg-cyber-neon-cyan/20 px-1.5 text-[10px]">
+                {authorIds.length}
+              </span>
+            )}
+          </button>
+
+          {authorOpen && (
+            <div className="absolute left-0 top-9 z-20 w-64 rounded-md border border-cyber-border-subtle bg-cyber-bg-panel p-2 shadow-lg">
+              <div className="flex items-center gap-1">
+                <input
+                  value={authorKw}
+                  onChange={(e) => setAuthorKw(e.target.value)}
+                  placeholder={t('manage.authorSearch', { defaultValue: '搜索发帖人' })}
+                  className="h-7 flex-1 px-2 rounded text-xs font-mono bg-cyber-bg-tertiary border border-cyber-border-subtle text-cyber-text-primary placeholder:text-cyber-text-muted"
+                />
+                {authorIds.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => { setAuthorIds([]); setPage(1) }}
+                    title={t('manage.clear', { defaultValue: '清空选择' })}
+                    className="flex h-7 w-7 items-center justify-center rounded border border-cyber-border-subtle text-cyber-text-muted hover:text-cyber-neon-pink"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+
+              <div className="mt-1.5 max-h-60 space-y-0.5 overflow-y-auto">
+                {authorsQ.isLoading ? (
+                  <div className="py-3 text-center text-[11px] font-mono text-cyber-text-muted">
+                    {t('manage.loading')}
+                  </div>
+                ) : (authorsQ.data || []).length === 0 ? (
+                  <div className="py-3 text-center text-[11px] font-mono text-cyber-text-muted">
+                    {t('manage.authorEmpty', { defaultValue: '没有匹配的发帖人' })}
+                  </div>
+                ) : (
+                  (authorsQ.data || []).map((a) => {
+                    const checked = authorIds.includes(a.id)
+                    return (
+                      <label
+                        key={a.id}
+                        className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 hover:bg-cyber-bg-tertiary/70"
+                      >
+                        <Checkbox
+                          checked={checked}
+                          onCheckedChange={() => toggleAuthor(a.id)}
+                        />
+                        <PlatformAvatar
+                          name={a.name || '-'}
+                          avatar={a.avatar}
+                          theme={getPlatformTheme(platform || undefined)}
+                          size={20}
+                        />
+                        <span className="min-w-0 flex-1 truncate text-xs text-cyber-text-primary">
+                          {a.name || '-'}
+                        </span>
+                        <span className="flex-shrink-0 text-[10px] font-mono text-cyber-text-muted">
+                          {a.story_count}
+                        </span>
+                      </label>
+                    )
+                  })
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* 排序 */}
         <select
           value={sort}
           onChange={(e) => { setSort(e.target.value); setPage(1) }}
           className="h-8 px-2 rounded-md text-xs font-mono bg-cyber-bg-tertiary border border-cyber-border-subtle text-cyber-text-primary"
         >
+          <option value="publish">{t('manage.sortPublish', { defaultValue: '按发布时间' })}</option>
           <option value="heat">{t('manage.sortHeat')}</option>
           <option value="time">{t('manage.sortTime')}</option>
           <option value="like">{t('manage.sortLike')}</option>
@@ -250,6 +372,7 @@ export function DataManagementView({
           {t('manage.selectedCount', { count: selected.size })}
           {keyword && ` · ${t('manage.keyword')}：${keyword}`}
           {platform && ` · ${t('manage.platform')}：${platform}`}
+          {authorIds.length > 0 && ` · ${t('manage.authorSelected', { count: authorIds.length, defaultValue: '发帖人 {{count}} 位' })}`}
           {range !== 'all' && ` · ${range}`}
         </span>
         <div className="ml-auto flex items-center gap-2">
@@ -312,14 +435,17 @@ export function DataManagementView({
               />
               <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                <span
-                  className="rounded-full px-2 py-0.5 text-[10px] font-mono font-medium"
-                  style={{
-                    color: getPlatformTheme(it.platform).accent,
-                    background: getPlatformTheme(it.platform).accentSoft,
-                  }}
-                >
-                  {getPlatformTheme(it.platform).label}
+                {/* 发帖人：头像 + 昵称（头像裂图自动回落名称首字） */}
+                <span className="flex flex-shrink-0 items-center gap-1">
+                  <PlatformAvatar
+                    name={it.author || '-'}
+                    avatar={it.author_avatar}
+                    theme={getPlatformTheme(it.platform)}
+                    size={18}
+                  />
+                  <span className="max-w-[10rem] truncate text-[11px] font-mono text-cyber-text-secondary">
+                    {it.author || '-'}
+                  </span>
                 </span>
                 {/* 标题里的小红书话题（#论文排版[话题]#）不进标题栏 */}
                 <span className="text-sm text-cyber-text-primary truncate" title={it.title}>

@@ -61,9 +61,11 @@ export function PlatformAvatar({
 }: AvatarProps) {
   const ch = (name || '?').trim().charAt(0) || '?'
   const src = toAvatarSrc(avatar)
+  // 头像加载失败（CDN 403 / 链接失效）时切换到字母头像，而不是留一块空白
+  const [broken, setBroken] = useState(false)
 
   // 有真实头像 URL 就直接渲染图片（走本地代理绕防盗链，加载失败再回落字母头像）
-  if (src && /^(https?:|\/|data:)/i.test(src)) {
+  if (src && !broken && /^(https?:|\/|data:)/i.test(src)) {
     return (
       <img
         src={src}
@@ -73,10 +75,7 @@ export function PlatformAvatar({
           square ? 'rounded-md' : 'rounded-full'
         } ${className}`}
         style={{ width: size, height: size }}
-        onError={(e) => {
-          // 图裂了隐藏自身，由父级背景露出（不阻塞列表渲染）
-          ;(e.target as HTMLImageElement).style.visibility = 'hidden'
-        }}
+        onError={() => setBroken(true)}
       />
     )
   }

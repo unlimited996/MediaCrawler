@@ -173,6 +173,11 @@
     "watchOn": "Following: updating now, then once a day",
     "watchOff": "Unfollowed",
     "watchFail": "Failed to update follow setting",
-    "watchStopped": "Follow task stopped automatically"
+    "watchStopped": "Follow task stopped automatically",
+    "sortPublish": "Publish time",
+    "authorFilter": "Authors",
+    "authorSearch": "Search authors",
+    "authorEmpty": "No matching author",
+    "authorSelected": "{{count}} authors"
   }
 }

@@ -173,6 +173,11 @@
     "watchOn": "已开启关注：立即更新一次，之后每天一次",
     "watchOff": "已取消关注",
     "watchFail": "关注设置失败",
-    "watchStopped": "已自动停止关注"
+    "watchStopped": "已自动停止关注",
+    "sortPublish": "按发布时间",
+    "authorFilter": "发帖人",
+    "authorSearch": "搜索发帖人",
+    "authorEmpty": "没有匹配的发帖人",
+    "authorSelected": "发帖人 {{count}} 位"
   }
 }

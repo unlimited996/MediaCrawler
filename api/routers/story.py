@@ -29,6 +29,9 @@ SORT_FIELDS = {
     "time": (Story.last_update_ts.desc(),),
     "like": (Story.like_count.desc(),),
     "comment": (Story.comment_count.desc(),),
+    # 发布时间倒序（最新在前）：列表默认排序用这个，与「按时间」（最后更新）
+    # 区分开，两者语义不同，不要合并
+    "publish": (Story.first_publish_ts.desc(), Story.id.desc()),
 }
 
 
@@ -70,10 +73,12 @@ async def list_stories(
     sort: str = "heat",
     start_ts: Optional[int] = Query(None, description="起始发布时间（毫秒时间戳）"),
     end_ts: Optional[int] = Query(None, description="截止发布时间（毫秒时间戳）"),
+    # 发帖人筛选（多选）：传多个 author_ids=1&author_ids=2，命中任一即展示
+    author_ids: Optional[List[int]] = Query(None, description="按发帖人筛选，可多选"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    """故事列表：支持平台 / 标签 / 关键词 / 时间范围筛选。"""
+    """故事列表：支持平台 / 标签 / 关键词 / 时间范围 / 发帖人筛选。"""
     engine, session = await _session()
     if session is None:
         return {"items": [], "total": 0, "page": page, "page_size": page_size,
@@ -96,6 +101,8 @@ async def list_stories(
             q = q.where(Story.first_publish_ts >= start_ts)
         if end_ts:
             q = q.where(Story.first_publish_ts <= end_ts)
+        if author_ids:
+            q = q.where(Story.author_id.in_(author_ids))
 
         total = (await session.execute(
             select(func.count()).select_from(q.subquery())
@@ -123,6 +130,17 @@ async def list_stories(
         site_rows = (await session.execute(select(SourceSite))).scalars().all()
         site_name = {s.id: s.code for s in site_rows}
 
+        # 发帖人信息（列表要展示头像 + 昵称）：一次批量查，避免 N+1
+        author_ids_on_page = {s.author_id for s in rows if s.author_id}
+        author_map: Dict[int, Any] = {}
+        if author_ids_on_page:
+            a_rows = (await session.execute(
+                select(Author.id, Author.nickname, Author.avatar_url, Author.profile_url)
+                .where(Author.id.in_(author_ids_on_page))
+            )).all()
+            author_map = {r[0]: {"name": r[1], "avatar": r[2] or "", "url": r[3] or ""}
+                          for r in a_rows}
+
         items = [{
             "id": s.id,
             "title": s.title,
@@ -130,6 +148,10 @@ async def list_stories(
             "cover_url": s.cover_url,
             "category": s.category,
             "platform": site_name.get(s.primary_site_id),
+            "author_id": s.author_id,
+            "author": (author_map.get(s.author_id) or {}).get("name") or "",
+            "author_avatar": (author_map.get(s.author_id) or {}).get("avatar") or "",
+            "author_url": (author_map.get(s.author_id) or {}).get("url") or "",
             "like_count": s.like_count,
             "comment_count": s.comment_count,
             "heat_score": float(s.heat_score or 0),
@@ -138,6 +160,52 @@ async def list_stories(
         } for s in rows]
 
         return {"items": items, "total": total, "page": page, "page_size": page_size}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/authors/list")
+async def list_authors(
+    platform: Optional[str] = None,
+    keyword: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+):
+    """发帖人列表（数据管理页的多选筛选用）。
+
+    按发帖量倒序返回，带头像与帖子数；可带平台与昵称关键词缩小范围
+    （作者表有 3000+ 行，前端靠这两个条件收敛候选，不做全量下拉）。
+    """
+    engine, session = await _session()
+    if session is None:
+        return {"items": [], "total": 0}
+    try:
+        q = (select(Author.id, Author.nickname, Author.avatar_url, Author.profile_url,
+                    func.count(Story.id).label("story_count"))
+             .join(Story, Story.author_id == Author.id)
+             .where(Story.deleted_at.is_(None),
+                    Story.status.in_(("active", "deleted"))))
+        if platform:
+            q = q.where(Story.primary_site_id.in_(
+                select(SourceSite.id).where(SourceSite.code == platform)))
+        if keyword:
+            like = f"%{keyword}%"
+            q = q.where(Author.nickname.ilike(like))
+        rows = (await session.execute(
+            q.group_by(Author.id, Author.nickname, Author.avatar_url, Author.profile_url)
+            .order_by(func.count(Story.id).desc(), Author.id.asc())
+            .limit(limit)
+        )).all()
+        return {
+            "items": [{
+                "id": r[0],
+                "name": r[1] or "",
+                "avatar": r[2] or "",
+                "url": r[3] or "",
+                "story_count": int(r[4] or 0),
+            } for r in rows],
+            "total": len(rows),
+        }
     finally:
         await session.close()
         await engine.dispose()
