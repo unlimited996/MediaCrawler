@@ -21,7 +21,8 @@
     "tasks": "TASKS",
     "dataBrowser": "FILES",
     "config": "CONFIG",
-    "queue": "QUEUE"
+    "queue": "QUEUE",
+    "stanceTags": "Stance Tags"
   },
   "action": {
     "loading": "Loading...",

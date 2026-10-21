@@ -323,3 +323,63 @@ async def preview(payload: Dict[str, Any] = Body(default={})):
     await load_library()
     ps = extract_post_stance(title=post_title, content=post_content)
     return {"post_stance": ps, "result": judge_with_library(text, ps)}
+
+
+@router.post("/rejudge")
+async def rejudge(payload: Dict[str, Any] = Body(default={})):
+    """按最新标签库重判评论（新增/修改标签后用于刷新历史数据）。
+
+    body: {"story_id": 可选, "limit": 条数上限, "force": 是否重判已有标签的评论}
+    """
+    from sqlalchemy import func as _func
+    from database.models_v2 import Comment
+    from tools.stance import ensure_seeded, judge_with_library, load_library
+    from tools.v2_sync import get_story_stance
+
+    story_id = payload.get("story_id")
+    limit = int(payload.get("limit") or 5000)
+    force = bool(payload.get("force"))
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="数据库不可用")
+    try:
+        await ensure_seeded(session)
+        lib = await load_library(session=session, force=True)
+        tags = lib.get("tags") or []
+        ver = lib.get("version") or 0
+        if not tags:
+            return {"updated": 0, "version": ver, "message": "标签库为空"}
+
+        stmt = select(Comment)
+        if story_id is not None:
+            stmt = stmt.where(Comment.story_id == int(story_id))
+        if not force:
+            stmt = stmt.where(Comment.stance_tag_code.is_(None))
+        stmt = stmt.limit(limit)
+        rows = (await session.execute(stmt)).scalars().all()
+
+        by_story: Dict[int, List] = {}
+        for c in rows:
+            by_story.setdefault(c.story_id, []).append(c)
+
+        updated = 0
+        for sid, comments in by_story.items():
+            post_stance = await get_story_stance(sid)
+            for c in comments:
+                try:
+                    r = judge_with_library(c.content_text or "", post_stance,
+                                           c.sentiment, tags=tags)
+                    c.stance = r.get("stance", "neutral")
+                    c.stance_tag_id = r.get("tag_id")
+                    c.stance_tag_code = r.get("tag_code")
+                    c.stance_confidence = r.get("confidence")
+                    c.stance_judged_ver = ver
+                    updated += 1
+                except Exception:
+                    continue
+        await session.commit()
+        return {"updated": updated, "version": ver}
+    finally:
+        await session.close()
+        await engine.dispose()

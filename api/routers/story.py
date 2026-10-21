@@ -46,9 +46,35 @@ async def _session():
     return engine, AsyncSession(engine, expire_on_commit=False)
 
 
+TAG_NAME_BY_CODE: Dict[str, Any] = {}
+TAG_COLOR_BY_CODE: Dict[str, Any] = {}
+_TAG_MAPS_AT = 0.0
+
+
+def _ensure_tag_maps() -> None:
+    """刷新标签 code → 名称 / 颜色的缓存（60 秒 TTL，改完标签库最多 1 分钟可见）。"""
+    global _TAG_MAPS_AT
+    import time as _time
+    if TAG_NAME_BY_CODE and (_time.time() - _TAG_MAPS_AT) < 60:
+        return
+    try:
+        from tools.stance import active_tags
+        tags = active_tags() or []
+        TAG_NAME_BY_CODE.clear()
+        TAG_COLOR_BY_CODE.clear()
+        for t in tags:
+            if t.get("code"):
+                TAG_NAME_BY_CODE[t["code"]] = t.get("name")
+                TAG_COLOR_BY_CODE[t["code"]] = t.get("color")
+        _TAG_MAPS_AT = _time.time()
+    except Exception:
+        pass
+
+
 def _comment_public(c: Comment, author_name: Optional[str],
                      author_avatar: Optional[str] = None,
                      author_url: Optional[str] = None) -> Dict[str, Any]:
+    _ensure_tag_maps()
     return {
         "id": c.id,
         "content": c.content_text,
@@ -62,6 +88,12 @@ def _comment_public(c: Comment, author_name: Optional[str],
         "parent_id": c.parent_id,
         "sentiment": c.sentiment,
         "stance": c.stance,
+        # 态度标签（P3）：徽标展示用，没判过的回落为空
+        "stance_tag_code": c.stance_tag_code,
+        "stance_tag_name": TAG_NAME_BY_CODE.get(c.stance_tag_code or ""),
+        "stance_tag_color": TAG_COLOR_BY_CODE.get(c.stance_tag_code or ""),
+        "stance_confidence": (float(c.stance_confidence)
+                              if c.stance_confidence is not None else None),
     }
 
 
@@ -352,6 +384,9 @@ async def get_story(story_id: int):
             "cover_url": story.cover_url,
             "category": story.category,
             "status": story.status,
+            "media_count": int(story.media_count or 0),
+            "edit_count": int(story.edit_count or 0),
+            "edited_at": story.edited_at,
             "platform": platform_code,
             "author": author_name,
             "author_avatar": author_avatar or "",

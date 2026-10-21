@@ -9,6 +9,7 @@ import { LicenseDisclaimer, isLicenseAccepted } from '@/components/license/Licen
 import { HotTimelineView } from '@/views/HotTimelineView'
 import { DataManagementView } from '@/views/DataManagementView'
 import { ScheduledTasksView } from '@/views/ScheduledTasksView'
+import { StanceTagsView } from '@/views/StanceTagsView'
 import { DataExplorer } from '@/components/data/DataExplorer'
 import type { MainView } from '@/components/layout/Sidebar'
 
@@ -71,6 +72,8 @@ function App() {
           <ScheduledTasksView />
         ) : view === 'browser' ? (
           <DataExplorer />
+        ) : view === 'stance' ? (
+          <StanceTagsView />
         ) : (
           <DataManagementView platform={dataPlatform} />
         )}

@@ -21,7 +21,8 @@
     "tasks": "定时任务",
     "dataBrowser": "数据浏览",
     "config": "配置",
-    "queue": "队列"
+    "queue": "队列",
+    "stanceTags": "态度标签库"
   },
   "action": {
     "loading": "加载中...",

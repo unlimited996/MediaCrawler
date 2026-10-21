@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { StoryEditLogDialog } from '@/components/data/StoryEditLogDialog'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import {
-  ArrowLeft, Loader2, RefreshCw, Trash2, Bell, BellOff, UserPlus, UserCheck,
+  ArrowLeft, Loader2, RefreshCw, Trash2, Bell, BellOff, UserPlus, UserCheck, History
 } from 'lucide-react'
 import { crawlerApi, storyApi } from '@/lib/api'
 import { toast } from 'sonner'
@@ -197,6 +198,8 @@ export function PlatformStoryDetail({
   // 新数据经 v2 同步 upsert 叠加到旧数据；若平台已删内容，
   // 爬虫侧会把 story 标记 deleted，刷新后显示「已删除」徽标。
   const [refetching, setRefetching] = useState(false)
+  /** 编辑记录弹层（P2） */
+  const [editsOpen, setEditsOpen] = useState(false)
   const statusQ = useQuery({
     queryKey: ['crawlerStatus'],
     queryFn: async () => (await crawlerApi.getStatus()).data,
@@ -371,6 +374,21 @@ export function PlatformStoryDetail({
           {t('manage.watchAuthor', { defaultValue: '关注此人' })}
         </button>
 
+        <button
+          type="button"
+          onClick={() => setEditsOpen(true)}
+          className="flex h-8 items-center gap-1.5 rounded border border-cyber-border-DEFAULT px-2 font-mono text-[11px] text-cyber-text-secondary transition-all hover:border-cyber-neon-cyan/40 hover:text-cyber-neon-cyan"
+          title={t('manage.editLogHint', { defaultValue: '查看这条内容被修改前后的差异' })}
+        >
+          <History className="h-3.5 w-3.5" />
+          {t('manage.editLog', { defaultValue: '编辑记录' })}
+          {(d?.edit_count ?? 0) > 0 && (
+            <span className="rounded bg-cyber-bg-tertiary px-1 text-[10px] text-cyber-text-muted">
+              {d?.edit_count}
+            </span>
+          )}
+        </button>
+
         <Button
           variant="ghost"
           size="sm"
@@ -462,6 +480,13 @@ export function PlatformStoryDetail({
           </RepliesContext.Provider>
         )}
       </div>
+
+      {/* 编辑记录：前后比对弹层（P2） */}
+      <StoryEditLogDialog
+        storyId={storyId}
+        open={editsOpen}
+        onClose={() => setEditsOpen(false)}
+      />
     </div>
   )
 }

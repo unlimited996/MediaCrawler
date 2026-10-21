@@ -1,4 +1,4 @@
-import { Bug, Wifi, Flame, Database, FolderOpen, CalendarClock } from 'lucide-react'
+import { Bug, Wifi, Flame, Database, FolderOpen, CalendarClock, Tags } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Badge } from '@/components/ui/badge'
 import { useCrawlerStore } from '@/store/crawlerStore'
@@ -8,7 +8,7 @@ import { PlatformBrandMark } from '@/components/data/platform/PlatformBrand'
 import { LanguageSwitch } from './LanguageSwitch'
 import { ThemeToggle } from './ThemeToggle'
 
-export type MainView = 'crawl' | 'discover' | 'data' | 'browser' | 'tasks'
+export type MainView = 'crawl' | 'discover' | 'data' | 'browser' | 'tasks' | 'stance'
 
 interface SidebarProps {
   view: MainView
@@ -73,6 +73,17 @@ export function Sidebar({ view, onViewChange, dataPlatform }: SidebarProps) {
             >
               <CalendarClock className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">{t('nav.tasks')}</span>
+            </button>
+            <button
+              onClick={() => onViewChange('stance')}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono transition-all ${
+                view === 'stance'
+                  ? 'bg-cyber-neon-pink text-black font-bold'
+                  : 'text-cyber-text-secondary hover:text-cyber-text-primary border border-cyber-border-subtle hover:border-cyber-neon-pink/50'
+              }`}
+            >
+              <Tags className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">{t('nav.stanceTags', { defaultValue: '态度标签库' })}</span>
             </button>
             <button
               onClick={() => onViewChange('browser')}
