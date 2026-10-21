@@ -5,6 +5,36 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-21] 修复网格图 404 / 评论表态标签筛选与改判
+
+### 修复
+- **网格视图图片加载不出来（根因）**：列表返回的本地封面路径拼错前缀。
+  `/api/data/files/{path}` 是**文本预览**路由（只认 json/jsonl/csv，图片直接 400），
+  而 `/api/data/{path}` 根本不存在（404）。新增二进制直出路由
+  `GET /api/data/raw/{file_path:path}`（限制在 DATA_DIR 内、防目录穿越、
+  按后缀给 Content-Type、带缓存头），封面改走它。实测 4 张封面全部 200。
+- 特定平台列表视图下不再显示平台品牌标识（进入平台页时列表已天然同质，
+  再放标识是冗余）；仅在「全部平台」视图保留。
+
+### 新增
+- **评论表态标签筛选**：`GET /stories/{id}/comments` 增 `tag` 参数
+  （按 `stance_tag_code` 过滤，逗号分隔多值），并返回 `tag_stats`
+  （按标签库的标签顺序输出 名称/颜色/条数）。工具栏新增「表态」筛选行，
+  标签名 + 条数按品牌色渲染，hover 显示占比，可多选（或关系）。
+- **评论表态可人工改判**：`PATCH /stories/comments/{id}/stance`
+  （body `{"tag_code": "..."}`），写回标签字段并按 polarity 同步 `stance`，
+  保证赞同度统计口径不变；徽标点击即弹出标签选择器（新增
+  `StanceEditContext`，11 个平台布局不必层层传 props）。
+- `GET /stories/comments/stance-tags`：改判可选标签列表（含颜色与极性）。
+- 徽标改库表驱动：优先显示命中的态度标签名 + 标签色，未重判的旧数据回落三态徽标。
+
+### 验证
+- 4 张本地封面 `/api/data/raw/...` 全部 200（image/webp、image/jpeg）；
+- `tag_stats` 正确输出 10 个标签的分布；`tag=doubt/sarcasm/speechless` 筛选生效
+  （该帖这几类确为 0 条）；
+- 改判：评论 549 → 阴阳（stance 同步 oppose）→ 改回赞同（stance 同步 agree）；
+- 前端 `tsc -b` 与 `npm run build` 通过。
+
 ---
 
 ## [2026-10-21] 态度标签库管理页 / 编辑记录 UI / 平台页品牌化

@@ -54,6 +54,14 @@ function fmtCount(n: number): string {
   return n.toLocaleString('en-US')
 }
 
+/** 态度标签统计项（库表驱动，后端 tag_stats 下发） */
+export interface TagStat {
+  code: string
+  name: string
+  color: string | null
+  count: number
+}
+
 /**
  * 评论区头部：统计行 + 筛选工具（参考 Steam 商店评论区布局）。
  *
@@ -65,6 +73,8 @@ function fmtCount(n: number): string {
 export function CommentToolbar({
   filteredTotal,
   stats,
+  tagStats,
+  selectedTags,
   sort,
   stance,
   hasReplies,
@@ -72,12 +82,18 @@ export function CommentToolbar({
   showReplies,
   onSort,
   onStance,
+  onToggleTag,
+  onClearTags,
   onHasReplies,
   onKeyword,
   onToggleReplies,
 }: {
   filteredTotal: number
   stats: StanceStats
+  /** 态度标签分布（库表驱动） */
+  tagStats?: TagStat[]
+  /** 已选中的标签 code（多选） */
+  selectedTags?: string[]
   sort: CommentSort
   stance: StanceFilter
   hasReplies: HasRepliesFilter
@@ -86,6 +102,9 @@ export function CommentToolbar({
   showReplies: boolean
   onSort: (v: CommentSort) => void
   onStance: (v: StanceFilter) => void
+  /** 点一个标签切换选中；多选之间是「或」关系 */
+  onToggleTag?: (code: string) => void
+  onClearTags?: () => void
   onHasReplies: (v: HasRepliesFilter) => void
   onKeyword: (v: string) => void
   onToggleReplies: () => void
@@ -174,6 +193,51 @@ export function CommentToolbar({
             ))}
           </div>
         </div>
+
+        {/* 态度标签筛选（库表驱动：阴阳 / 无语 / 质疑 / 嘲讽 / 观望 / 神评 …） */}
+        {!!(tagStats || []).length && (
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
+            <span className="text-[10px] font-mono text-cyber-text-muted">
+              {t('manage.cmt.stanceTag', { defaultValue: '表态' })}
+            </span>
+            <button
+              type="button"
+              onClick={() => onClearTags?.()}
+              className={`rounded border px-1.5 py-[3px] text-[11px] font-mono transition-all ${
+                !(selectedTags || []).length
+                  ? 'border-cyber-neon-cyan/50 bg-cyber-neon-cyan/15 text-cyber-neon-cyan'
+                  : 'border-cyber-border-subtle text-cyber-text-muted hover:text-cyber-text-primary'
+              }`}
+            >
+              {t('manage.cmt.filterAll', { defaultValue: '全部' })}
+            </button>
+            {(tagStats || []).map((g) => {
+              const on = (selectedTags || []).includes(g.code)
+              const color = g.color || '#94a3b8'
+              const total = (tagStats || []).reduce((a, b) => a + (b.count || 0), 0)
+              const pct = total > 0 ? Math.round((g.count / total) * 100) : 0
+              return (
+                <button
+                  key={g.code}
+                  type="button"
+                  onClick={() => onToggleTag?.(g.code)}
+                  title={`${g.name} · ${g.count} 条 · 占 ${pct}%`}
+                  className={`flex items-center gap-1 rounded border px-1.5 py-[3px] text-[11px] font-mono transition-all ${
+                    on ? '' : 'opacity-70 hover:opacity-100'
+                  }`}
+                  style={{
+                    borderColor: on ? color : `${color}44`,
+                    background: on ? `${color}26` : 'transparent',
+                    color: on ? color : undefined,
+                  }}
+                >
+                  <span>{g.name}</span>
+                  <span className="text-[10px] opacity-70">{g.count}</span>
+                </button>
+              )
+            })}
+          </div>
+        )}
 
         {/* 是否含回复 */}
         <div className="flex items-center gap-1">

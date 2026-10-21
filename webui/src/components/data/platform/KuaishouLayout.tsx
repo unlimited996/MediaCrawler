@@ -121,7 +121,7 @@ export function KuaishouLayout({ d, comments, commentsTotal, commentsToolbar, t,
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-1.5 text-xs text-cyber-text-muted">
                     {authorAnchor(c.author_url, c.author || '-')}
-                    <StanceBadge stance={c.stance} t={t} />
+                    <StanceBadge stance={c.stance} t={t} tagCode={c.stance_tag_code} tagName={c.stance_tag_name} tagColor={c.stance_tag_color} comment={c} />
                   </div>
                   <div className="mt-0.5 text-sm leading-6 text-cyber-text-primary"><RichText content={c.content} /></div>
                   <div className="mt-1 flex items-center gap-3 text-[11px] text-cyber-text-muted">

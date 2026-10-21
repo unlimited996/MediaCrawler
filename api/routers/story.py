@@ -214,7 +214,8 @@ async def list_stories(
                     continue
                 try:
                     rel = Path(lp).resolve().relative_to(_DATA_DIR.resolve())
-                    cover_local[sid] = f"/api/data/{rel.as_posix()}"
+                    # 二进制直出走 /api/data/raw/（/files/ 是文本预览，图片会 400）
+                    cover_local[sid] = f"/api/data/raw/{rel.as_posix()}"
                 except Exception:
                     p = Path(lp)
                     cover_local[sid] = (
@@ -440,6 +441,7 @@ async def get_story_comments(
                              description="每条主评论最多返回多少条回复，0=不限"),
     sentiment: Optional[str] = Query(None, description="按情感筛选：positive/neutral/negative"),
     stance: Optional[str] = Query(None, description="按立场筛选：agree/neutral/oppose（相对发帖人观点）"),
+    tag: Optional[str] = Query(None, description="按态度标签筛选：stance_tag.code，逗号分隔多个"),
 ):
     """评论树：先取主楼（depth=0）分页，再按 root_id 拉出楼中楼。
 
@@ -462,6 +464,8 @@ async def get_story_comments(
         stance = (stance or "").strip().lower() or None
         if stance and stance not in ("agree", "neutral", "oppose"):
             stance = None
+        # 态度标签筛选（库表驱动，支持逗号分隔多值）
+        tag_list = [x.strip() for x in (tag or "").split(",") if x.strip()]
 
         # 需要情感/立场维度时，先补齐该 story 的缺失判定（幂等，只补缺失行）
         from tools.v2_sync import backfill_comment_sentiments, backfill_comment_stances
@@ -475,6 +479,8 @@ async def get_story_comments(
             base = base.where(Comment.sentiment == sentiment)
         if stance:
             base = base.where(Comment.stance == stance)
+        if tag_list:
+            base = base.where(Comment.stance_tag_code.in_(tag_list))
         total = (await session.execute(
             select(func.count()).select_from(base.subquery()))).scalar() or 0
 
@@ -502,6 +508,27 @@ async def get_story_comments(
         st_total = sum(st_dist.values())
         agreement = agreement_label(st_dist["agree"], st_total, st_dist["neutral"])
 
+        # 态度标签分布（库表驱动；按库内顺序输出，前端据此渲染筛选按钮与占比）
+        tag_rows = (await session.execute(
+            select(Comment.stance_tag_code, func.count())
+            .where(Comment.story_id == story_id, Comment.deleted_at.is_(None),
+                   Comment.depth == 0, Comment.stance_tag_code.isnot(None))
+            .group_by(Comment.stance_tag_code)
+        )).all()
+        tag_dist = {code: int(cnt) for code, cnt in tag_rows if code}
+        try:
+            from tools.stance import active_tags
+            _ensure_tag_maps()
+            tag_stats = [{
+                "code": t.get("code"),
+                "name": t.get("name"),
+                "color": t.get("color"),
+                "count": int(tag_dist.get(t.get("code") or "", 0)),
+            } for t in (active_tags() or [])]
+        except Exception:
+            tag_stats = [{"code": c, "name": c, "color": None, "count": n}
+                         for c, n in tag_dist.items()]
+
         # 情感分布保留作辅助参考
         sent_rows = (await session.execute(
             select(Comment.sentiment, func.count())
@@ -518,7 +545,8 @@ async def get_story_comments(
         if not mains:
             return {"items": [], "total": total, "page": page, "page_size": page_size,
                     "stance_stats": {**st_dist, "total": st_total, "agreement": agreement},
-                    "sentiment_stats": {**s_dist, "total": sum(s_dist.values())}}
+                    "sentiment_stats": {**s_dist, "total": sum(s_dist.values())},
+                    "tag_stats": tag_stats}
 
         main_ids = [m.id for m in mains]
         subs = (await session.execute(
@@ -554,7 +582,8 @@ async def get_story_comments(
 
         return {"items": items, "total": total, "page": page, "page_size": page_size,
                 "stance_stats": {**st_dist, "total": st_total, "agreement": agreement},
-                "sentiment_stats": {**s_dist, "total": sum(s_dist.values())}}
+                "sentiment_stats": {**s_dist, "total": sum(s_dist.values())},
+                "tag_stats": tag_stats}
     finally:
         await session.close()
         await engine.dispose()
@@ -1132,6 +1161,88 @@ async def get_story_edit(story_id: int, edit_id: int):
             "diff": e.diff or [],
             "source": e.source,
         }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 评论表态：手动指定 / 修正（P3）
+#
+# 自动判定难免有误，允许人工改成标签库里任一启用的标签；
+# 同时写回 stance（polarity 归并），保证赞同度统计口径不变。
+# ---------------------------------------------------------------------------
+
+@router.patch("/comments/{comment_id}/stance")
+async def set_comment_stance(comment_id: int, payload: Dict[str, Any] = Body(default={})):
+    """手动设置一条评论的态度标签。
+
+    body: {"tag_code": "sarcasm"} 或 {"stance": "agree"}（后者取该极性下的首个标签）
+    """
+    from database.models_v2 import Comment as _C, StanceTag
+    from tools.stance import active_tags, ensure_seeded, load_library
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="数据库不可用")
+    try:
+        await ensure_seeded(session)
+        lib = await load_library(session=session)
+        ver = lib.get("version") or 0
+        tags = [t for t in (active_tags() or [])]
+
+        c = await session.get(_C, comment_id)
+        if c is None:
+            raise HTTPException(status_code=404, detail="评论不存在")
+
+        code = str(payload.get("tag_code") or "").strip()
+        if not code:
+            want = str(payload.get("stance") or "").strip()
+            hit = next((t for t in tags if t.get("polarity") == want), None)
+            if not hit:
+                raise HTTPException(status_code=400, detail="tag_code 或 stance 必填")
+            code = hit.get("code") or ""
+
+        tag = next((t for t in tags if t.get("code") == code), None)
+        if tag is None:
+            raise HTTPException(status_code=400, detail=f"未知标签 {code}")
+
+        c.stance_tag_id = tag.get("id")
+        c.stance_tag_code = tag.get("code")
+        c.stance = tag.get("polarity") or "neutral"
+        c.stance_confidence = 1.0            # 人工判定=最高置信
+        c.stance_judged_ver = ver
+        await session.commit()
+
+        _ensure_tag_maps()
+        return {
+            "id": c.id,
+            "stance": c.stance,
+            "stance_tag_code": c.stance_tag_code,
+            "stance_tag_name": tag.get("name"),
+            "stance_tag_color": tag.get("color"),
+        }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/comments/stance-tags")
+async def list_comment_stance_tags():
+    """评论表态可选标签（供前端下拉 / 筛选栏渲染，含颜色与极性）。"""
+    from tools.stance import active_tags, ensure_seeded, load_library
+
+    engine, session = await _session()
+    if session is None:
+        return {"items": []}
+    try:
+        await ensure_seeded(session)
+        await load_library(session=session)
+        return {"items": [{
+            "code": t.get("code"), "name": t.get("name"),
+            "color": t.get("color"), "polarity": t.get("polarity"),
+            "is_fallback": bool(t.get("is_fallback")),
+        } for t in (active_tags() or [])]}
     finally:
         await session.close()
         await engine.dispose()

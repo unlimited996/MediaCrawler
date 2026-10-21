@@ -122,7 +122,7 @@ export function ZhihuLayout({ d, comments, commentsTotal, commentsToolbar, t, th
                       {authorAnchor(c.author_url, c.author || '-')}
                     </span>
                     <span className="text-[11px] text-cyber-text-muted">{fmtTs(c.publish_ts)}</span>
-                    <StanceBadge stance={c.stance} t={t} />
+                    <StanceBadge stance={c.stance} t={t} tagCode={c.stance_tag_code} tagName={c.stance_tag_name} tagColor={c.stance_tag_color} comment={c} />
                   </div>
                   <div className="mt-1 text-sm leading-6 text-cyber-text-secondary"><RichText content={c.content} /></div>
                   <div className="mt-1 flex items-center gap-3 text-[11px] text-cyber-text-muted">

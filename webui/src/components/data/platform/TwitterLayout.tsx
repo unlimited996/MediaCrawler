@@ -146,7 +146,7 @@ export function TwitterLayout({ d, comments, commentsTotal, commentsToolbar, t, 
                       @{String(c.author || 'user').replace(/\s+/g, '').toLowerCase()}
                     </span>
                     <span className="text-[13px] text-cyber-text-muted">· {fmtTs(c.publish_ts)}</span>
-                    <StanceBadge stance={c.stance} t={t} />
+                    <StanceBadge stance={c.stance} t={t} tagCode={c.stance_tag_code} tagName={c.stance_tag_name} tagColor={c.stance_tag_color} comment={c} />
                   </div>
                   <div className="mt-0.5 text-[15px] leading-7 text-cyber-text-primary">
                     <RichText content={c.content} />

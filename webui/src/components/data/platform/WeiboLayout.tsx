@@ -102,7 +102,7 @@ export function WeiboLayout({ d, comments, commentsTotal, commentsToolbar, t, th
                       {authorAnchor(c.author_url, c.author || '-')}
                     </span>
                     <span className="text-cyber-text-muted">{fmtTs(c.publish_ts)}</span>
-                    <StanceBadge stance={c.stance} t={t} />
+                    <StanceBadge stance={c.stance} t={t} tagCode={c.stance_tag_code} tagName={c.stance_tag_name} tagColor={c.stance_tag_color} comment={c} />
                     <span className="ml-auto text-[11px] text-cyber-text-muted">
                       {idx + 1}{t('manage.floor')}
                     </span>

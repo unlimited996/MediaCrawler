@@ -298,6 +298,24 @@ export function TopicChips({
 }
 
 // ---------------------------------------------------------------------------
+// 表态编辑上下文
+//
+// 详情页统一提供「改判这条评论的态度」回调，11 个平台布局组件不必层层传 props。
+// ---------------------------------------------------------------------------
+
+export interface StanceEditState {
+  /** 打开改判选择器；传入评论对象 */
+  open: (comment: any) => void
+}
+
+export const StanceEditContext = createContext<StanceEditState | null>(null)
+
+/** 布局组件内取改判入口；没有提供时为 undefined（徽标不可点） */
+export function useStanceEdit(): StanceEditState | null {
+  return useContext(StanceEditContext)
+}
+
+// ---------------------------------------------------------------------------
 // 立场徽标（内容赞同度）
 //
 // 后端 tools/stance.py 先提取发帖人核心观点，再判定每条评论相对该观点的立场：
@@ -332,22 +350,68 @@ export const STANCE_META: Record<string, StanceMeta> = {
 }
 
 /**
- * 评论立场徽标：赞同 / 中立 / 反对。
+ * 评论态度徽标（库表驱动）。
  *
- * 判不出来（stance 为空）时不渲染，避免出现误导性的空标签。
+ * 优先展示命中的态度标签（阴阳 / 无语 / 质疑 / 嘲讽 / 观望 / 神评 …），
+  标签名与颜色都来自标签库；评论还没按标签重判过时回落三态徽标。
+ * 判不出来（stance 与标签都为空）时不渲染，避免出现误导性的空标签。
+ * `onEdit` 传入后徽标可点击，弹出标签选择器改判（人工修正自动判定）。
  * `dark` 用于抖音这类深色舞台，换成半透明白底以免徽标和深色背景糊在一起。
  */
 export function StanceBadge({
   stance, t, size = 'sm', dark = false, className = '',
+  tagCode, tagName, tagColor, onEdit, comment,
 }: {
   stance?: StanceValue
   t: (key: string, opts?: any) => string
   size?: 'xs' | 'sm'
   dark?: boolean
   className?: string
+  /** 命中的态度标签 code（库表驱动） */
+  tagCode?: string | null
+  /** 标签名（后端已带，减少前端查表） */
+  tagName?: string | null
+  /** 标签颜色 */
+  tagColor?: string | null
+  /** 传入则可点击编辑表态 */
+  onEdit?: () => void
+  /** 评论对象：配合上下文自动获得改判入口 */
+  comment?: any
 }) {
+  const edit = useStanceEdit()
+  const editHandler = onEdit ?? (edit && comment ? () => edit.open(comment) : undefined)
   const key = String(stance || '').toLowerCase()
   const meta = STANCE_META[key]
+
+  // 有标签 → 用标签名 + 标签色
+  if (tagCode) {
+    const label = tagName || tagCode
+    const color = tagColor || '#94a3b8'
+    const tone = dark
+      ? 'border-white/20 bg-white/10'
+      : ''
+    return (
+      <span
+        role={editHandler ? 'button' : undefined}
+        onClick={editHandler ? (e) => { e.stopPropagation(); editHandler() } : undefined}
+        className={`inline-flex max-w-[7.5rem] items-center gap-0.5 rounded border px-1 ${
+          size === 'xs' ? 'py-0 text-[10px]' : 'py-[1px] text-[11px]'
+        } font-mono leading-4 ${tone} ${className} ${
+          editHandler ? 'cursor-pointer hover:brightness-125' : ''
+        }`}
+        style={dark ? undefined : {
+          borderColor: `${color}55`,
+          background: `${color}1a`,
+          color,
+        }}
+        title={`${label}${editHandler ? '（点击改判）' : ''}`}
+      >
+        <span className="truncate">{label}</span>
+        {editHandler && <ChevronDown className="h-2.5 w-2.5 flex-shrink-0 opacity-70" />}
+      </span>
+    )
+  }
+
   if (!meta) return null
   const Icon = meta.icon
   const tone = dark && key !== 'neutral'
@@ -355,13 +419,19 @@ export function StanceBadge({
     : meta.cls
   return (
     <span
+      role={editHandler ? 'button' : undefined}
+      onClick={editHandler ? (e) => { e.stopPropagation(); editHandler() } : undefined}
       className={`inline-flex items-center gap-0.5 rounded border px-1 ${
         size === 'xs' ? 'py-0 text-[10px]' : 'py-[1px] text-[11px]'
-      } font-mono leading-4 ${tone} ${className}`}
-      title={t('manage.cmt.stanceHint', { defaultValue: '相对发帖人观点的立场（自动判定）' })}
+      } font-mono leading-4 ${tone} ${className} ${
+        editHandler ? 'cursor-pointer hover:brightness-125' : ''
+      }`}
+      title={`${t(`manage.cmt.${meta.key}`, { defaultValue: key })}${
+        editHandler ? '（点击改判）' : ''}`}
     >
       <Icon className={size === 'xs' ? 'h-2.5 w-2.5' : 'h-3 w-3'} />
       {t(`manage.cmt.${meta.key}`, { defaultValue: key })}
+      {editHandler && <ChevronDown className="h-2.5 w-2.5 flex-shrink-0 opacity-70" />}
     </span>
   )
 }

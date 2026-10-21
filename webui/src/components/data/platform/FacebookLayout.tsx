@@ -126,7 +126,7 @@ export function FacebookLayout({ d, comments, commentsTotal, commentsToolbar, t,
                       <span className="text-[13px] font-semibold text-cyber-text-primary">
                         {authorAnchor(c.author_url, c.author || '-')}
                       </span>
-                      <StanceBadge stance={c.stance} t={t} size="xs" />
+                      <StanceBadge stance={c.stance} t={t} size="xs" tagCode={c.stance_tag_code} tagName={c.stance_tag_name} tagColor={c.stance_tag_color} comment={c} />
                       <div className="mt-0.5 w-full whitespace-pre-wrap text-[14px] leading-6 text-cyber-text-primary">
                         <RichText content={c.content} />
                       </div>

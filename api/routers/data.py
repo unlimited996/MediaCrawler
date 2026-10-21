@@ -305,6 +305,31 @@ async def serve_local_media(platform: str, content_id: str, filename: str):
     )
 
 
+@router.get("/raw/{file_path:path}")
+async def serve_raw_file(file_path: str):
+    """直出 DATA_DIR 内的原始文件（图片 / 视频等二进制）。
+
+    /files/{path} 是文本预览路由（只认 json/jsonl/csv，二进制会 400），
+    浏览器 <img>/<video> 要取真实字节必须走这里。
+    路径限制在 DATA_DIR 内，防目录穿越。
+    """
+    import mimetypes
+
+    try:
+        full = (DATA_DIR / file_path).resolve()
+        full.relative_to(DATA_DIR.resolve())   # 越界即 ValueError
+    except (ValueError, OSError):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not full.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    ctype = mimetypes.guess_type(str(full))[0] or "application/octet-stream"
+    return FileResponse(
+        str(full), media_type=ctype,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @router.get("/media/placeholder")
 async def media_placeholder(text: str = "无图", w: int = 300, h: int = 400):
     """占位图：外链失效（原帖删除 / CDN 签名过期）且无本地副本时兜底。

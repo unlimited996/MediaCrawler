@@ -141,7 +141,7 @@ export function RedditLayout({ d, comments, commentsTotal, commentsToolbar, t, t
                       <span>{fmtNum(c.like_count)} {t('manage.likes')}</span>
                       <span>·</span>
                       <span>{fmtTs(c.publish_ts)}</span>
-                      <StanceBadge stance={c.stance} t={t} size="xs" />
+                      <StanceBadge stance={c.stance} t={t} size="xs" tagCode={c.stance_tag_code} tagName={c.stance_tag_name} tagColor={c.stance_tag_color} comment={c} />
                     </div>
                     <div className="mt-1 text-[14px] leading-6 text-cyber-text-primary">
                       <RichText content={c.content} />

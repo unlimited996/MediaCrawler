@@ -594,8 +594,9 @@ export function DataManagementView({
               </span>
               <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                {/* 平台品牌标识（无 logo 用图标，再没有用品牌色首字） */}
-                <PlatformBrandMark platform={it.platform} size={16} />
+                {/* 平台品牌标识：只在「全部平台」视图下显示；
+                    进入某个平台页时列表已天然同质，再放标识是冗余 */}
+                {!platform && <PlatformBrandMark platform={it.platform} size={16} />}
                 {/* 发帖人：头像 + 昵称（列表模式昵称固定 2 字 + 省略号，hover 看全名） */}
                 <span className="flex flex-shrink-0 items-center gap-1">
                   <PlatformAvatar

@@ -9,7 +9,7 @@ import { crawlerApi, storyApi } from '@/lib/api'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { getPlatformTheme } from './platformTheme'
-import { pickSourceUrl, extractTopics, RepliesContext } from './shared'
+import { pickSourceUrl, extractTopics, RepliesContext, StanceEditContext } from './shared'
 import { CommentToolbar } from './CommentToolbar'
 import type { CommentSort, HasRepliesFilter, StanceFilter, StanceStats } from './CommentToolbar'
 import { XhsLayout } from './XhsLayout'
@@ -62,14 +62,18 @@ export function PlatformStoryDetail({
   // ---------- 评论筛选状态（Steam 风格：排序/立场走后端，回复/关键词走前端） ----------
   const [cmtSort, setCmtSort] = useState<CommentSort>('like')
   const [cmtStance, setCmtStance] = useState<StanceFilter>('')
+  /** 态度标签筛选（库表驱动，逗号分隔多值） */
+  const [cmtTags, setCmtTags] = useState<string[]>([])
   const [cmtHasReplies, setCmtHasReplies] = useState<HasRepliesFilter>('all')
   const [cmtKeyword, setCmtKeyword] = useState('')
+  /** 正在改判的评论（人工修正自动判定） */
+  const [stanceEditTarget, setStanceEditTarget] = useState<any | null>(null)
 
   // ---------- 评论：滚动到底自动加载下一页 ----------
   // 只分页读取库里已抓到的评论，不会触发新的抓取任务。
   // sort / stance 变化会改变 queryKey 重新拉取（服务端筛选）。
   const commentsQ = useInfiniteQuery({
-    queryKey: ['storyComments', storyId, cmtSort, cmtStance],
+    queryKey: ['storyComments', storyId, cmtSort, cmtStance, cmtTags.join(',')],
     initialPageParam: 1,
     queryFn: async ({ pageParam }) =>
       (await storyApi.comments(
@@ -79,6 +83,8 @@ export function PlatformStoryDetail({
         COMMENT_PAGE_SIZE,
         20,
         cmtStance || undefined,
+        undefined,
+        cmtTags.length ? cmtTags.join(',') : undefined,
       )).data,
     getNextPageParam: (last) => {
       const size = last?.page_size ?? COMMENT_PAGE_SIZE
@@ -107,6 +113,10 @@ export function PlatformStoryDetail({
     () => (commentsQ.data?.pages || []).flatMap((p: any) => p.items || []),
     [commentsQ.data],
   )
+  /** 态度标签分布（全量口径，不随筛选变化） */
+  const tagStats: { code: string; name: string; color: string | null; count: number }[] =
+    useMemo(() => commentsQ.data?.pages?.[0]?.tag_stats || [], [commentsQ.data])
+
   const comments = useMemo(() => {
     const kw = cmtKeyword.trim().toLowerCase()
     return allComments.filter((c: any) => {
@@ -197,6 +207,25 @@ export function PlatformStoryDetail({
   // ---------- 重新拉取：按原文链接重跑一次详情抓取 ----------
   // 新数据经 v2 同步 upsert 叠加到旧数据；若平台已删内容，
   // 爬虫侧会把 story 标记 deleted，刷新后显示「已删除」徽标。
+  /** 改判可选标签：打开弹层时才拉 */
+  const tagsQ = useQuery({
+    queryKey: ['commentStanceTags'],
+    staleTime: 60_000,
+    queryFn: async () => (await storyApi.commentStanceTags()).data,
+  })
+
+  // ---------- 人工改判评论态度 ----------
+  const stanceM = useMutation({
+    mutationFn: async ({ id, code }: { id: number; code: string }) =>
+      (await storyApi.setCommentStance(id, code)).data,
+    onSuccess: (d) => {
+      setStanceEditTarget(null)
+      qc.invalidateQueries({ queryKey: ['storyComments', storyId] })
+      toast.success(`已改判为「${d.stance_tag_name || d.stance_tag_code}」`)
+    },
+    onError: (e: any) => toast.error(`改判失败：${e?.response?.data?.detail || e?.message}`),
+  })
+
   const [refetching, setRefetching] = useState(false)
   /** 编辑记录弹层（P2） */
   const [editsOpen, setEditsOpen] = useState(false)
@@ -270,6 +299,8 @@ export function PlatformStoryDetail({
     <CommentToolbar
       filteredTotal={filteredTotal}
       stats={stanceStats}
+      tagStats={tagStats}
+      selectedTags={cmtTags}
       sort={cmtSort}
       stance={cmtStance}
       hasReplies={cmtHasReplies}
@@ -277,6 +308,9 @@ export function PlatformStoryDetail({
       showReplies={showReplies}
       onSort={setCmtSort}
       onStance={setCmtStance}
+      onToggleTag={(code) => setCmtTags((prev) =>
+        prev.includes(code) ? prev.filter((x) => x !== code) : [...prev, code])}
+      onClearTags={() => setCmtTags([])}
       onHasReplies={setCmtHasReplies}
       onKeyword={setCmtKeyword}
       onToggleReplies={() => setShowReplies((v) => !v)}
@@ -447,6 +481,7 @@ export function PlatformStoryDetail({
           </div>
         ) : (
           <RepliesContext.Provider value={{ showReplies, storyId }}>
+            <StanceEditContext.Provider value={{ open: setStanceEditTarget }}>
             {renderLayout()}
 
             {/* 滚动到底自动加载下一页评论；没有更多时给出总数提示 */}
@@ -477,9 +512,68 @@ export function PlatformStoryDetail({
                 </button>
               )}
             </div>
+            </StanceEditContext.Provider>
           </RepliesContext.Provider>
         )}
       </div>
+
+      {/* 改判评论态度：标签库里选一个（人工修正自动判定） */}
+      {stanceEditTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+             onClick={() => setStanceEditTarget(null)}>
+          <div className="w-full max-w-sm overflow-hidden rounded-lg border border-cyber-border-subtle bg-cyber-bg-panel"
+               onClick={(e) => e.stopPropagation()}>
+            <div className="border-b border-cyber-border-subtle px-3 py-2">
+              <div className="text-sm font-mono font-bold text-cyber-text-primary">
+                改判这条评论的态度
+              </div>
+              <div className="mt-0.5 line-clamp-2 text-[11px] text-cyber-text-muted">
+                {stanceEditTarget.content}
+              </div>
+            </div>
+            <div className="max-h-64 overflow-y-auto p-2">
+              {stanceM.isPending ? (
+                <div className="py-3 text-center text-[11px] font-mono text-cyber-text-muted">
+                  提交中…
+                </div>
+              ) : (
+                <div className="flex flex-wrap gap-1.5">
+                  {tagsQ.data?.items.map((g) => {
+                    const color = g.color || '#94a3b8'
+                    const cur = stanceEditTarget.stance_tag_code === g.code
+                    return (
+                      <button
+                        key={g.code}
+                        type="button"
+                        onClick={() => stanceM.mutate({ id: stanceEditTarget.id, code: g.code })}
+                        className={`rounded border px-2 py-1 text-[11px] font-mono transition-all hover:brightness-125 ${
+                          cur ? 'font-bold' : ''
+                        }`}
+                        style={{
+                          borderColor: cur ? color : `${color}44`,
+                          background: cur ? `${color}26` : 'transparent',
+                          color,
+                        }}
+                      >
+                        {g.name}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+            <div className="border-t border-cyber-border-subtle px-3 py-2 text-right">
+              <button
+                type="button"
+                onClick={() => setStanceEditTarget(null)}
+                className="rounded border border-cyber-border-subtle px-2 py-1 text-[11px] font-mono text-cyber-text-secondary"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 编辑记录：前后比对弹层（P2） */}
       <StoryEditLogDialog

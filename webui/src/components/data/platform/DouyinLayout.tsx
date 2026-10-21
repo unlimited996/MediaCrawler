@@ -112,7 +112,7 @@ export function DouyinLayout({ d, comments, commentsTotal, commentsToolbar, t, t
                   <div className="mt-0.5 text-sm leading-6 text-white/90"><RichText content={c.content} /></div>
                   <div className="mt-1 flex items-center gap-3 text-[11px] text-white/40">
                     <span>{fmtTs(c.publish_ts)}</span>
-                    <StanceBadge stance={c.stance} t={t} dark />
+                    <StanceBadge stance={c.stance} t={t} dark tagCode={c.stance_tag_code} tagName={c.stance_tag_name} tagColor={c.stance_tag_color} comment={c} />
                     <span className="flex items-center gap-1">
                       <Heart className="h-3 w-3" />
                       {fmtNum(c.like_count)}

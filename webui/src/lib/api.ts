@@ -270,16 +270,29 @@ export const storyApi = {
       cascade: Record<string, number>
       failed: { id: number; error: string }[]
     }>('/stories/batch-delete', { ids, purge_files }),
-  /** stance：按立场筛选 agree/neutral/oppose（相对发帖人核心观点，后端自动判定） */
+  /** stance：按立场筛选 agree/neutral/oppose；tag：按态度标签筛选（逗号分隔多值） */
   comments: (id: number, sort = 'like', page = 1, page_size = 50, reply_limit = 20,
-             stance?: string, sentiment?: string) =>
+             stance?: string, sentiment?: string, tag?: string) =>
     api.get<{ items: any[]; total: number; page: number; page_size: number;
               stance_stats?: { agree: number; neutral: number; oppose: number;
                                total: number; agreement: string };
               sentiment_stats?: { positive: number; neutral: number; negative: number;
-                                  total: number } }>(
+                                  total: number };
+              /** 态度标签分布（库表驱动，含名称/颜色/条数） */
+              tag_stats?: { code: string; name: string; color: string | null;
+                            count: number }[] }>(
       `/stories/${id}/comments`,
-      { params: { sort, page, page_size, reply_limit, stance, sentiment } }),
+      { params: { sort, page, page_size, reply_limit, stance, sentiment, tag } }),
+  /** 评论表态可选标签（库表驱动，含颜色与极性） */
+  commentStanceTags: () =>
+    api.get<{ items: { code: string; name: string; color: string | null;
+                       polarity: string; is_fallback: boolean }[] }>(
+      '/stories/comments/stance-tags'),
+  /** 人工改判一条评论的态度标签 */
+  setCommentStance: (commentId: number, tagCode: string) =>
+    api.patch<{ id: number; stance: string; stance_tag_code: string;
+                stance_tag_name: string | null; stance_tag_color: string | null }>(
+      `/stories/comments/${commentId}/stance`, { tag_code: tagCode }),
   /** 单条主评论的全部楼中楼：前端展开回复时按需拉取（默认接口只给前 20 条） */
   commentReplies: (id: number, commentId: number, page = 1, page_size = 500) =>
     api.get<{ items: any[]; total: number; page: number; page_size: number }>(
