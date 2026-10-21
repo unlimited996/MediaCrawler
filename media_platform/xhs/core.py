@@ -40,7 +40,7 @@ from media_downloader import MediaDownloader
 from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import xhs as xhs_store
-from tools import utils
+from tools import anti_risk, utils
 from tools.crawler_util import chromium_launch_kwargs, system_playwright_proxy
 from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
@@ -56,6 +56,21 @@ from .exception import (
 from .field import SearchSortType
 from .help import parse_note_info_from_note_url, parse_creator_info_from_url, get_search_id
 from .login import XiaoHongShuLogin
+
+
+def _xhs_concurrency() -> int:
+    """小红书并发数：默认恒为 1（串行请求最像真人，风控最低）。"""
+    return max(1, int(getattr(config, "XHS_MAX_CONCURRENCY_NUM",
+                              config.MAX_CONCURRENCY_NUM) or 1))
+
+
+def _xhs_crawl_interval():
+    """小红书请求间隔规格：(lo, hi) 随机区间，默认 5-15s。"""
+    return anti_risk.xhs_sleep_bounds()
+
+
+def _xhs_captcha_wait_sec() -> int:
+    return int(getattr(config, "XHS_CAPTCHA_WAIT_SEC", 300) or 300)
 
 
 class XiaoHongShuCrawler(AbstractCrawler):
@@ -120,13 +135,25 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
         async with async_playwright() as playwright:
             # Choose launch mode based on configuration
-            if config.ENABLE_CDP_MODE:
-                utils.logger.info("[XiaoHongShuCrawler] Launching browser using CDP mode")
+            # 小红书默认走 CDP：连接本地真实浏览器，复用登录态/扩展/历史，
+            # 不带 Playwright 自动化标识（--enable-automation 等已在启动参数剔除）
+            use_cdp = bool(getattr(config, "XHS_ENABLE_CDP_MODE",
+                                   config.ENABLE_CDP_MODE))
+            if use_cdp:
+                utils.logger.info(
+                    "[XiaoHongShuCrawler] Launching browser using CDP mode "
+                    "(连接本地真实浏览器，复用登录态)")
                 self.browser_context = await self.launch_browser_with_cdp(
                     playwright,
                     playwright_proxy_format,
                     self.user_agent,
-                    headless=config.CDP_HEADLESS,
+                    headless=bool(getattr(config, "XHS_CDP_HEADLESS",
+                                          config.CDP_HEADLESS)),
+                    connect_existing=bool(getattr(
+                        config, "XHS_CDP_CONNECT_EXISTING",
+                        config.CDP_CONNECT_EXISTING)),
+                    auto_close=bool(getattr(config, "XHS_AUTO_CLOSE_BROWSER",
+                                           config.AUTO_CLOSE_BROWSER)),
                 )
             else:
                 utils.logger.info("[XiaoHongShuCrawler] Launching browser using standard mode")
@@ -164,7 +191,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 # Cookie 过期时表现为"没让扫码就直接抓 → 全部跳过 → 显示成功"，
                 # 用户根本不知道是登录态挂了。这里二次校验，仍无效就回退扫码。
                 if not await self.xhs_client.pong():
-                    headless_now = config.CDP_HEADLESS if config.ENABLE_CDP_MODE else config.HEADLESS
+                    use_cdp_now = bool(getattr(config, "XHS_ENABLE_CDP_MODE",
+                                               config.ENABLE_CDP_MODE))
+                    headless_now = (bool(getattr(config, "XHS_CDP_HEADLESS",
+                                                 config.CDP_HEADLESS))
+                                    if use_cdp_now else config.HEADLESS)
                     if headless_now:
                         utils.logger.warning(
                             "[XiaoHongShuCrawler] 登录态无效（Cookie 已过期），当前为无头模式无法扫码。"
@@ -276,6 +307,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 )
                 if attempt > 1:
                     utils.logger.info(f"[XiaoHongShuCrawler] 第 {attempt} 次尝试打开首页成功")
+                # 风控页拦截：标题/正文带验证关键字时等用户人工过验证（CDP 真实浏览器）
+                if await anti_risk.page_has_captcha(self.context_page):
+                    utils.logger.warning(
+                        "[XiaoHongShuCrawler] 首页命中安全验证，等待人工处理 ...")
+                    await anti_risk.wait_for_human_verify(
+                        self.context_page, timeout_sec=_xhs_captcha_wait_sec())
                 return
             except Exception as e:
                 last_err = e
@@ -391,7 +428,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     if not notes_res or not notes_res.get("has_more", False):
                         utils.logger.info("[XiaoHongShuCrawler.search] No more content!")
                         break
-                    semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+                    semaphore = asyncio.Semaphore(_xhs_concurrency())
                     task_list = [
                         self.get_note_detail_async_task(
                             note_id=post_item.get("id"),
@@ -417,14 +454,27 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     utils.logger.info(f"[XiaoHongShuCrawler.search] Note details: {note_details}")
                     await self.batch_get_note_comments(note_ids, xsec_tokens)
 
-                    # Sleep after each page navigation
-                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
+                    # Sleep after each page navigation（5-15s 随机，降低频率特征）
+                    await anti_risk.xhs_sleep(f"search 第 {page-1} 页间隔")
                 except DataFetchError:
                     utils.logger.error("[XiaoHongShuCrawler.search] Get note detail error")
                     if self.task_id:
                         await checkpoint.mark_error(
                             self.task_id, "search_page", keyword, page, "DataFetchError")
+                    break
+                except (IPBlockError, PlatformAccessError) as ex:
+                    # 验证码 / 安全限制：等用户在真实浏览器里人工过验证后重试当前页，
+                    # 超时或仍失败才中断本轮（不无限重试）
+                    if anti_risk.is_captcha_error(ex):
+                        verified = await anti_risk.wait_for_human_verify(
+                            self.context_page, timeout_sec=_xhs_captcha_wait_sec())
+                        if verified:
+                            utils.logger.info(
+                                "[XiaoHongShuCrawler.search] 人工验证完成，重试当前页")
+                            continue
+                    utils.logger.error(
+                        f"[XiaoHongShuCrawler.search] Access restricted: {ex}. "
+                        f"建议降低采集频率、更换 IP 或检查账号状态")
                     break
 
     async def get_creators_and_notes(self) -> None:
@@ -450,14 +500,32 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 continue
             except (IPBlockError, PlatformAccessError) as e:
                 # Access restricted on the creator homepage, skip this creator instead of crashing the run.
+                # 先等人工过验证再重试一次（CDP 连的是真实浏览器，用户直接在窗口里操作）
+                if anti_risk.is_captcha_error(e):
+                    verified = await anti_risk.wait_for_human_verify(
+                        self.context_page, timeout_sec=_xhs_captcha_wait_sec())
+                    if verified:
+                        try:
+                            createor_info = await self.xhs_client.get_creator_info(
+                                user_id=user_id,
+                                xsec_token=creator_info.xsec_token,
+                                xsec_source=creator_info.xsec_source,
+                            )
+                            if createor_info:
+                                await xhs_store.save_creator(user_id, creator=createor_info)
+                                utils.logger.info(
+                                    f"[XiaoHongShuCrawler] 人工验证后重试成功: {user_id}")
+                        except Exception as retry_err:
+                            utils.logger.warning(
+                                f"[XiaoHongShuCrawler] 人工验证后重试仍失败 {user_id}: {retry_err}")
                 utils.logger.error(
                     f"[XiaoHongShuCrawler.get_creators_and_notes] Access restricted for creator {creator_url}: {e}. "
                     f"建议降低采集频率、更换 IP 或检查账号状态"
                 )
                 continue
 
-            # Use fixed crawling interval
-            crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
+            # Use randomized crawling interval (5-15s) instead of a fixed one
+            crawl_interval = _xhs_crawl_interval()
             # 增量模式（定时任务默认）：预读该作者已入库的 note_id，
             # 翻到整页旧笔记就停止翻页，只抓新帖，避免每次全量重跑
             known_note_ids = None
@@ -493,7 +561,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def fetch_creator_notes_detail(self, note_list: List[Dict]):
         """Concurrently obtain the specified post list and save the data"""
-        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+        semaphore = asyncio.Semaphore(_xhs_concurrency())
         task_list = [
             self.get_note_detail_async_task(
                 note_id=post_item.get("note_id"),
@@ -522,7 +590,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 note_id=note_url_info.note_id,
                 xsec_source=note_url_info.xsec_source,
                 xsec_token=note_url_info.xsec_token,
-                semaphore=asyncio.Semaphore(config.MAX_CONCURRENCY_NUM),
+                semaphore=asyncio.Semaphore(_xhs_concurrency()),
             )
             get_note_detail_task_list.append(crawler_task)
 
@@ -600,9 +668,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
 
-                # Sleep after fetching note detail
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
+                # Sleep after fetching note detail（5-15s 随机，避免固定节奏）
+                await anti_risk.xhs_sleep(f"note {note_id} 详情间隔")
 
                 return note_detail
 
@@ -617,6 +684,25 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     f"[XiaoHongShuCrawler.get_note_detail_async_task] Access restricted while getting note {note_id}: {ex}. "
                     f"建议降低采集频率、更换 IP 或检查账号状态"
                 )
+                # 验证码/安全限制：等用户在真实浏览器里人工完成验证后重试一次
+                if anti_risk.is_captcha_error(ex):
+                    verified = await anti_risk.wait_for_human_verify(
+                        self.context_page, timeout_sec=_xhs_captcha_wait_sec())
+                    if verified:
+                        try:
+                            retried = await self.xhs_client.get_note_by_id(
+                                note_id, xsec_source, xsec_token)
+                            if retried:
+                                retried.update({"xsec_token": xsec_token,
+                                                "xsec_source": xsec_source})
+                                await anti_risk.xhs_sleep(
+                                    f"note {note_id} 人工验证后重试间隔")
+                                return retried
+                            utils.logger.warning(
+                                f"[XiaoHongShuCrawler] 人工验证后重试仍无数据: {note_id}")
+                        except Exception as retry_err:
+                            utils.logger.warning(
+                                f"[XiaoHongShuCrawler] 人工验证后重试异常 {note_id}: {retry_err}")
                 return None
             except DataFetchError as ex:
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] Get note detail error: {ex}")
@@ -643,7 +729,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return
 
         utils.logger.info(f"[XiaoHongShuCrawler.batch_get_note_comments] Begin batch get note comments, note list: {note_list}")
-        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+        semaphore = asyncio.Semaphore(_xhs_concurrency())
         task_list: List[Task] = []
         for index, note_id in enumerate(note_list):
             task = asyncio.create_task(
@@ -657,8 +743,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
         """Get note comments with keyword filtering and quantity limitation"""
         async with semaphore:
             utils.logger.info(f"[XiaoHongShuCrawler.get_comments] Begin get note id comments {note_id}")
-            # Use fixed crawling interval
-            crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
+            # Use randomized crawling interval (5-15s)
+            crawl_interval = _xhs_crawl_interval()
             try:
                 await self.xhs_client.get_note_all_comments(
                     note_id=note_id,
@@ -679,9 +765,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     f"[XiaoHongShuCrawler.get_comments] 评论抓取异常，跳过 {note_id}: {type(e).__name__} {e}")
                 return
 
-            # Sleep after fetching comments
-            await asyncio.sleep(crawl_interval)
-            utils.logger.info(f"[XiaoHongShuCrawler.get_comments] Sleeping for {crawl_interval} seconds after fetching comments for note {note_id}")
+            # Sleep after fetching comments（5-15s 随机）
+            await anti_risk.interval_sleep(
+                crawl_interval, f"note {note_id} 评论间隔")
 
     async def create_xhs_client(self, httpx_proxy: Optional[str]) -> XiaoHongShuClient:
         """Create Xiaohongshu client"""
@@ -738,6 +824,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
             utils.logger.warning(
                 f"[XiaoHongShuCrawler.launch_browser] 回退使用本机 Chromium: "
                 f"{fallback_exe}（建议执行 python -m playwright install chromium）")
+        # 反检测：剔除自动化测试标识（--enable-automation / AutomationControlled），
+        # 标准模式只是回退路径，默认应走 CDP 连接真实浏览器
+        stealth_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--exclude-switches=enable-automation",
+            "--disable-infobars",
+        ]
+        fallback_kwargs.setdefault("args", [])
+        fallback_kwargs["args"] = list(fallback_kwargs["args"]) + [
+            a for a in stealth_args if a not in fallback_kwargs["args"]]
         if config.SAVE_LOGIN_STATE:
             # feat issue #14
             # we will save login state to avoid login every time
@@ -767,6 +863,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
         playwright_proxy: Optional[Dict],
         user_agent: Optional[str],
         headless: bool = True,
+        connect_existing: Optional[bool] = None,
+        auto_close: Optional[bool] = None,
     ) -> BrowserContext:
         """Launch browser using CDP mode"""
         try:
@@ -776,6 +874,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 playwright_proxy=playwright_proxy,
                 user_agent=user_agent,
                 headless=headless,
+                connect_existing=connect_existing,
+                auto_close=auto_close,
             )
 
             # Display browser information
@@ -791,13 +891,24 @@ class XiaoHongShuCrawler(AbstractCrawler):
             return await self.launch_browser(chromium, playwright_proxy, user_agent, headless)
 
     async def close(self):
-        """Close browser context"""
+        """Close browser context
+
+        小红书默认 XHS_AUTO_CLOSE_BROWSER=False：保持浏览器常开，
+        登录态/指纹跨任务连续；需要收敛时把配置打开即可。
+        """
+        auto_close = bool(getattr(config, "XHS_AUTO_CLOSE_BROWSER",
+                                  config.AUTO_CLOSE_BROWSER))
         # Special handling if using CDP mode
         if self.cdp_manager:
-            await self.cdp_manager.cleanup()
+            await self.cdp_manager.cleanup(auto_close=auto_close)
             self.cdp_manager = None
-        else:
-            await self.browser_context.close()
+        elif self.browser_context is not None:
+            if auto_close:
+                await self.browser_context.close()
+            else:
+                utils.logger.info(
+                    "[XiaoHongShuCrawler.close] AUTO_CLOSE_BROWSER=False，"
+                    "浏览器保持常开（登录态连续）")
         utils.logger.info("[XiaoHongShuCrawler.close] Browser context closed ...")
 
     async def download_media(self, note_detail: Dict) -> None:

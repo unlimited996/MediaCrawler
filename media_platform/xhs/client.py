@@ -39,6 +39,7 @@ from tenacity import (
     stop_after_attempt,
     wait_fixed,
 )
+from tools import anti_risk
 from tools.httpx_util import make_async_client
 
 import config
@@ -482,7 +483,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 comments = comments[: max_count - len(result)]
             if callback:
                 await callback(note_id, comments)
-            await asyncio.sleep(crawl_interval)
+            await anti_risk.interval_sleep(crawl_interval, "分页/翻页间隔")
             result.extend(comments)
             sub_comments = await self.get_comments_all_sub_comments(
                 comments=comments,
@@ -598,7 +599,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     seen_sub_ids.update(c.get("id") for c in fresh if c.get("id"))
                     if fresh and callback:
                         await callback(note_id, fresh)
-                    await asyncio.sleep(crawl_interval)
+                    await anti_risk.interval_sleep(crawl_interval, "分页/翻页间隔")
                     result.extend(fresh)
             except Exception as e:
                 utils.logger.error(
@@ -734,7 +735,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 await callback(notes_to_add)
 
             result.extend(notes_to_add)
-            await asyncio.sleep(crawl_interval)
+            await anti_risk.interval_sleep(crawl_interval, "分页/翻页间隔")
 
         utils.logger.info(
             f"[XiaoHongShuClient.get_all_notes_by_creator] Finished getting notes for user {user_id}, total: {len(result)}"

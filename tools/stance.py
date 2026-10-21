@@ -454,6 +454,9 @@ SEED_TAGS: List[Dict[str, Any]] = [
 
 #: 进程内缓存：{version, tags:[{...rules}], loaded_at}
 _LIB_CACHE: Dict[str, Any] = {"version": 0, "tags": [], "loaded_at": 0.0}
+#: ensure_seeded 的进程内缓存：已确认种子化时 60s 内不再查库
+_SEED_OK_AT: float = 0.0
+_SEED_TAG_CNT: int = 0
 #: 库不可用时用种子构造的库（结构同 _LIB_CACHE["tags"]）
 _SEED_LIB: Optional[List[Dict[str, Any]]] = None
 
@@ -477,7 +480,13 @@ async def ensure_seeded(session=None) -> int:
     """库表为空时写入内置种子标签（9 个），并置版本号。返回标签数。
 
     幂等：已存在任何标签就直接返回。启动 / 首次判定时调用。
+
+    性能：评论批量同步时每条评论都会走到这里，探到「已种子化」后
+    进程内 60s TTL 缓存，避免每条评论都开一个 session 查一次 count。
     """
+    global _SEED_OK_AT, _SEED_TAG_CNT
+    if _SEED_OK_AT and (time.monotonic() - _SEED_OK_AT) < 60:
+        return _SEED_TAG_CNT
     try:
         from database.models_v2 import StanceTag, StanceTagRule, StanceTagVersion
         from sqlalchemy import select as _sel, func as _func
@@ -533,6 +542,8 @@ async def ensure_seeded(session=None) -> int:
                 if v is None:
                     session.add(StanceTagVersion(version=1))
                     await session.commit()
+                _SEED_OK_AT = time.monotonic()
+                _SEED_TAG_CNT = int(cnt)
                 return int(cnt)
             for t in SEED_TAGS:
                 tag = StanceTag(
@@ -555,6 +566,8 @@ async def ensure_seeded(session=None) -> int:
                 await load_library(session=session, force=True)
             except Exception:
                 pass
+            _SEED_OK_AT = time.monotonic()
+            _SEED_TAG_CNT = len(SEED_TAGS)
             return len(SEED_TAGS)
         finally:
             if own and ctx is not None:

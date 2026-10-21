@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import random
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -25,8 +26,41 @@ import config
 from sqlalchemy import select, update
 
 from database.models_v2 import ScheduledTask, ScheduledTaskRun
+from tools import anti_risk
 from tools.cst import cst_now, to_cst, utc_now
 from tools.v2_sync import get_content_index  # noqa: F401  （复用同库会话约定）
+
+
+def _active_window() -> tuple:
+    """任务允许执行的本地时间窗口 [START, END)。"""
+    start = int(getattr(config, "SCHEDULER_ACTIVE_HOUR_START", 6) or 0)
+    end = int(getattr(config, "SCHEDULER_ACTIVE_HOUR_END", 24) or 24)
+    if end > 24:
+        end = 24
+    if end <= start:  # 配置非法时退回全天
+        return (0, 24)
+    return (start, end)
+
+
+def _in_active_window(now: Optional[datetime] = None) -> bool:
+    """当前本地时间是否落在执行窗口内（默认 6-24 点）。"""
+    now = now or cst_now()
+    start, end = _active_window()
+    if (start, end) == (0, 24):
+        return True
+    return start <= now.hour < end
+
+
+def _next_window_open(now: Optional[datetime] = None) -> datetime:
+    """下一个开窗时刻（本地时间，aware）。已在窗口内则返回当前时间。"""
+    now = now or cst_now()
+    start, end = _active_window()
+    if (start, end) == (0, 24) or start <= now.hour < end:
+        return now
+    candidate = now.replace(hour=start, minute=0, second=0, microsecond=0)
+    if now.hour >= end:
+        candidate = candidate + timedelta(days=1)
+    return candidate
 
 # cron 名称映射
 _MONTH_NAMES = {
@@ -357,6 +391,26 @@ class TaskScheduler:
                 due = [r for r in rows
                        if r.next_run_at is not None
                        and to_cst(r.next_run_at) <= self.last_tick_at]
+
+                # 反风控：只允许在窗口内执行（默认 6-24 点）。
+                # 窗口外到点的任务推迟到下次开窗（并叠加随机分散，避免齐步走），
+                # 到点时刻本身不丢失，开窗后照常触发。
+                if not _in_active_window(self.last_tick_at) and due:
+                    spread = int(getattr(config, "SCHEDULER_WINDOW_SPREAD_SEC", 300) or 0)
+                    open_at = _next_window_open(self.last_tick_at)
+                    for r in due:
+                        r.next_run_at = (open_at + timedelta(
+                            seconds=random.randint(0, max(0, spread))
+                        )).astimezone(timezone.utc)
+                    await session.commit()
+                    self.last_error = None
+                    from tools import utils as _utils
+
+                    _utils.logger.info(
+                        f"[scheduler] 非执行窗口（{_active_window()[0]}-"
+                        f"{_active_window()[1]} 点），{len(due)} 个到点任务"
+                        f"已推迟到 {open_at:%H:%M} 之后")
+                    return
         except Exception as e:
             self.last_error = f"tick 查询失败: {e}"
             return
@@ -595,6 +649,13 @@ class TaskScheduler:
                                 f"[定时任务#{task_id}] {msg}", level)
                         except Exception:
                             pass
+
+                    # 反风控：任务真正发起前随机抖动 1-5s。
+                    # 多个任务同时到点时错开起跑，固定节奏是风控识别特征
+                    await anti_risk.jitter_sleep(
+                        lo=float(getattr(config, "SCHEDULER_JITTER_MIN_SEC", 1) or 1),
+                        hi=float(getattr(config, "SCHEDULER_JITTER_MAX_SEC", 5) or 5),
+                        reason=f"任务「{task_dict.get('name') or task_id}」触发抖动")
 
                     result = await execute_task(
                         task_dict,

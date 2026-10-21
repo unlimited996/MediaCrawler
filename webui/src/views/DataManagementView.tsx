@@ -115,14 +115,13 @@ function StoryCard({
             className="h-4 w-4 border-white/70 bg-black/40 data-[state=checked]:border-cyber-neon-cyan data-[state=checked]:bg-cyber-neon-cyan"
           />
         </div>
-        {/* 已备份标识（P4）：全部图片/视频已入 S3，帖子删除也不丢图 */}
+        {/* 已备份标识（P4）：全部图片/视频已入 S3，帖子删除也不丢图。纯图标，无文字 */}
         {it.backup_complete && (
           <div
-            className="absolute right-1.5 top-1.5 flex items-center gap-0.5 rounded-full bg-black/50 px-1.5 py-0.5 text-[10px] text-emerald-300 backdrop-blur-sm"
+            className="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-black/55 text-emerald-300 backdrop-blur-sm"
             title={`图片/视频已全部备份至 S3（${it.backup_uploaded}/${it.backup_total}）`}
           >
-            <CheckCircle2 className="h-3 w-3" />
-            <span className="hidden sm:inline">已备份</span>
+            <CheckCircle2 className="h-3.5 w-3.5" />
           </div>
         )}
       </div>

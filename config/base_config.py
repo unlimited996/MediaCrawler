@@ -45,6 +45,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(name: str, default: float) -> float:
+    """读浮点型环境变量（非法值回退默认）。"""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # Basic configuration
 PLATFORM = "xhs"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
 
@@ -195,6 +206,19 @@ SCHEDULER_TICK_SEC = _env_int("SCHEDULER_TICK_SEC", 15)
 SCHEDULER_BUSY_WAIT_SEC = _env_int("SCHEDULER_BUSY_WAIT_SEC", 300)
 # 单次执行的运行记录保留条数（按任务）
 SCHEDULER_RUN_HISTORY = _env_int("SCHEDULER_RUN_HISTORY", 100)
+
+# ---- 反风控（调度侧）----
+# 任务只允许在 [START, END) 点执行（本地时区）。默认 6-24 点：
+# 深夜不抓，避开平台风控值守时段，也省账号。
+SCHEDULER_ACTIVE_HOUR_START = _env_int("SCHEDULER_ACTIVE_HOUR_START", 6)
+SCHEDULER_ACTIVE_HOUR_END = _env_int("SCHEDULER_ACTIVE_HOUR_END", 24)
+# 任务真正发起前的随机抖动区间（秒）：每次错开 1-5s，
+# 避免多个任务整点齐步走打接口（固定节奏是风控特征）
+SCHEDULER_JITTER_MIN_SEC = _env_float("SCHEDULER_JITTER_MIN_SEC", 1)
+SCHEDULER_JITTER_MAX_SEC = _env_float("SCHEDULER_JITTER_MAX_SEC", 5)
+# 窗口外到点的任务推迟到窗口起点时，再叠加的随机分散上限（秒），
+# 防止开窗瞬间所有任务同时起跑
+SCHEDULER_WINDOW_SPREAD_SEC = _env_int("SCHEDULER_WINDOW_SPREAD_SEC", 300)
 
 # 是否禁用 SSL 证书验证。仅在使用企业代理、Burp Suite、mitmproxy 等会注入自签名证书的中间人代理时设为 True。
 # 警告：禁用 SSL 验证将使所有流量暴露于中间人攻击风险，请勿在生产环境中开启。

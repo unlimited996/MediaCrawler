@@ -5,6 +5,58 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-21] 小红书反检测配置 / 定时任务反风控 / PDF 留档导入
+
+### 新增
+- **小红书反检测配置**（`config/xhs_config.py`，全部可用环境变量覆盖）：
+  - `XHS_ENABLE_CDP_MODE=True`：默认走 CDP 连接本地真实浏览器，
+    复用登录态/扩展/历史，不带 Playwright 自动化标识
+    （标准模式回退路径也补了 `--exclude-switches=enable-automation`、
+    `--disable-blink-features=AutomationControlled`、`--disable-infobars`）；
+  - `XHS_CDP_HEADLESS=False`：默认关闭无头（有头窗口风控阈值最低）；
+  - `XHS_CDP_CONNECT_EXISTING=True`：连接已开远程调试的浏览器；
+  - `XHS_AUTO_CLOSE_BROWSER=False`：浏览器常开，登录态/指纹跨任务连续
+    （cleanup 不再关用户上下文与 CDP 连接，atexit 也不杀进程）；
+  - `XHS_MAX_CONCURRENCY_NUM=1`：并发恒 1，串行请求最像真人；
+  - `XHS_SLEEP_MIN_SEC=5 / XHS_SLEEP_MAX_SEC=15`：请求间隔 5-15s 随机
+    （client 的分页/翻页循环改为区间感知 `interval_sleep`，兼容固定值）。
+- **验证码人工介入**（`tools/anti_risk.py`）：命中验证码/安全限制时打印醒目指引，
+  轮询等待用户在真实浏览器里手动完成验证后自动继续（默认 300s 上限）；
+  首页、搜索翻页、作者主页、笔记详情四条路径都已接入，
+  人工验证成功后自动重试一次。无浏览器模式下降级为等待并跳过。
+- **定时任务反风控**（`api/services/task_scheduler.py` + 配置）：
+  - 执行窗口默认 **6-24 点**（`SCHEDULER_ACTIVE_HOUR_START/END`），
+    窗口外到点的任务推迟到下次开窗并叠加 0-300s 随机分散，避免齐步走；
+  - 任务真正发起前随机抖动 **1-5s**（`SCHEDULER_JITTER_MIN/MAX_SEC`），
+    多个任务同时到点时错开起跑。
+- **PDF 留档导入脚本**（`scripts/import_pdf_archive.py`）：把
+  `WorkBuddy\2026-10-14-11-20-16` 下小红书网页留档 PDF 的**原页面数据字段**
+  （标题/作者/发布时间/IP/互动数/正文/评论与楼中楼）与**内嵌配图**导入 pgsql：
+  走 store.xhs（v1 落库自动同步 v2 story/chapter/comment/media），
+  配图落盘 `data/xhs/media/{note_id}/001.jpg` 后直注册 media_attachment
+  并自动入 S3 备份队列；楼中楼经 `backfill_comment_links` 回填父子链接；
+  按 note_id 幂等去重（目录里多份拷贝自动跳过）。
+
+### 变更
+- `CDPBrowserManager` 新增 `connect_existing / auto_close` 参数与
+  `_keep_browser_open` 语义：连接已有浏览器时 `browser.close()` 会把用户
+  整个浏览器关掉，现在「常开」模式下只丢弃引用不断连接。
+- `config/base_config.py` 新增 `_env_float` 助手与调度器反风控配置组。
+- 「已备份」徽标改为**纯图标**（无文字，hover 显示 N/N 进度）。
+- 详情页「编辑记录」按钮在**内容未发生变化（edit_count=0）时禁用**，
+  hover 提示「内容未发生变化，暂无编辑记录」。
+
+### 验证
+- 小红书配置加载：CDP=True / HEADLESS=False / CONNECT_EXISTING=True /
+  AUTO_CLOSE=False / 并发=1 / 间隔 5-15 随机，全部生效；
+- 调度窗口：凌晨 3 点判定不在窗口、下次开窗=当日 06:00，23:30 在窗口内；
+- PDF 导入：单文件链路（正文+互动数+155 条评论+配图+楼中楼 86 条链接+
+  自动入 S3 备份 uploaded）全部验证通过；全量 10 篇（momo 9 篇 +
+  另 1 篇）导入中；
+- 前端 `tsc -b` 与 `npm run build` 通过。
+
+---
+
 ## [2026-10-21] S3 客户端配置持久化与图片自动备份
 
 ### 新增

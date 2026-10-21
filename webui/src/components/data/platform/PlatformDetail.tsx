@@ -433,8 +433,11 @@ export function PlatformStoryDetail({
         <button
           type="button"
           onClick={() => setEditsOpen(true)}
-          className="flex h-8 items-center gap-1.5 rounded border border-cyber-border-DEFAULT px-2 font-mono text-[11px] text-cyber-text-secondary transition-all hover:border-cyber-neon-cyan/40 hover:text-cyber-neon-cyan"
-          title={t('manage.editLogHint', { defaultValue: '查看这条内容被修改前后的差异' })}
+          disabled={(d?.edit_count ?? 0) === 0}
+          className="flex h-8 items-center gap-1.5 rounded border border-cyber-border-DEFAULT px-2 font-mono text-[11px] text-cyber-text-secondary transition-all hover:border-cyber-neon-cyan/40 hover:text-cyber-neon-cyan disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-cyber-border-DEFAULT disabled:hover:text-cyber-text-secondary"
+          title={(d?.edit_count ?? 0) > 0
+            ? t('manage.editLogHint', { defaultValue: '查看这条内容被修改前后的差异' })
+            : (t('manage.editLogEmpty', { defaultValue: '内容未发生变化，暂无编辑记录' }) as string)}
         >
           <History className="h-3.5 w-3.5" />
           {t('manage.editLog', { defaultValue: '编辑记录' })}
