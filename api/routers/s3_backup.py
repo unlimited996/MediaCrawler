@@ -17,6 +17,7 @@
     POST   /s3-backup/enqueue-missing    历史媒体入队
     GET    /s3-backup/items              备份记录（筛选/分页）
     POST   /s3-backup/items/{id}/retry   单条重试
+    DELETE /s3-backup/items/{id}          删除记录（连同 S3 对象）
     POST   /s3-backup/stories/{id}/backup   把该帖媒体全部入队并立即执行
     GET    /s3-backup/stories/{id}/status   该帖备份进度
 
@@ -440,6 +441,21 @@ async def purge_item(item_id: int):
     result = await purge_backup_item(item_id)
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error") or "清理失败")
+    return result
+
+
+@router.delete("/items/{item_id}")
+async def delete_item(item_id: int):
+    """删除单条备份记录：连同 S3 对象一起清除。
+
+    对象仍被其它记录引用时只删记录、保留对象；S3 删除失败不阻断
+    （记录仍被删除，对象成为桶内孤儿，可重新上传覆盖同键）。
+    """
+    from tools.media_backup import purge_backup_item
+
+    result = await purge_backup_item(item_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "删除失败")
     return result
 
 

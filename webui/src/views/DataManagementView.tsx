@@ -169,9 +169,15 @@ function StoryCard({
  */
 export function DataManagementView({
   platform: platformProp,
+  openStoryId,
+  onStoryOpened,
 }: {
   /** 当前平台（顶部导航的平台入口传入）；'' = 全部 */
   platform?: string
+  /** 跨视图跳转携带的待打开帖子 ID（如备份记录「跳转到原贴」） */
+  openStoryId?: number | null
+  /** 详情已打开后回调，用于清理跳转状态 */
+  onStoryOpened?: () => void
 } = {}) {
   const { t } = useTranslation('data')
   const queryClient = useQueryClient()
@@ -188,6 +194,15 @@ export function DataManagementView({
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [detailId, setDetailId] = useState<number | null>(null)
+
+  // 跨视图跳转（如 S3 备份记录「跳转到原贴」）：携带的 storyId 变化时
+  // 自动打开对应详情，并回调清理跳转状态
+  useEffect(() => {
+    if (openStoryId) {
+      setDetailId(openStoryId)
+      onStoryOpened?.()
+    }
+  }, [openStoryId])
   /** 列表 / 网格视图，选择持久化到 localStorage */
   const [viewMode, setViewMode] = useState<ViewMode>(loadViewMode)
   useEffect(() => {

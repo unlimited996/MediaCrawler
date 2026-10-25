@@ -8,15 +8,16 @@
  * - S3 配置的增删改查与启用状态管理（Secret 加密落库，前端只读掩码）
  * - 连通性测试（保存前试用 / 已保存配置直试）
  * - 备份任务面板：统计、立即执行、失败重试、历史媒体入队
- * - 备份记录明细：状态/平台筛选、单条重试、对象地址
+ * - 备份记录明细：状态/平台筛选、单条重试、删除记录（连同 S3 对象）、
+ *   一键跳转到原贴
  */
 
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
-  CloudUpload, DatabaseBackup, HardDriveDownload, Play, Plus, Power,
-  RefreshCw, RotateCcw, Trash2, Wifi, X, Zap,
+  CloudUpload, Crosshair, DatabaseBackup, HardDriveDownload, Play, Plus,
+  Power, RefreshCw, RotateCcw, Trash2, Wifi, X, Zap,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -157,15 +158,15 @@ export function S3BackupView() {
     onSuccess: () => { invalidateAll(); toast.success('已加入重试队列') },
   })
 
-  const purgeItemM = useMutation({
-    mutationFn: async (id: number) => (await api.post(`/s3-backup/items/${id}/purge`)).data,
+  const deleteItemM = useMutation({
+    mutationFn: async (id: number) => (await api.delete(`/s3-backup/items/${id}`)).data,
     onSuccess: (d: any) => {
       invalidateAll()
-      if (d?.object_deleted) toast.success('S3 对象与备份记录已删除')
+      if (d?.object_deleted) toast.success('备份记录与 S3 对象已删除')
       else if (d?.kept_for_refs) toast.success('对象仍被其它媒体引用，仅删除本条记录')
-      else toast.warning('S3 对象删除失败，记录已保留，可稍后重试')
+      else toast.success('备份记录已删除')
     },
-    onError: (e: any) => toast.error(`清理失败：${e?.response?.data?.detail || e?.message}`),
+    onError: (e: any) => toast.error(e?.response?.data?.detail || '删除失败'),
   })
 
   const purgeOrphanedM = useMutation({
@@ -365,29 +366,37 @@ export function S3BackupView() {
                     <td className="px-2 py-1.5 text-cyber-text-secondary">{fmtBytes(it.size_bytes || 0)}</td>
                     <td className="px-2 py-1.5 text-cyber-text-muted">{it.retry_count}/{it.max_retries}</td>
                     <td className="px-2 py-1.5">
-                      {(it.status === 'failed' || it.status === 'pending') && (
-                        <Button size="icon" variant="ghost" title="重试" className="h-6 w-6"
-                                onClick={() => retryItemM.mutate(it.id)}>
-                          <RotateCcw className="h-3 w-3 text-cyber-neon-cyan" />
-                        </Button>
-                      )}
-                      {(it.status === 'orphaned' || it.status === 'uploaded') && (
+                      <div className="flex items-center gap-0.5">
+                        {it.story_id ? (
+                          <Button size="icon" variant="ghost" title="跳转到原贴" className="h-6 w-6"
+                                  onClick={() => window.dispatchEvent(new CustomEvent(
+                                    'mc:open-story', {
+                                      detail: { storyId: it.story_id, platform: it.platform || '' },
+                                    }))}>
+                            <Crosshair className="h-3 w-3 text-cyber-neon-purple" />
+                          </Button>
+                        ) : null}
+                        {(it.status === 'failed' || it.status === 'pending') && (
+                          <Button size="icon" variant="ghost" title="重试" className="h-6 w-6"
+                                  onClick={() => retryItemM.mutate(it.id)}>
+                            <RotateCcw className="h-3 w-3 text-cyber-neon-cyan" />
+                          </Button>
+                        )}
                         <Button size="icon" variant="ghost"
                                 title={it.status === 'orphaned'
                                   ? '原帖已删：删除 S3 对象与备份记录'
-                                  : '手动删除 S3 对象与备份记录'}
+                                  : '删除备份记录（连同 S3 对象）'}
                                 className="h-6 w-6"
                                 onClick={() => {
-                                  if (confirm(`删除备份对象？\n${it.object_key}`)) {
-                                    purgeItemM.mutate(it.id)
-                                  }
+                                  if (!confirm(`删除备份记录？\n${it.object_key}\n\nS3 中的对应对象将一并删除，删除后无法通过备份地址恢复。`)) return
+                                  deleteItemM.mutate(it.id)
                                 }}>
                           <Trash2 className="h-3 w-3 text-rose-400" />
                         </Button>
-                      )}
-                      {it.last_error && (
-                        <span className="ml-1 text-rose-300" title={it.last_error}>!</span>
-                      )}
+                        {it.last_error && (
+                          <span className="ml-1 text-rose-300" title={it.last_error}>!</span>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}

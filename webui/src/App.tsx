@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Toaster } from 'sonner'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { MainContent } from '@/components/layout/MainContent'
@@ -19,6 +19,23 @@ function App() {
   const [view, setView] = useState<MainView>('crawl')
   /** 数据管理当前选中的平台（'' = 全部）；平台入口在顶部第二行 */
   const [dataPlatform, setDataPlatform] = useState('')
+  /** 跨视图跳转：备份记录等位置「定位到原贴」时携带的 storyId */
+  const [openStoryId, setOpenStoryId] = useState<number | null>(null)
+
+  // 监听全局「打开帖子详情」事件（S3 备份记录行 → 跳转到原贴）：
+  // 切到数据管理视图、对齐平台上下文，再由 DataManagementView 打开详情
+  useEffect(() => {
+    const onOpenStory = (e: Event) => {
+      const detail = (e as CustomEvent).detail as
+        { storyId?: number; platform?: string } | undefined
+      if (!detail?.storyId) return
+      setView('data')
+      setDataPlatform(detail.platform || '')
+      setOpenStoryId(detail.storyId)
+    }
+    window.addEventListener('mc:open-story', onOpenStory)
+    return () => window.removeEventListener('mc:open-story', onOpenStory)
+  }, [])
   // Initialize by checking localStorage if license has been accepted
   const [licenseAccepted, setLicenseAccepted] = useState(() => isLicenseAccepted())
   // Initialize by checking localStorage if env check has passed
@@ -78,7 +95,9 @@ function App() {
         ) : view === 'backup' ? (
           <S3BackupView />
         ) : (
-          <DataManagementView platform={dataPlatform} />
+          <DataManagementView platform={dataPlatform}
+                              openStoryId={openStoryId}
+                              onStoryOpened={() => setOpenStoryId(null)} />
         )}
       </div>
 

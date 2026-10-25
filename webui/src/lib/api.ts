@@ -468,6 +468,9 @@ export const s3BackupApi = {
       '/s3-backup/items', { params }),
   retryItem: (id: number) =>
     api.post<{ reset: number }>(`/s3-backup/items/${id}/retry`),
+  deleteItem: (id: number) =>
+    api.delete<{ success: boolean; object_deleted: boolean | null;
+                 kept_for_refs: boolean }>(`/s3-backup/items/${id}`),
   /** 手动清理单条备份：删 S3 对象 + 删记录（orphaned 兜底） */
   purgeItem: (id: number) =>
     api.post<{ success: boolean; object_deleted?: boolean | null;
