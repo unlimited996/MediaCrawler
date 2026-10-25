@@ -741,11 +741,12 @@ class S3Config(BaseV2, TimestampMixin):
 
 
 class MediaBackup(BaseV2, TimestampMixin):
-    """媒体备份记录：一张媒体一行，上传成功后帖子删了也能按 object_key 取回。
+    """媒体备份记录：一张媒体一行，随原帖删除而联动清除（S3 对象一并删）。
 
-    刻意不加外键：story / media_attachment 是硬删除的，FK 会把备份记录
-    一起 Cascade 掉，违背「帖子删除后图片仍可通过备份地址访问」的目标。
-    media_id / story_id 仅作冗余检索字段，允许悬空。
+    刻意不加外键：删帖时先删 S3 对象再删记录，删除失败的记录转 orphaned
+    （原帖已删、对象待清理）——这种「悬空」状态必须能存在，级联外键会把它
+    一起删掉，从而丢失待清理对象的线索。media_id / story_id 仅作检索字段。
+    status: pending / uploading / uploaded / failed / orphaned（待清理）
     """
 
     __tablename__ = "media_backup"

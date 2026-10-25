@@ -762,7 +762,8 @@ _V1_TABLES: Dict[str, Any] = {
 }
 
 CASCADE_KEYS = ("chapters", "comments", "media", "tags",
-                "files", "legacy_rows", "homefeed_rows")
+                "files", "legacy_rows", "homefeed_rows",
+                "s3_purged", "s3_orphaned")
 
 
 async def _hard_delete_story(session: AsyncSession, story_id: int,
@@ -774,8 +775,8 @@ async def _hard_delete_story(session: AsyncSession, story_id: int,
       v1   平台原始表（xhs_note 等）与其评论表 —— 不清会被回填/重拉复活
       v2   homefeed_content（首页流缓存）
       磁盘 附件本地文件，空的内容目录一并清掉
-      保留 media_backup（S3 备份记录）—— 帖子删除后图片仍可靠
-      object_key 从备份地址取回，这是备份机制的存在意义
+      S3   该帖的备份对象与 media_backup 记录（S3_BACKUP_PURGE_WITH_STORY，
+            默认开）—— 原贴没了备份一并删除；删除失败转 orphaned 待重试
 
     返回各类删除行数；story 不存在时返回 None。
     注意：已软删除（deleted_at 非空）的记录同样会被物理清掉。
@@ -811,11 +812,35 @@ async def _hard_delete_story(session: AsyncSession, story_id: int,
         select(MediaAttachment).where(or_(*conds))
     )).scalars().all()
 
+    # ---- 1.5 S3 备份联动清除（原贴删除 → 备份一并删除）----
+    # 在删 media 行之前做：备份记录的 media_id 还指着这些行。
+    # 不自行 commit——由调用方（单条/批量删除）统一提交，批量回滚时
+    # 备份记录与删除动作保持同一事务语义。
+    s3_purged = s3_orphaned = 0
+    if media:
+        try:
+            from tools.media_backup import purge_media_backups, purge_with_story
+
+            if purge_with_story():
+                purge_stat = await purge_media_backups(
+                    session, [m.id for m in media])
+                s3_purged = purge_stat.get("purged", 0)
+                s3_orphaned = purge_stat.get("orphaned", 0)
+                if s3_orphaned:
+                    from tools import utils as _utils
+
+                    _utils.logger.warning(
+                        f"[story.delete] story {story_id} 有 {s3_orphaned} 个 "
+                        f"S3 对象删除失败，转 orphaned 待重试")
+        except Exception as e:
+            # 备份清除失败绝不能阻断删帖主流程
+            from tools import utils as _utils
+
+            _utils.logger.warning(
+                f"[story.delete] S3 备份联动清除异常（不影响删帖）: {e}")
+
     # ---- 2. 磁盘上的媒体文件（只删项目 data 目录内的，防误删）----
-    # 注意：S3 备份记录（media_backup）刻意不清——帖子删除后图片仍可
-    # 通过备份地址访问；本地文件删除不影响已上传的对象。
     files_removed = 0
-    backups_kept = 0
     if purge_files:
         try:
             data_root = Path(DATA_DIR).resolve()
@@ -848,17 +873,13 @@ async def _hard_delete_story(session: AsyncSession, story_id: int,
                     continue
 
     # ---- 3. v2 子表（先删子表，避免外键报错）----
+    # 备份记录已在 1.5 步联动清除（成功即删记录，失败转 orphaned）
     media_count = 0
     if media:
         media_count = (await session.execute(
             sa_delete(MediaAttachment).where(
                 MediaAttachment.id.in_([m.id for m in media]))
         )).rowcount or 0
-        # 统计将保留的备份记录数（仅告知，不删除）
-        backups_kept = (await session.execute(
-            select(func.count()).select_from(MediaBackup).where(
-                MediaBackup.media_id.in_([m.id for m in media]))
-        )).scalar() or 0
     tags = (await session.execute(
         sa_delete(StoryTag).where(StoryTag.story_id == story_id))).rowcount or 0
     comments_n = (await session.execute(
@@ -907,7 +928,7 @@ async def _hard_delete_story(session: AsyncSession, story_id: int,
     return {"chapters": chapters_n, "comments": comments_n, "media": media_count,
             "tags": tags, "files": files_removed,
             "legacy_rows": legacy, "homefeed_rows": feed,
-            "backups_kept": backups_kept}
+            "s3_purged": s3_purged, "s3_orphaned": s3_orphaned}
 
 
 @router.post("/batch-delete")

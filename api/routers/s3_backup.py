@@ -428,6 +428,29 @@ async def retry_item(item_id: int):
     return {"reset": n}
 
 
+@router.post("/items/{item_id}/purge")
+async def purge_item(item_id: int):
+    """手动清理单条备份：删 S3 对象 + 删记录。
+
+    主要用于 orphaned（删帖时 S3 删除失败）的兜底；
+    对象仍被其它记录引用时只删记录、保留对象。
+    """
+    from tools.media_backup import purge_backup_item
+
+    result = await purge_backup_item(item_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "清理失败")
+    return result
+
+
+@router.post("/purge-orphaned")
+async def purge_orphaned():
+    """清理全部孤立备份（删帖时 S3 删除失败转来的那批）。"""
+    from tools.media_backup import retry_orphaned_purges
+
+    return await retry_orphaned_purges(limit=500)
+
+
 @router.post("/stories/{story_id}/backup")
 async def backup_story(story_id: int, run: bool = True):
     """把该帖全部媒体加入备份队列；run=true 时立即执行一批。"""

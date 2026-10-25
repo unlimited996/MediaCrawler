@@ -220,6 +220,12 @@ SCHEDULER_JITTER_MAX_SEC = _env_float("SCHEDULER_JITTER_MAX_SEC", 5)
 # 防止开窗瞬间所有任务同时起跑
 SCHEDULER_WINDOW_SPREAD_SEC = _env_int("SCHEDULER_WINDOW_SPREAD_SEC", 300)
 
+# ---- S3 媒体备份联动删除 ----
+# 原贴被硬删除时，是否把该帖的 S3 备份对象一并删除（默认开）。
+# 关掉后保留「帖子删了仍可靠 object_key 取回」的旧语义；
+# 删除失败的对象转 orphaned 状态，由后台循环自动重试 / 管理页手动清理。
+S3_BACKUP_PURGE_WITH_STORY = _env_bool("S3_BACKUP_PURGE_WITH_STORY", True)
+
 # 是否禁用 SSL 证书验证。仅在使用企业代理、Burp Suite、mitmproxy 等会注入自签名证书的中间人代理时设为 True。
 # 警告：禁用 SSL 验证将使所有流量暴露于中间人攻击风险，请勿在生产环境中开启。
 DISABLE_SSL_VERIFY = False

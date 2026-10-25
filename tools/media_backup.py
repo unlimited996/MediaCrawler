@@ -533,6 +533,190 @@ async def retry_failed(ids: Optional[List[int]] = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 联动清除：原贴硬删除 → S3 备份对象一并删除
+# ---------------------------------------------------------------------------
+
+def purge_with_story() -> bool:
+    """删帖时是否联动删 S3 备份（默认开，S3_BACKUP_PURGE_WITH_STORY 可关）。"""
+    import config
+
+    return bool(getattr(config, "S3_BACKUP_PURGE_WITH_STORY", True))
+
+
+async def purge_media_backups(session, media_ids: List[int],
+                              concurrency: int = 4) -> Dict[str, int]:
+    """删除指定媒体的 S3 备份对象与记录（删帖联动，不自行 commit）。
+
+    语义：
+    - pending / failed → 从未上传成功，无对象，直接删记录；
+    - uploaded / uploading / orphaned → 尝试删 S3 对象，成功才删记录；
+    - object_key 仍被本次范围之外的备份记录引用（跨帖同键）→ 保留对象，
+      只删自己的记录，避免误删别人还在用的备份；
+    - S3 删除失败 → 记录转 orphaned（原帖已删、对象待清理），不阻断删帖，
+      由后台循环重试或管理页手动清理。
+
+    返回 {"purged": 已删对象+记录, "orphaned": 待清理, "kept_ref": 保留对象,
+          "skipped": 无配置/无记录}
+    """
+    stats = {"purged": 0, "orphaned": 0, "kept_ref": 0, "skipped": 0}
+    if not media_ids:
+        return stats
+
+    from sqlalchemy import func as sa_func
+
+    from tools.s3_client import delete_object
+
+    rows = (await session.execute(
+        select(MediaBackup).where(MediaBackup.media_id.in_(media_ids))
+    )).scalars().all()
+    if not rows:
+        return stats
+
+    row_ids = [r.id for r in rows]
+    # 交叉引用保护：这些 object_key 有没有被未删除的备份记录指着
+    ref_counts = (await session.execute(
+        select(MediaBackup.object_key, sa_func.count(MediaBackup.id))
+        .where(MediaBackup.object_key.in_([r.object_key for r in rows]),
+               MediaBackup.id.not_in(row_ids))
+        .group_by(MediaBackup.object_key)
+    )).all()
+    ref_keys = {k for k, n in ref_counts if (n or 0) > 0}
+
+    cfg = await active_settings(session)
+
+    # S3 删除是网络调用，并发执行；session 的写操作全部串行在 gather 之后，
+    # 避免 AsyncSession 被并发使用
+    sem = asyncio.Semaphore(max(1, concurrency))
+    need_s3 = [r for r in rows
+               if r.status in ("uploaded", "uploading", "orphaned")
+               and r.object_key not in ref_keys]
+
+    async def _try(r: MediaBackup):
+        async with sem:
+            try:
+                await delete_object(cfg["settings"], r.object_key)
+                return r, True, ""
+            except Exception as e:
+                return r, False, f"{type(e).__name__}: {str(e)[:200]}"
+
+    s3_results: Dict[int, tuple] = {}
+    if need_s3 and cfg is not None and cfg["settings"].secret_access_key:
+        for res in await asyncio.gather(*[_try(r) for r in need_s3],
+                                        return_exceptions=True):
+            if isinstance(res, Exception):
+                continue
+            r, ok, err = res
+            s3_results[r.id] = (ok, err)
+    elif need_s3:
+        # 没有可用配置：对象动不了，全部转 orphaned 留线索
+        for r in need_s3:
+            s3_results[r.id] = (False, "无可用 S3 配置，对象待手动清理")
+
+    for r in rows:
+        if r.object_key in ref_keys:
+            # 对象仍被其它媒体引用：保留对象，只删自己的记录
+            await session.delete(r)
+            stats["kept_ref"] += 1
+        elif r.status in ("uploaded", "uploading", "orphaned"):
+            ok, err = s3_results.get(r.id, (False, "未执行"))
+            if ok:
+                await session.delete(r)
+                stats["purged"] += 1
+            else:
+                r.status = "orphaned"
+                r.last_error = err[:500]
+                r.next_retry_at = None
+                stats["orphaned"] += 1
+        else:
+            # pending / failed：没有对象，直接删记录
+            await session.delete(r)
+            stats["purged"] += 1
+    return stats
+
+
+async def retry_orphaned_purges(limit: int = 20) -> Dict[str, int]:
+    """重试孤立备份的 S3 删除（删帖时删失败的那批）。
+
+    后台循环每次 tick 调用；成功即删记录。自管 session。
+    """
+    from config.db_config import resolve_config_db_type
+    from database.db_session import get_async_engine
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    engine = get_async_engine(resolve_config_db_type())
+    if engine is None:
+        return {"picked": 0, "purged": 0, "still": 0}
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            cfg = await active_settings(session)
+            if cfg is None or not cfg["settings"].secret_access_key:
+                return {"picked": 0, "purged": 0, "still": 0, "skipped": "no_config"}
+            rows = (await session.execute(
+                select(MediaBackup).where(MediaBackup.status == "orphaned")
+                .order_by(MediaBackup.id.asc()).limit(limit)
+            )).scalars().all()
+            if not rows:
+                return {"picked": 0, "purged": 0, "still": 0}
+            stat = await purge_media_backups(
+                session, [r.media_id for r in rows])
+            await session.commit()
+            return {"picked": len(rows), "purged": stat["purged"],
+                    "still": stat["orphaned"]}
+    except Exception as e:
+        return {"picked": 0, "purged": 0, "still": 0, "error": str(e)[:200]}
+    finally:
+        await engine.dispose()
+
+
+async def purge_backup_item(item_id: int) -> Dict[str, Any]:
+    """手动清理单条备份记录（管理页用）：删 S3 对象 + 删记录。
+
+    对 orphaned / uploaded 都适用（上传错的也能手动撤）。
+    """
+    from config.db_config import resolve_config_db_type
+    from database.db_session import get_async_engine
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from tools.s3_client import delete_object
+
+    engine = get_async_engine(resolve_config_db_type())
+    if engine is None:
+        return {"success": False, "error": "配置库不可用"}
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            row = (await session.execute(
+                select(MediaBackup).where(MediaBackup.id == item_id)
+            )).scalar_one_or_none()
+            if row is None:
+                return {"success": False, "error": "记录不存在"}
+            object_key = row.object_key
+            # 对象仍被其它记录引用时不删对象
+            from sqlalchemy import func as sa_func
+
+            refs = (await session.execute(
+                select(sa_func.count(MediaBackup.id)).where(
+                    MediaBackup.object_key == object_key,
+                    MediaBackup.id != item_id)
+            )).scalar() or 0
+            cfg = await active_settings(session)
+            s3_ok = None
+            if refs == 0 and cfg is not None and cfg["settings"].secret_access_key:
+                try:
+                    await delete_object(cfg["settings"], object_key)
+                    s3_ok = True
+                except Exception as e:
+                    s3_ok = False
+                    err = f"{type(e).__name__}: {str(e)[:200]}"
+            await session.delete(row)
+            await session.commit()
+            return {"success": True, "object_deleted": s3_ok,
+                    "kept_for_refs": refs > 0,
+                    "error": None if s3_ok is not False else err}
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
 # 查询
 # ---------------------------------------------------------------------------
 
@@ -569,6 +753,8 @@ async def backup_stats() -> Dict[str, Any]:
                 "uploading": by_status.get("uploading", {}).get("count", 0),
                 "uploaded": by_status.get("uploaded", {}).get("count", 0),
                 "failed": by_status.get("failed", {}).get("count", 0),
+                # orphaned：原帖已删但 S3 对象删除失败，待重试/手动清理
+                "orphaned": by_status.get("orphaned", {}).get("count", 0),
                 "uploaded_bytes": by_status.get("uploaded", {}).get("bytes", 0),
                 "last_error": (last_err[0] if last_err else None),
                 "last_error_at": (last_err[1].isoformat() if last_err and last_err[1] else None),

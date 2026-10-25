@@ -130,8 +130,9 @@ async def _install_loop_exception_handler():
     # S3 媒体备份（P4）：确保表存在 + 种子配置，然后起定时备份循环。
     # 循环每 60s 扫一批到期任务（pending/重试到期），锁互斥不影响 API 主流程。
     try:
-        from tools.media_backup import (ensure_seed_config,
-                                         enqueue_missing, run_backup_batch)
+        from tools.media_backup import (ensure_seed_config, enqueue_missing,
+                                         retry_orphaned_purges,
+                                         run_backup_batch)
 
         async def _s3_backup_boot():
             try:
@@ -158,6 +159,8 @@ async def _install_loop_exception_handler():
                 try:
                     await enqueue_missing(limit=200)
                     await run_backup_batch()
+                    # 删帖时 S3 删除失败的孤儿对象：跟着重试清理
+                    await retry_orphaned_purges(limit=50)
                 except Exception as e:
                     print(f"[s3-backup] 备份循环异常（继续运行）：{e}")
                 await asyncio.sleep(60)

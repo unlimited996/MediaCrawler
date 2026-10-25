@@ -296,10 +296,14 @@ export function DataManagementView({
         c.media ? `${c.media} 附件` : '',
         c.files ? `${c.files} 个媒体文件` : '',
         c.legacy_rows ? `${c.legacy_rows} 行原始记录` : '',
+        c.s3_purged ? `${c.s3_purged} 个 S3 备份` : '',
       ].filter(Boolean)
       toast.success(
         `${t('manage.deleteOk', { count: n })}${parts.length ? `（${parts.join(' / ')}）` : ''}`
       )
+      if (c.s3_orphaned) {
+        toast.warning(`${c.s3_orphaned} 个 S3 对象删除失败，已转「待清理」，可在图片备份页重试`)
+      }
       const failed = res.data.failed ?? []
       if (failed.length) {
         toast.error(`${failed.length} 条删除失败：${failed[0]?.error ?? ''}`)

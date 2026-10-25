@@ -410,7 +410,7 @@ export interface S3BackupItem {
   source_url: string | null
   mime_type: string | null
   size_bytes: number | null
-  status: 'pending' | 'uploading' | 'uploaded' | 'failed'
+  status: 'pending' | 'uploading' | 'uploaded' | 'failed' | 'orphaned'
   retry_count: number
   max_retries: number
   next_retry_at: string | null
@@ -427,6 +427,8 @@ export interface S3BackupStats {
   uploading: number
   uploaded: number
   failed: number
+  /** 孤立备份：原帖已删但 S3 对象删除失败，待重试/手动清理 */
+  orphaned: number
   uploaded_bytes: number
   last_error: string | null
   last_error_at: string | null
@@ -466,6 +468,15 @@ export const s3BackupApi = {
       '/s3-backup/items', { params }),
   retryItem: (id: number) =>
     api.post<{ reset: number }>(`/s3-backup/items/${id}/retry`),
+  /** 手动清理单条备份：删 S3 对象 + 删记录（orphaned 兜底） */
+  purgeItem: (id: number) =>
+    api.post<{ success: boolean; object_deleted?: boolean | null;
+                kept_for_refs?: boolean; error?: string | null }>(
+      `/s3-backup/items/${id}/purge`),
+  /** 清理全部孤立备份 */
+  purgeOrphaned: () =>
+    api.post<{ picked: number; purged: number; still: number }>(
+      '/s3-backup/purge-orphaned'),
   backupStory: (storyId: number, run = true) =>
     api.post<{ queued: number; media_total: number }>(
       `/s3-backup/stories/${storyId}/backup`, {}, { params: { run } }),

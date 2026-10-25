@@ -38,6 +38,7 @@ const STATUS_LABEL: Record<string, { label: string; cls: string }> = {
   uploading: { label: '上传中', cls: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40' },
   uploaded: { label: '已备份', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' },
   failed: { label: '失败', cls: 'bg-rose-500/15 text-rose-300 border-rose-500/40' },
+  orphaned: { label: '待清理', cls: 'bg-orange-500/15 text-orange-300 border-orange-500/40' },
 }
 
 function fmtBytes(n: number): string {
@@ -156,6 +157,25 @@ export function S3BackupView() {
     onSuccess: () => { invalidateAll(); toast.success('已加入重试队列') },
   })
 
+  const purgeItemM = useMutation({
+    mutationFn: async (id: number) => (await api.post(`/s3-backup/items/${id}/purge`)).data,
+    onSuccess: (d: any) => {
+      invalidateAll()
+      if (d?.object_deleted) toast.success('S3 对象与备份记录已删除')
+      else if (d?.kept_for_refs) toast.success('对象仍被其它媒体引用，仅删除本条记录')
+      else toast.warning('S3 对象删除失败，记录已保留，可稍后重试')
+    },
+    onError: (e: any) => toast.error(`清理失败：${e?.response?.data?.detail || e?.message}`),
+  })
+
+  const purgeOrphanedM = useMutation({
+    mutationFn: async () => (await api.post('/s3-backup/purge-orphaned')).data,
+    onSuccess: (d: any) => {
+      invalidateAll()
+      toast.success(`清理完成：删除 ${d?.purged ?? 0} 个，仍待清理 ${d?.still ?? 0} 个`)
+    },
+  })
+
   const stats = statsQ.data
   const items = itemsQ.data?.items || []
   const total = itemsQ.data?.total || 0
@@ -184,6 +204,13 @@ export function S3BackupView() {
                 onClick={() => retryM.mutate()} disabled={retryM.isPending}>
           <RotateCcw className="mr-1 h-3.5 w-3.5" />重试失败项
         </Button>
+        <Button size="sm" variant="outline" className="font-mono text-xs"
+                onClick={() => purgeOrphanedM.mutate()}
+                disabled={purgeOrphanedM.isPending || !stats?.orphaned}
+                title="删帖时 S3 删除失败转来的孤立备份：重试删除对象与记录">
+          <Trash2 className="mr-1 h-3.5 w-3.5" />清理孤立备份
+          {stats?.orphaned ? ` (${stats.orphaned})` : ''}
+        </Button>
         <Button size="sm" className="font-mono text-xs" onClick={() => runM.mutate()}
                 disabled={runM.isPending}>
           <Play className="mr-1 h-3.5 w-3.5" />立即备份
@@ -198,11 +225,13 @@ export function S3BackupView() {
         {/* 左列：统计 + 配置 */}
         <div className="flex min-h-0 flex-col gap-4 overflow-hidden lg:col-span-2">
           {/* 统计卡片 */}
-          <div className="grid flex-shrink-0 grid-cols-2 gap-2">
+          <div className="grid flex-shrink-0 grid-cols-3 gap-2">
             <StatCard label="待备份" value={stats?.pending ?? 0} tone="amber" />
             <StatCard label="已备份" value={stats?.uploaded ?? 0} tone="emerald" />
             <StatCard label="失败（待手动重试）" value={stats?.failed ?? 0} tone="rose" />
+            <StatCard label="待清理（原帖已删）" value={stats?.orphaned ?? 0} tone="orange" />
             <StatCard label="已备份体积" value={fmtBytes(stats?.uploaded_bytes ?? 0)} tone="cyan" />
+            <StatCard label="当前配置" value={stats?.config_name || '未配置'} tone="purple" />
           </div>
 
           {stats?.last_error && (
@@ -293,6 +322,7 @@ export function S3BackupView() {
               <option value="uploading">上传中</option>
               <option value="uploaded">已备份</option>
               <option value="failed">失败</option>
+              <option value="orphaned">待清理（原帖已删）</option>
             </select>
             <Input value={platform} placeholder="平台筛选，如 xhs"
                    onChange={(e) => { setPlatform(e.target.value); setPage(1) }}
@@ -333,6 +363,20 @@ export function S3BackupView() {
                         <Button size="icon" variant="ghost" title="重试" className="h-6 w-6"
                                 onClick={() => retryItemM.mutate(it.id)}>
                           <RotateCcw className="h-3 w-3 text-cyber-neon-cyan" />
+                        </Button>
+                      )}
+                      {(it.status === 'orphaned' || it.status === 'uploaded') && (
+                        <Button size="icon" variant="ghost"
+                                title={it.status === 'orphaned'
+                                  ? '原帖已删：删除 S3 对象与备份记录'
+                                  : '手动删除 S3 对象与备份记录'}
+                                className="h-6 w-6"
+                                onClick={() => {
+                                  if (confirm(`删除备份对象？\n${it.object_key}`)) {
+                                    purgeItemM.mutate(it.id)
+                                  }
+                                }}>
+                          <Trash2 className="h-3 w-3 text-rose-400" />
                         </Button>
                       )}
                       {it.last_error && (
@@ -455,7 +499,8 @@ export function S3BackupView() {
 function StatCard({ label, value, tone }: { label: string; value: number | string; tone: string }) {
   const toneMap: Record<string, string> = {
     amber: 'text-amber-300', emerald: 'text-emerald-300',
-    rose: 'text-rose-300', cyan: 'text-cyan-300',
+    rose: 'text-rose-300', cyan: 'text-cyan-300', orange: 'text-orange-300',
+    purple: 'text-purple-300',
   }
   return (
     <div className="glass-panel rounded-lg px-3 py-2">
