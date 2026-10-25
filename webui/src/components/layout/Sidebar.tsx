@@ -1,4 +1,4 @@
-import { Bug, Wifi, Flame, Database, FolderOpen, CalendarClock, Tags, DatabaseBackup } from 'lucide-react'
+import { Bug, Wifi, Flame, Database, FolderOpen, CalendarClock, Tags, DatabaseBackup, Eye } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Badge } from '@/components/ui/badge'
 import { useCrawlerStore } from '@/store/crawlerStore'
@@ -8,7 +8,7 @@ import { PlatformBrandMark } from '@/components/data/platform/PlatformBrand'
 import { LanguageSwitch } from './LanguageSwitch'
 import { ThemeToggle } from './ThemeToggle'
 
-export type MainView = 'crawl' | 'discover' | 'data' | 'browser' | 'tasks' | 'stance' | 'backup'
+export type MainView = 'crawl' | 'discover' | 'data' | 'browser' | 'tasks' | 'stance' | 'backup' | 'guest'
 
 interface SidebarProps {
   view: MainView
@@ -106,6 +106,18 @@ export function Sidebar({ view, onViewChange, dataPlatform }: SidebarProps) {
             >
               <DatabaseBackup className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">{t('nav.backup', { defaultValue: '图片备份' })}</span>
+            </button>
+            {/* 访客视图：只读筛选 + 导出，可整页分享（URL 即 #/guest） */}
+            <button
+              onClick={() => onViewChange('guest')}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono transition-all ${
+                view === 'guest'
+                  ? 'bg-cyber-neon-cyan text-black font-bold'
+                  : 'text-cyber-text-secondary hover:text-cyber-text-primary border border-cyber-border-subtle hover:border-cyber-neon-cyan/50'
+              }`}
+            >
+              <Eye className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">{t('nav.guest', { defaultValue: '访客浏览' })}</span>
             </button>
           </div>
 

@@ -48,9 +48,12 @@ const EMPTY_STANCE_STATS: StanceStats = {
 export function PlatformStoryDetail({
   storyId,
   onBack,
+  readonly,
 }: {
   storyId: number
   onBack: () => void
+  /** 只读模式（访客页）：隐藏关注/编辑记录/备份/重新拉取/删除等管理操作 */
+  readonly?: boolean
 }) {
   const { t } = useTranslation('data')
   const qc = useQueryClient()
@@ -385,6 +388,8 @@ export function PlatformStoryDetail({
         </Button>
 
         {/* 关注：【关注此贴】每天定时更新这条内容；【关注此人】每天定时更新该作者 */}
+        {!readonly && (
+          <>
         <button
           type="button"
           onClick={() => toggleWatch('note')}
@@ -429,7 +434,10 @@ export function PlatformStoryDetail({
           )}
           {t('manage.watchAuthor', { defaultValue: '关注此人' })}
         </button>
+          </>
+        )}
 
+        {!readonly && (
         <button
           type="button"
           onClick={() => setEditsOpen(true)}
@@ -447,9 +455,10 @@ export function PlatformStoryDetail({
             </span>
           )}
         </button>
+        )}
 
         {/* S3 备份（P4）：全量备份后显示绿色已备份标识；否则可一键入队备份 */}
-        {(d?.backup_total ?? 0) > 0 && (
+        {(d?.backup_total ?? 0) > 0 && !readonly && (
           <button
             type="button"
             onClick={() => backupM.mutate()}
@@ -475,6 +484,23 @@ export function PlatformStoryDetail({
           </button>
         )}
 
+        {/* 只读模式（访客）：备份状态仅作展示，不可点击 */}
+        {(d?.backup_total ?? 0) > 0 && readonly && (
+          <span
+            className={`flex h-8 items-center gap-1.5 rounded border px-2 font-mono text-[11px] ${
+              d?.backup_complete
+                ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
+                : 'border-cyber-border-DEFAULT text-cyber-text-muted'
+            }`}
+            title="图片/视频已备份至 S3，原帖删除后仍可访问"
+          >
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            {d?.backup_complete ? '已备份' : `${d?.backup_uploaded}/${d?.backup_total}`}
+          </span>
+        )}
+
+        {!readonly && (
+          <>
         <Button
           variant="ghost"
           size="sm"
@@ -503,6 +529,8 @@ export function PlatformStoryDetail({
             <Trash2 className="h-3.5 w-3.5" />
           )}
         </Button>
+          </>
+        )}
         <span
           className="rounded-full px-2.5 py-0.5 text-[11px] font-medium"
           style={{ color: theme.accent, background: theme.accentSoft }}
@@ -531,6 +559,40 @@ export function PlatformStoryDetail({
           <div className="py-10 text-center font-mono text-cyber-text-muted animate-pulse">
             {t('manage.loading')}
           </div>
+        ) : readonly ? (
+          // 只读模式（访客）：不提供改判入口，立场徽标自动变为不可点
+          <RepliesContext.Provider value={{ showReplies, storyId }}>
+            {renderLayout()}
+
+            {/* 滚动到底自动加载下一页评论；没有更多时给出总数提示 */}
+            <div className="mx-auto max-w-2xl px-1 py-4">
+              <div ref={sentinelRef} />
+              {commentsQ.isFetchingNextPage && (
+                <div className="flex items-center justify-center gap-2 py-2 font-mono text-[11px] text-cyber-text-muted">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  {t('manage.loadingMore', { defaultValue: '加载更多评论...' })}
+                </div>
+              )}
+              {!hasNextPage && comments.length > 0 && (
+                <div className="py-2 text-center font-mono text-[11px] text-cyber-text-muted">
+                  {t('manage.allCommentsLoaded', {
+                    count: comments.length,
+                    total: serverTotal,
+                    defaultValue: `已加载全部 ${serverTotal} 条主评论`,
+                  })}
+                </div>
+              )}
+              {commentsQ.isError && (
+                <button
+                  type="button"
+                  onClick={() => commentsQ.refetch()}
+                  className="mx-auto block font-mono text-[11px] text-cyber-neon-pink hover:underline"
+                >
+                  {t('manage.loadCommentsFail', { defaultValue: '评论加载失败，点击重试' })}
+                </button>
+              )}
+            </div>
+          </RepliesContext.Provider>
         ) : (
           <RepliesContext.Provider value={{ showReplies, storyId }}>
             <StanceEditContext.Provider value={{ open: setStanceEditTarget }}>
