@@ -235,10 +235,16 @@ export function S3BackupView() {
           </div>
 
           {stats?.last_error && (
-            <div className="flex-shrink-0 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] text-rose-300">
+            <button
+              type="button"
+              onClick={() => { setStatus('failed'); setPage(1) }}
+              title="点击查看未解决的失败记录（连接恢复后此横幅自动隐藏）"
+              className="flex-shrink-0 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-left text-[11px] text-rose-300 transition-colors hover:border-rose-500/60 hover:bg-rose-500/15"
+            >
               最近错误：{stats.last_error}
               {stats.last_error_at ? `（${stats.last_error_at.replace('T', ' ').slice(0, 19)}）` : ''}
-            </div>
+              <span className="ml-1 text-rose-300/70">· 点击查看失败记录</span>
+            </button>
           )}
 
           {/* 配置列表 */}

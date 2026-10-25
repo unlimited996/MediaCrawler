@@ -739,11 +739,25 @@ async def backup_stats() -> Dict[str, Any]:
             )).all()
             by_status = {r[0]: {"count": int(r[1]), "bytes": int(r[2] or 0)}
                          for r in rows}
+            # 最近错误：仅当该错误之后没有任何成功上传时才展示。
+            # 连接/远端恢复后（后续备份持续成功），历史失败自动隐藏，
+            # 不再长期占据「最近错误」横幅；未解决的失败仍可在记录表
+            # 按状态筛选查看，统计卡也有对应计数。
             last_err = (await session.execute(
                 select(MediaBackup.last_error, MediaBackup.updated_at)
-                .where(MediaBackup.last_error.isnot(None))
+                .where(MediaBackup.last_error.isnot(None),
+                       MediaBackup.status.in_(("pending", "uploading",
+                                               "failed", "orphaned")))
                 .order_by(MediaBackup.updated_at.desc()).limit(1)
             )).first()
+            last_ok_at = (await session.execute(
+                select(sa_func.max(MediaBackup.uploaded_at))
+            )).scalar()
+            err_stale = bool(last_ok_at and last_err
+                             and last_err[1] is not None
+                             and last_err[1] <= last_ok_at)
+            if err_stale:
+                last_err = None
             cfg = await active_settings(session)
             return {
                 "configured": cfg is not None,
