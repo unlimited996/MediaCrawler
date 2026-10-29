@@ -48,8 +48,10 @@ from var import crawler_type_var, source_keyword_var
 from . import media as xhs_media
 from .client import XiaoHongShuClient
 from .exception import (
+    CaptchaError,
     DataFetchError,
     IPBlockError,
+    NoteHiddenError,
     NoteNotFoundError,
     PlatformAccessError,
 )
@@ -73,11 +75,40 @@ def _xhs_captcha_wait_sec() -> int:
     return int(getattr(config, "XHS_CAPTCHA_WAIT_SEC", 300) or 300)
 
 
+def _comment_max_count(declared: int) -> int:
+    """单篇笔记抓多少条一级评论（0 = 不限制，翻到 has_more=False）。
+
+    目标是把评论抓到「原帖显示评论量」的 90% 以上（见
+    tools/v2_sync.COMMENT_COMPLETENESS_TARGET / get_archived_content_ids），
+    所以默认按声明数抓，而不是固定 30 条 —— 固定值会让热门帖永远不达标
+    或者反过来（抓够了仍被跳过）。
+      - declared > 0：declared + 余量（平台显示数常含已删/折叠评论）
+      - declared == 0（详情没拿到统计）：不限制，交给 has_more
+      - XHS_COMMENT_MAX_PER_NOTE > 0：再压一道硬顶，控制单篇耗时
+    """
+    margin = int(getattr(config, "XHS_COMMENT_COUNT_MARGIN", 30) or 0)
+    hard_cap = int(getattr(config, "XHS_COMMENT_MAX_PER_NOTE", 0) or 0)
+    limit = (declared + margin) if declared > 0 else 0
+    if hard_cap > 0:
+        limit = min(limit, hard_cap) if limit > 0 else hard_cap
+    return limit
+
+
 class XiaoHongShuCrawler(AbstractCrawler):
-    context_page: Page
-    xhs_client: XiaoHongShuClient
-    browser_context: BrowserContext
-    cdp_manager: Optional[CDPBrowserManager]
+    # 这些是运行期注入的句柄。类级默认 None + __init__/launch 赋值：
+    # 单测常用 `XiaoHongShuCrawler.__new__()` 绕开 __init__ 造对象，
+    # 没有类默认值就会 AttributeError（曾把 access_error 用例打挂）。
+    context_page: Optional[Page] = None
+    xhs_client: Optional[XiaoHongShuClient] = None
+    browser_context: Optional[BrowserContext] = None
+    cdp_manager: Optional[CDPBrowserManager] = None
+
+    # 风控熔断状态。类级默认值 + __init__ 里重置：
+    # 单测常用 `XiaoHongShuCrawler.__new__()` 绕开 __init__ 造对象，
+    # 没有类默认值就会 AttributeError（曾把 4 个 access_error 用例打挂）。
+    _risk_abort_reason: str = ""
+    _comment_fail_streak: int = 0
+    _comment_done_count: int = 0
 
     def __init__(self) -> None:
         self.index_url = "https://www.rednote.com" if config.XHS_INTERNATIONAL else "https://www.xiaohongshu.com"
@@ -88,6 +119,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
         self._media_downloader: Optional[MediaDownloader] = None
         self.task_id: Optional[int] = None  # 断点续爬任务 ID（未开启时为 None）
+        # 风控熔断：评论接口连续失败到上限就整批停手
+        self._risk_abort_reason: str = ""
+        self._comment_fail_streak: int = 0
+        self._comment_done_count: int = 0
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -354,6 +389,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
         elif config.CRAWLER_TYPE == "creator":
             # Get creator's information and their notes and comments
             await self.get_creators_and_notes()
+        elif config.CRAWLER_TYPE == "account":
+            # Get the logged-in user's liked & collected image posts
+            await self.get_account_behavior_notes()
         else:
             pass
 
@@ -605,6 +643,402 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 await self.download_media(note_detail)
         await self.batch_get_note_comments(need_get_comment_note_ids, xsec_tokens)
 
+    # ------------------------------------------------------------------
+    # account 维度：登录用户的点赞 / 收藏图文帖
+    #
+    # 与 profile（作者主页）/ note（单帖）并列的第三个抓取维度，供定时任务
+    # 「扫码登录用户」使用：把该账号点赞过、收藏过的图文帖陆续拉进来。
+    # - 只保留图文帖，视频帖（note.type == "video"）直接跳过；
+    # - 详情/评论/媒体/S3 备份全部复用既有管线，不另起炉灶；
+    # - 入库走 v2 upsert，已存在的帖子自动增量刷新（评论重抓）。
+    # ------------------------------------------------------------------
+
+    async def _resolve_account_cookie(self) -> str:
+        """account 模式解析登录态：优先账号池指定 ID，否则健康度最高。
+
+        返回解密后的 cookie 串；账号池不可用 / 无可用账号返回空串。
+        """
+        account_id = (getattr(config, "XHS_ACCOUNT_ID", "") or "").strip()
+        try:
+            from account import AccountPool
+
+            pool = AccountPool()
+            if account_id:
+                account = await pool.get_account(int(account_id))
+                if account and account.get("cookie"):
+                    utils.logger.info(
+                        f"[XiaoHongShuCrawler] account 模式使用账号池账号 "
+                        f"#{account_id}（{account.get('account_name')}）")
+                    return account["cookie"]
+                utils.logger.warning(
+                    f"[XiaoHongShuCrawler] 账号池无可用账号 #{account_id}，"
+                    f"回退为健康度最高的账号")
+            picked = await pool.pick("xhs")
+            if picked and picked.get("cookie"):
+                return picked["cookie"]
+        except Exception as e:
+            utils.logger.warning(f"[XiaoHongShuCrawler] 账号池解析失败: {e}")
+        return ""
+
+    # -------------------- 页面内抓取「赞过 / 收藏」 --------------------
+    # 实测结论（2026-10-28）：接口直连 /note/like/page 虽然签名通过、
+    # selfinfo 里 liked=12，却稳定返回 {"notes": [], "has_more": false}。
+    # 平台按「请求是否来自网页会话」放行，直连永远拿不到列表。
+    # 唯一可行路径：打开本人主页的「赞过 / 收藏」标签页，截获页面自己发的请求。
+    # --------------------
+
+    _BEHAVIOR_TAB = {"likes": ("赞过", "like"), "collects": ("收藏", "collect")}
+    _BEHAVIOR_API = {"likes": "note/like/page", "collects": "note/collect/page"}
+
+    # 评论抓取连续失败多少次就熔断整批（不再对剩下的帖子继续发请求）。
+    # 2026-10-28：100 篇点赞帖全撞 HTTP 461 验证码，每篇还重试 3 次，
+    # 一轮下来 300 次无效请求，账号越打越死。
+    RISK_FAIL_LIMIT = 3
+    # 熔断标记：调度器扫到它就该把任务标成失败而不是 success，
+    # 否则用户只看得到「帖子进来了、评论是空的」。
+    RISK_ABORT_MARKER = "[MEDIACRAWLER_RISK_ABORT]"
+
+    @staticmethod
+    def _normalize_behavior_note(raw: Dict) -> Optional[Dict]:
+        """把点赞/收藏列表里的卡片统一成 {note_id, type, xsec_token, cover}。
+
+        页面接口的卡片有两种形态：扁平（note_id/type 直接在顶层）和
+        包一层 note_card（note_id 在顶层、其余字段在 card 里），都要兼容。
+        """
+        if not isinstance(raw, dict):
+            return None
+        card = raw.get("note_card") or raw.get("noteCard") or {}
+        note_id = str(raw.get("note_id") or raw.get("id") or card.get("note_id") or "")
+        if not note_id:
+            return None
+        cover = card.get("cover") or raw.get("cover") or {}
+        return {
+            "note_id": note_id,
+            "type": (raw.get("type") or card.get("type") or ""),
+            "xsec_token": (raw.get("xsec_token") or card.get("xsec_token") or ""),
+            "display_title": (card.get("display_title") or raw.get("display_title") or ""),
+            "cover": cover,
+        }
+
+    async def _collect_behavior_notes_via_page(
+        self, user_id: str, behaviors: List[str], max_notes: int = 200,
+    ) -> List[Dict]:
+        """在真实浏览器页面里滚动「赞过 / 收藏」标签页，截获页面自身发出的
+        列表请求，返回归一化后的笔记列表（按 note_id 去重）。
+
+        只在接口直连返回空时使用；没有浏览器上下文（纯无头直连）返回空。
+        """
+        if self.browser_context is None:
+            return []
+
+        collected: List[Dict] = []
+        seen: set = set()
+
+        # 页面必须有登录态：CDP 复用失败时上下文是全新空浏览器（没有 cookie），
+        # 打开「赞过」页只会看到登录墙。这里把账号 cookie 直接注入上下文。
+        try:
+            cookie_dict = (self.xhs_client.cookie_dict
+                           if self.xhs_client is not None else None) \
+                or utils.convert_str_cookie_to_dict(config.COOKIES or "")
+            if cookie_dict:
+                domain = "rednote.com" if config.XHS_INTERNATIONAL else "xiaohongshu.com"
+                await self.browser_context.add_cookies([
+                    {"name": str(k), "value": str(v),
+                     "domain": f".{domain}", "path": "/"}
+                    for k, v in cookie_dict.items() if k and v
+                ])
+                utils.logger.info(
+                    f"[get_account_behavior_notes] 已注入 {len(cookie_dict)} 条 cookie 到页面上下文")
+        except Exception as e:
+            utils.logger.warning(
+                f"[get_account_behavior_notes] cookie 注入失败（页面可能掉登录）: {e}")
+
+        page = await self.browser_context.new_page()
+        try:
+            for behavior in behaviors:
+                label = self._BEHAVIOR_TAB.get(behavior, ("赞过", "like"))[0]
+                tab_key = self._BEHAVIOR_TAB.get(behavior, ("赞过", "like"))[1]
+                api_part = self._BEHAVIOR_API.get(behavior, "note/like/page")
+
+                grabbed: List[Dict] = []
+                resp_tasks: List = []
+                # 诊断用：记录本次页面请求过的所有 /api/sns/web 接口，
+                # 拿不到数据时打出来，省得靠猜（标签名/接口路径改版排查）
+                seen_apis: List[str] = []
+
+                async def _grab(resp, grabbed=grabbed) -> None:
+                    try:
+                        body = await resp.json()
+                    except Exception:
+                        return
+                    got = 0
+                    for n in ((body or {}).get("notes") or []):
+                        item = self._normalize_behavior_note(n)
+                        if item:
+                            grabbed.append(item)
+                            got += 1
+                    if got:
+                        utils.logger.info(
+                            f"[get_account_behavior_notes] 截获「{label}」"
+                            f"接口一批 {got} 条：{resp.url.split('?')[0].rsplit('/', 3)[-3:]}")
+
+                def _on_resp(resp, api_part=api_part, resp_tasks=resp_tasks,
+                             seen_apis=seen_apis) -> None:
+                    url = resp.url
+                    if "/api/sns/web" in url:
+                        short = url.split("?")[0].replace("https://edith.xiaohongshu.com", "")
+                        if short not in seen_apis and len(seen_apis) < 40:
+                            seen_apis.append(short)
+                    if api_part in url:
+                        resp_tasks.append(asyncio.create_task(_grab(resp)))
+
+                page.on("response", _on_resp)
+                # 1) 打开发帖人主页（浏览器上下文里已带登录态），切到目标标签
+                await page.goto(f"{self.index_url}/user/profile/{user_id}",
+                                wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(2500)
+                baseline = len(grabbed)
+                tab_clicked = False
+                # 点标签：优先在 DOM 里按文本找可点元素（比 get_by_text 稳，
+                # 小红书标签有多个同名节点，exact 匹配常点空）
+                try:
+                    tab_clicked = bool(await page.evaluate(
+                        """(label) => {
+                            const nodes = Array.from(document.querySelectorAll('div,span,a,li'))
+                              .filter(e => e.textContent && e.textContent.trim() === label);
+                            if (!nodes.length) return false;
+                            const el = nodes[nodes.length - 1];
+                            (el.closest('div') || el).click();
+                            return true;
+                        }""", label))
+                except Exception:
+                    tab_clicked = False
+                if not tab_clicked:
+                    try:
+                        await page.get_by_text(label, exact=True).first.click(timeout=6000)
+                        tab_clicked = True
+                    except Exception:
+                        await page.goto(
+                            f"{self.index_url}/user/profile/{user_id}?tab={tab_key}",
+                            wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(3500)
+                try:
+                    cur_url = page.url.split("?")[-1]
+                    title = await page.title()
+                except Exception:
+                    cur_url, title = "", ""
+                utils.logger.info(
+                    f"[get_account_behavior_notes] 「{label}」页已就位"
+                    f"（点中标签={tab_clicked}，地址={cur_url[:60]}，标题={title[:30]}）")
+                # 2) 滚动加载：达到上限 / 连续 3 轮无增长就停
+                stale = 0
+                for _ in range(60):
+                    if len(grabbed) - baseline >= max_notes:
+                        break
+                    before = len(grabbed)
+                    try:
+                        await page.mouse.wheel(0, 2600)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(1800)
+                    if len(grabbed) == before:
+                        stale += 1
+                        if stale >= 3:
+                            break
+                    else:
+                        stale = 0
+                    await anti_risk.interval_sleep(
+                        random.uniform(0.6, 1.4), f"{label}列表滚动")
+
+                for t in resp_tasks:
+                    if not t.done():
+                        t.cancel()
+                try:
+                    page.remove_listener("response", _on_resp)
+                except Exception:
+                    pass
+
+                fresh = 0
+                for item in grabbed:
+                    nid = item["note_id"]
+                    if nid in seen:
+                        continue
+                    seen.add(nid)
+                    collected.append(item)
+                    fresh += 1
+                if not grabbed:
+                    # 一条都没截到：把页面实际发过的接口打出来，方便判断是
+                    # 标签没切对、还是列表接口换了路径
+                    utils.logger.warning(
+                        f"[get_account_behavior_notes] 「{label}」未截到列表接口，"
+                        f"页面共请求 {len(seen_apis)} 个接口："
+                        f"{' | '.join(seen_apis[:25])}")
+                utils.logger.info(
+                    f"[get_account_behavior_notes] 页面截获「{label}」"
+                    f"{len(grabbed)} 条，去重后新增 {fresh} 条")
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        return collected
+
+    async def get_account_behavior_notes(self):
+        """拉取登录用户「点赞 + 收藏」的图文帖并入库（跳过视频帖）。"""
+        # 1) 登录态兜底：没带 cookie 时按账号池解析，并同步到已建好的客户端
+        if not (config.COOKIES or "").strip():
+            cookie = await self._resolve_account_cookie()
+            if cookie:
+                config.COOKIES = cookie
+                config.LOGIN_TYPE = "cookie"
+                if self.xhs_client is not None:
+                    self.xhs_client.headers["Cookie"] = cookie
+                    self.xhs_client.cookie_dict = utils.convert_str_cookie_to_dict(cookie)
+        if not (config.COOKIES or "").strip():
+            raise RuntimeError(
+                "account 模式需要登录态：请在任务 options 里配置 Cookie，"
+                "或先在账号池添加扫码登录账号（--account_id 指定）")
+
+        # 2) 拿登录用户自己的 user_id（点赞/收藏接口按它拉列表）
+        #    这里就撞验证码的话立刻收手：别再翻 25 页列表、再抓 100 篇详情，
+        #    白打几百个请求把账号越推越死（2026-10-28 实测过一轮）。
+        try:
+            self_user_id = await self.xhs_client.get_self_user_id()
+        except (CaptchaError, IPBlockError, PlatformAccessError) as e:
+            self._risk_abort_reason = f"身份检查阶段即触发风控：{type(e).__name__}"
+            utils.logger.error(
+                f"[get_account_behavior_notes] {self._risk_abort_reason}，"
+                f"本轮放弃抓取。{self.RISK_ABORT_MARKER} 请先冷却或人工过验证码。")
+            return
+        if not self_user_id:
+            raise RuntimeError(
+                "无法获取当前登录用户 ID（selfinfo 与互动列表均未返回）："
+                "请检查 Cookie 是否有效、账号是否发布过笔记/收到过互动")
+
+        behaviors = (os.environ.get("XHS_ACCOUNT_BEHAVIORS")
+                     or getattr(config, "XHS_ACCOUNT_BEHAVIORS", "")
+                     or "likes,collects")
+        behavior_list = [b.strip() for b in behaviors.split(",") if b.strip()]
+
+        # 3) 边拉列表边建详情任务（回调里过滤视频帖 + 已归档帖子）
+        get_note_detail_task_list = []
+        skipped_video = 0
+        skipped_archived = 0
+        # 本次「新帖」抓取额度，按行为独立计数。列表本身会一直翻到
+        # has_more=False（跨过的老帖不算消耗额度），否则增量模式下永远
+        # 只会扫到最前面几页的已归档帖子。
+        budget = int(getattr(config, "XHS_BEHAVIOR_MAX_NOTES", 100) or 100)
+        queued_by_behavior: Dict[str, int] = {}
+
+        # 增量：已归档的帖子不再重抓详情+评论。
+        # 点赞动辄几百条（实测本号 495 条），全量重抓评论要跑几小时，
+        # 日常备份任务只需要补新增的；想强制刷新老帖时把
+        # XHS_BEHAVIOR_INCREMENTAL 设成 0。
+        incremental = bool(getattr(config, "XHS_BEHAVIOR_INCREMENTAL", True))
+        known_ids: set = set()
+        if incremental:
+            try:
+                from tools.v2_sync import get_archived_content_ids
+
+                # 跳过判据 = 评论完整率（已抓 / 原帖显示）>= 90%。
+                # backfill_limit 只是每轮的补抓工作量上限，不是重试次数：
+                # 未达标的帖子会一直留在待补池，每轮挑最接近达标的先补。
+                # 篇数上限与「本次抓取上限」(XHS_BEHAVIOR_MAX_NOTES) 统一，
+                # 不再用独立的 XHS_COMMENT_BACKFILL_MAX_NOTES（已删除）。
+                known_ids = await get_archived_content_ids(
+                    "xhs",
+                    backfill_limit=int(getattr(
+                        config, "XHS_BEHAVIOR_MAX_NOTES", 100) or 0),
+                    backfill_max_comments=int(getattr(
+                        config, "XHS_COMMENT_BACKFILL_MAX_COMMENTS", 3000) or 0))
+                utils.logger.info(
+                    f"[get_account_behavior_notes] 增量模式：库内已归档 "
+                    f"{len(known_ids)} 条帖子，本次跳过它们（额度按新帖算：{budget}）")
+            except Exception as e:
+                utils.logger.warning(
+                    f"[get_account_behavior_notes] 读取已归档列表失败，"
+                    f"退回全量模式：{type(e).__name__}: {e}")
+
+        # 整批详情请求共用同一个并发闸门（见下方调用处的注释）
+        detail_semaphore = asyncio.Semaphore(_xhs_concurrency())
+
+        async def _on_batch(notes: List[Dict], behavior: str = "likes") -> bool:
+            """返回 False 表示该行为的额度已用满，调用方应停止翻页。"""
+            nonlocal skipped_video, skipped_archived
+            for note in notes:
+                if queued_by_behavior.get(behavior, 0) >= budget:
+                    return False
+                note_id = str(note.get("note_id") or note.get("id") or "")
+                if not note_id:
+                    continue
+                if (note.get("type") or "") == "video":
+                    skipped_video += 1
+                    utils.logger.info(
+                        f"[get_account_behavior_notes] 跳过视频帖 {note_id}")
+                    continue
+                if note_id in known_ids:
+                    skipped_archived += 1
+                    continue
+                get_note_detail_task_list.append(self.get_note_detail_async_task(
+                    note_id=note_id,
+                    xsec_source="pc_feed",
+                    xsec_token=note.get("xsec_token") or "",
+                    # 整批共用同一个信号量！原先这里每篇都 new 一个，
+                    # 等于 100 篇同时并发打出去 —— 秒级 100 请求，风控必炸
+                    # （2026-10-28：一轮点赞任务把账号打到 HTTP 461 验证码）。
+                    semaphore=detail_semaphore,
+                ))
+                queued_by_behavior[behavior] = queued_by_behavior.get(behavior, 0) + 1
+            return queued_by_behavior.get(behavior, 0) < budget
+
+        try:
+            await self.xhs_client.get_all_behavior_notes(
+                self_user_id, behaviors=behavior_list, callback=_on_batch,
+                # 别用 client 默认的 1s/页：点赞列表要翻几十页，1s 一页太急。
+                # 走小红书统一的 5-15s 随机间隔。
+                crawl_interval=_xhs_crawl_interval())
+        except (CaptchaError, IPBlockError, PlatformAccessError) as e:
+            # 翻列表途中被风控：直接收手，别再进详情阶段
+            self._risk_abort_reason = f"列表阶段触发风控：{type(e).__name__}"
+            utils.logger.error(
+                f"[get_account_behavior_notes] {self._risk_abort_reason}，"
+                f"本轮放弃抓取。{self.RISK_ABORT_MARKER}")
+            return
+
+        # 接口直连拿不到列表时（平台只对网页会话放行）退回页面内截获：
+        # 打开本人主页「赞过/收藏」页滚动，抓页面自己发出的请求
+        if not get_note_detail_task_list and self.browser_context is not None:
+            utils.logger.info(
+                "[get_account_behavior_notes] 接口列表为空，改用浏览器页面截获"
+                "（打开本人主页「赞过/收藏」并滚动加载）")
+            page_notes = await self._collect_behavior_notes_via_page(
+                self_user_id, behavior_list)
+            if page_notes:
+                await _on_batch(page_notes)
+
+        if not get_note_detail_task_list:
+            utils.logger.warning(
+                "[get_account_behavior_notes] 点赞/收藏列表为空：接口直连与"
+                "浏览器页面截获都没拿到数据。若账号里确实有点赞，请确认"
+                "selfinfo 的 liked 数是否 >0、以及浏览器是否处于登录态。")
+
+        utils.logger.info(
+            f"[get_account_behavior_notes] 用户 {self_user_id} 待抓取图文帖 "
+            f"{len(get_note_detail_task_list)} 篇，跳过视频帖 {skipped_video} 篇，"
+            f"跳过已归档 {skipped_archived} 篇")
+
+        # 4) 详情管线（与 get_specified_notes 完全一致）
+        need_get_comment_note_ids = []
+        xsec_tokens = []
+        note_details = await asyncio.gather(*get_note_detail_task_list)
+        for note_detail in note_details:
+            if note_detail:
+                need_get_comment_note_ids.append(note_detail.get("note_id", ""))
+                xsec_tokens.append(note_detail.get("xsec_token", ""))
+                await xhs_store.update_xhs_note(note_detail)
+                await self.download_media(note_detail)
+        await self.batch_get_note_comments(need_get_comment_note_ids, xsec_tokens)
+
     async def get_note_detail_async_task(
         self,
         note_id: str,
@@ -624,27 +1058,47 @@ class XiaoHongShuCrawler(AbstractCrawler):
             Dict: note detail
         """
         note_detail = None
+        # 风控熔断：前面已经连续被验证码拦下，这篇直接跳过，别再撞
+        if self._risk_abort_reason:
+            return None
         utils.logger.info(f"[get_note_detail_async_task] Begin get note detail, note_id: {note_id}")
         async with semaphore:
             try:
                 try:
                     note_detail = await self.xhs_client.get_note_by_id(note_id, xsec_source, xsec_token)
+                except (CaptchaError, IPBlockError, PlatformAccessError) as e:
+                    # 账号已被平台风控（461/471）：任何兜底通道（html/SSR）此时
+                    # 也只会再吃一次 461，纯属加重风控、把账号彻底打死。
+                    # 立即熔断本批，绝不再级联重试 —— 这是 2026-10-28 那次
+                    # 「详情阶段被风控后几百个 461 把账号彻底锁死」事故的止血点。
+                    self._abort(f"详情接口触发风控：{type(e).__name__}", type(e))
+                    utils.logger.error(
+                        f"[get_note_detail_async_task] 详情请求被平台拦截，跳过 "
+                        f"{note_id}: {type(e).__name__}: {str(e)[:120]}")
+                    return None
                 except RetryError:
-                    pass
+                    note_detail = None
 
                 if not note_detail:
-                    note_detail = await self.xhs_client.get_note_by_id_from_html(note_id, xsec_source, xsec_token,
-                                                                                 enable_cookie=True)
+                    # 兜底通道只处理「非风控」失败（空结果/token 过期/网络）。
+                    # 每个兜底都要捕获风控错误，一旦撞上立即熔断，绝不连发。
+                    try:
+                        note_detail = await self.xhs_client.get_note_by_id_from_html(
+                            note_id, xsec_source, xsec_token, enable_cookie=True)
+                    except (CaptchaError, IPBlockError, PlatformAccessError) as e:
+                        self._abort(f"详情接口触发风控：{type(e).__name__}", type(e))
+                        return None
                     if not note_detail:
                         # 带 Cookie 还失败，多半是登录态已失效、页面被登录墙拦了。
-                        # 分享链接的详情页本身是 SSR（免登录可读），去掉 Cookie 再试一次，
-                        # 否则一条本可抓到的内容会因为失效 Cookie 白白丢掉。
-                        note_detail = await self.xhs_client.get_note_by_id_from_html(
-                            note_id, xsec_source, xsec_token, enable_cookie=False)
+                        # 去掉 Cookie 再试一次（分享链接的详情页本身是 SSR 免登录可读）。
+                        try:
+                            note_detail = await self.xhs_client.get_note_by_id_from_html(
+                                note_id, xsec_source, xsec_token, enable_cookie=False)
+                        except (CaptchaError, IPBlockError, PlatformAccessError) as e:
+                            self._abort(f"详情接口触发风控：{type(e).__name__}", type(e))
+                            return None
                     if not note_detail:
-                        # 最后兜底：走免登录 SSR 通道（media_platform/xhs/ssr.py）。
-                        # 它用干净的浏览器 UA 直取页面，不带 x-s 签名头、不带失效 Cookie，
-                        # 实测在登录态失效时仍能拿到正文/图片/作者/互动数。
+                        # 最后兜底：免登录 SSR 通道（不带 x-s 签名、不带失效 Cookie）。
                         try:
                             from media_platform.xhs.ssr import fetch_note_by_url
 
@@ -656,6 +1110,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             if note_detail:
                                 utils.logger.info(
                                     f"[get_note_detail_async_task] 免登录 SSR 通道兜底成功: {note_id}")
+                        except (CaptchaError, IPBlockError, PlatformAccessError) as e:
+                            self._abort(f"详情接口触发风控：{type(e).__name__}", type(e))
+                            return None
                         except Exception as ssr_exc:
                             utils.logger.info(f"[get_note_detail_async_task] SSR 兜底失败: {ssr_exc}")
                     if not note_detail:
@@ -664,6 +1121,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         # （平台明确返回 NOTE_NOT_FOUND/ABNORMAL 错误码）分支标记，
                         # 这里绝不碰本地数据，否则会把活的内容误标成已删除。
                         utils.logger.warning(f"[skip] Failed to get note detail, Id: {note_id}, 跳过继续")
+                        # 失败也要退避：否则被风控/批量空结果时会以零间隔
+                        # 紧挨着打下一帖，进一步坐实风控。
+                        await anti_risk.xhs_sleep(f"note {note_id} 详情失败间隔")
                         return None
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
@@ -675,11 +1135,17 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             except NoteNotFoundError as ex:
                 utils.logger.warning(f"[XiaoHongShuCrawler.get_note_detail_async_task] Note not found: {note_id}, {ex}")
-                await self._mark_content_deleted(note_id)
+                await self._mark_content_status(note_id, "deleted")
                 return None
-            except (IPBlockError, PlatformAccessError) as ex:
-                # Access restricted (IP block / rate limit / account security).
-                # Skip this note instead of aborting the whole asyncio.gather batch.
+            except NoteHiddenError as ex:
+                # 作者已隐藏原贴（code -510001）：与"已删除"是不同的状态，单独标记，
+                # 前端展示【原贴已隐藏】徽标，数据仍保留可查。
+                utils.logger.warning(f"[XiaoHongShuCrawler.get_note_detail_async_task] Note hidden: {note_id}, {ex}")
+                await self._mark_content_status(note_id, "hidden")
+                return None
+            except (CaptchaError, IPBlockError, PlatformAccessError) as ex:
+                # 外层兜底：任何在兜底通道里漏出来的风控错误，直接熔断本批。
+                self._abort(f"详情接口触发风控：{type(ex).__name__}", type(ex))
                 utils.logger.error(
                     f"[XiaoHongShuCrawler.get_note_detail_async_task] Access restricted while getting note {note_id}: {ex}. "
                     f"建议降低采集频率、更换 IP 或检查账号状态"
@@ -711,63 +1177,245 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 utils.logger.error(f"[XiaoHongShuCrawler.get_note_detail_async_task] have not fund note detail note_id:{note_id}, err: {ex}")
                 return None
 
-    async def _mark_content_deleted(self, note_id: str) -> None:
-        """平台侧内容不存在（已删/私密）时，把 v2 里的对应 story 标记 deleted。
+    async def _mark_content_status(self, note_id: str, status: str) -> None:
+        """平台侧内容状态变化时，把 v2 里的对应 story 标记为指定状态。
 
+        status: "deleted"（已删除，code -510000）| "hidden"（作者已隐藏，code -510001）。
         只在配置库是数据库模式时才有意义；失败只记日志，不影响抓取主流程。
         """
         try:
-            from tools.v2_sync import mark_story_deleted
-            await mark_story_deleted("xhs", note_id)
+            from tools.v2_sync import mark_story_status
+            await mark_story_status("xhs", note_id, status)
         except Exception as e:
-            utils.logger.warning(f"[xhs] 标记内容删除失败 {note_id}: {e}")
+            utils.logger.warning(f"[xhs] 标记内容状态失败 {note_id}={status}: {e}")
 
     async def batch_get_note_comments(self, note_list: List[str], xsec_tokens: List[str]):
         """Batch get note comments"""
         if not config.ENABLE_GET_COMMENTS:
             utils.logger.info(f"[XiaoHongShuCrawler.batch_get_note_comments] Crawling comment mode is not enabled")
             return
+        if self._risk_abort_reason:
+            # 详情阶段已被风控熔断，评论就别再起了
+            utils.logger.error(
+                f"[XiaoHongShuCrawler.batch_get_note_comments] 风控已熔断，"
+                f"跳过 {len(note_list)} 篇的评论抓取。{self.RISK_ABORT_MARKER} "
+                f"原因：{self._risk_abort_reason}")
+            return
 
         utils.logger.info(f"[XiaoHongShuCrawler.batch_get_note_comments] Begin batch get note comments, note list: {note_list}")
+
+        # 单篇评论上限按「原帖显示评论量」推算（不再统一吃全局的 30）：
+        # 声明 800 条的帖子就该抓 800 条，否则增量判定会把它当已归档。
+        declared_map: Dict[str, int] = {}
+        try:
+            from tools.v2_sync import get_declared_comment_counts
+
+            declared_map = await get_declared_comment_counts("xhs", note_list)
+        except Exception as e:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler.batch_get_note_comments] 读取声明评论数失败，"
+                f"按不限制处理: {type(e).__name__}: {e}")
+
         semaphore = asyncio.Semaphore(_xhs_concurrency())
         task_list: List[Task] = []
         for index, note_id in enumerate(note_list):
             task = asyncio.create_task(
-                self.get_comments(note_id=note_id, xsec_token=xsec_tokens[index], semaphore=semaphore),
+                self.get_comments(note_id=note_id, xsec_token=xsec_tokens[index],
+                                  semaphore=semaphore,
+                                  declared=int(declared_map.get(str(note_id), 0) or 0)),
                 name=note_id,
             )
             task_list.append(task)
         await asyncio.gather(*task_list, return_exceptions=True)
 
-    async def get_comments(self, note_id: str, xsec_token: str, semaphore: asyncio.Semaphore):
-        """Get note comments with keyword filtering and quantity limitation"""
+        # 抓完立刻把「已抓/声明」写回 v2 章节表：下一轮增量的跳过判定
+        # （tools/v2_sync.get_archived_content_ids）与前端完整率都读它。
+        try:
+            from tools.v2_sync import refresh_comment_completeness
+
+            updated = await refresh_comment_completeness("xhs", note_list)
+            utils.logger.info(
+                f"[XiaoHongShuCrawler.batch_get_note_comments] 已刷新 "
+                f"{updated} 篇帖子的评论完整率（已抓/原帖显示）")
+        except Exception as e:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler.batch_get_note_comments] 刷新评论完整率失败: "
+                f"{type(e).__name__}: {e}")
+
+        if self._risk_abort_reason:
+            utils.logger.error(
+                f"[XiaoHongShuCrawler.batch_get_note_comments] 风控中止："
+                f"{self._risk_abort_reason}｜本轮 {len(note_list)} 篇里有 "
+                f"{len(note_list) - self._comment_done_count} 篇没抓到评论。"
+                f"{self.RISK_ABORT_MARKER} 请降低任务额度/拉长间隔，并在浏览器里"
+                f"处理验证码或等冷却后再跑。")
+
+    async def get_comments(self, note_id: str, xsec_token: str,
+                           semaphore: asyncio.Semaphore, declared: int = 0):
+        """Get note comments with keyword filtering and quantity limitation
+
+        declared: 原帖显示的评论量（平台声明数）。单篇抓多少条由它决定 ——
+        目标是把评论抓到声明量的 90% 以上，而不是固定抓 30 条。
+
+        断点续抓（2026-10-29）：抓取前读取该帖上一次中断时保存的评论分页进度，
+        从「最后一个成功抓取的评论之后」继续，而不是从头重翻；抓取中每翻完一页
+        持久化一次，翻到底（reached_end）后清掉进度。风控熔断/异常中断时不清除，
+        保留最近一页游标供下一轮恢复。
+        """
         async with semaphore:
+            # 熔断：前面已经连续被风控拦下，后面的笔记就别再撞了
+            if self._risk_abort_reason:
+                return
             utils.logger.info(f"[XiaoHongShuCrawler.get_comments] Begin get note id comments {note_id}")
             # Use randomized crawling interval (5-15s)
             crawl_interval = _xhs_crawl_interval()
+            # 单篇上限：声明数 + 余量；XHS_COMMENT_MAX_PER_NOTE > 0 时再压一道硬顶。
+            max_count = _comment_max_count(declared)
+
+            # 断点续抓：读上一次中断保存的进度
+            start_cursor = ""
+            top_count_in = 0
+            sub_cursors_in: Dict[str, str] = {}
+            try:
+                from tools.v2_sync import (
+                    get_comment_resume, save_comment_resume, clear_comment_resume,
+                )
+                resume = await get_comment_resume("xhs", note_id)
+                if resume:
+                    start_cursor = resume.get("top_cursor") or ""
+                    top_count_in = int(resume.get("top_count") or 0)
+                    sub_cursors_in = resume.get("sub_cursors") or {}
+                    if start_cursor or sub_cursors_in:
+                        utils.logger.info(
+                            f"[xhs] 续抓恢复 note {note_id}："
+                            f"主评论续抓起点={'有' if start_cursor else '无'}，"
+                            f"已抓一级评论 {top_count_in} 条，"
+                            f"待续楼中楼 {len(sub_cursors_in)} 个根")
+            except Exception as e:
+                utils.logger.warning(
+                    f"[xhs] 读取评论续抓进度失败 {note_id}: {e}")
+
+            async def _on_progress(nid, state, finished):
+                # page 级 / 结束级统一在这里持久化续抓进度
+                try:
+                    if finished and state.get("reached_end"):
+                        # 真翻到底：评论抓全，清掉进度，避免下轮误续或误判
+                        await clear_comment_resume("xhs", nid)
+                    else:
+                        await save_comment_resume(
+                            "xhs", nid,
+                            state.get("top_cursor", ""),
+                            state.get("top_count", 0),
+                            state.get("sub_cursors", {}),
+                            reached_end=bool(state.get("reached_end", False)),
+                        )
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[xhs] 续抓进度持久化失败 {nid}: {e}")
+
+            utils.logger.info(
+                f"[XiaoHongShuCrawler.get_comments] note {note_id} "
+                f"原帖显示评论 {declared or '未知'} 条 → 本次最多抓 "
+                f"{max_count or '不限'} 条一级评论"
+                + (f"（续抓：已 {top_count_in} 条）" if top_count_in else ""))
             try:
                 await self.xhs_client.get_note_all_comments(
                     note_id=note_id,
                     xsec_token=xsec_token,
                     crawl_interval=crawl_interval,
                     callback=xhs_store.batch_update_xhs_note_comments,
-                    max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
+                    max_count=max_count,
+                    start_cursor=start_cursor,
+                    top_count_in=top_count_in,
+                    sub_cursors=sub_cursors_in,
+                    progress_callback=_on_progress,
                 )
+                self._comment_fail_streak = 0
+                self._comment_done_count += 1
+            except CaptchaError as e:
+                # 验证码/风控：首次命中即熔断整批评论。继续打只会越打越死，
+                # 而且评论接口是平台最先限的那一层。绝不累计重试。
+                self._abort(f"评论接口触发风控：{type(e).__name__}", type(e))
+                utils.logger.error(
+                    f"[XiaoHongShuCrawler.get_comments] 触发验证码，跳过 {note_id}: {e}")
+                return
+            except (IPBlockError, PlatformAccessError) as e:
+                self._abort(f"评论接口触发风控：{type(e).__name__}", type(e))
+                utils.logger.error(
+                    f"[XiaoHongShuCrawler.get_comments] 被平台限制，跳过 {note_id}: "
+                    f"{type(e).__name__}: {str(e)[:160]}")
+                return
             except RetryError as e:
+                self._comment_fail_streak += 1
                 # 评论接口必须带登录态（x-s 签名），登录失效时会被 tenacity 重试到
                 # RetryError 抛出。这里必须拦住：一条笔记的评论抓不到，
                 # 不应该让整轮抓取直接崩掉（正文/图片已经入库了）。
+                # 属于「非风控」失败，累计到阈值再熔断，避免偶发抖动放弃整批。
+                root = getattr(getattr(e, "last_attempt", None), "exception", None)
                 utils.logger.warning(
-                    f"[XiaoHongShuCrawler.get_comments] 评论抓取失败（多为登录态失效），跳过 {note_id}: {e}")
+                    f"[XiaoHongShuCrawler.get_comments] 评论抓取失败，跳过 {note_id}: "
+                    f"{type(root).__name__ if root else 'RetryError'}: {str(root or e)[:200]}")
+                self._maybe_trip_risk("评论接口连续失败")
                 return
             except Exception as e:
                 utils.logger.warning(
                     f"[XiaoHongShuCrawler.get_comments] 评论抓取异常，跳过 {note_id}: {type(e).__name__} {e}")
                 return
 
-            # Sleep after fetching comments（5-15s 随机）
+            # Sleep after fetching comments（5-15s 随机，仅成功抓到才睡；
+            # 失败已经白等过重试了，别再叠加）
             await anti_risk.interval_sleep(
                 crawl_interval, f"note {note_id} 评论间隔")
+
+    def _abort(self, reason: str, exc_type=None) -> None:
+        """命中平台限制时决定怎么熔断。
+
+        - **CaptchaError（461/471 验证码）= 账号已被平台风控**：*首次*命中即熔断
+          整批。继续打只会越打越死，这是用户最痛的「触发风控后狂打把账号锁死」
+          事故的止血点（2026-10-28：详情阶段被风控后每篇连发 4 个接口、
+          零间隔每秒十几条 461，把账号彻底锁死）。
+        - **IPBlockError / PlatformAccessError（403/429/IP 限流）/ 其它**：可能是
+          单条偶发限流，*连续* RISK_FAIL_LIMIT 次才熔断 —— 避免偶发一条就
+          让整批白跑；但连续命中说明账号确实被限流，再打也没用。
+        """
+        if self._risk_abort_reason:
+            return
+        is_captcha = exc_type is CaptchaError
+        self._comment_fail_streak += 1
+        if not is_captcha and self._comment_fail_streak < self.RISK_FAIL_LIMIT:
+            # 非验证码：累计到阈值才熔断，偶发单条不限整批
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler] 受限 {self._comment_fail_streak} 次"
+                f"（{reason}），尚未熔断（阈值 {self.RISK_FAIL_LIMIT}）")
+            return
+        self._risk_abort_reason = reason
+        if is_captcha:
+            utils.logger.error(
+                f"[XiaoHongShuCrawler] 命中验证码风控（461/471），立即熔断后续抓取"
+                f" —— 本轮只入库已成功抓取的内容，其余留到冷却后再补。"
+                f"原因：{reason}")
+        else:
+            utils.logger.error(
+                f"[XiaoHongShuCrawler] 连续 {self._comment_fail_streak} 次受限"
+                f"（{reason}），熔断后续抓取 —— 本轮只入库已成功抓取的内容，"
+                f"其余留到冷却后再补。")
+
+    def _maybe_trip_risk(self, reason: str) -> None:
+        """*非风控类*失败（登录失效/网络抖动）连续 N 次才熔断。
+
+        风控类错误（461/471/封禁）请用 `_abort` —— 那是要*首次即停*的。
+        这里只兜底「登录态彻底失效」之类的非风控连续失败，避免偶发抖动
+        就放弃整批，也避免无意义的反复重试浪费时间。
+        """
+        if self._risk_abort_reason:
+            return
+        if self._comment_fail_streak < self.RISK_FAIL_LIMIT:
+            return
+        self._risk_abort_reason = reason
+        utils.logger.error(
+            f"[XiaoHongShuCrawler] 已连续 {self._comment_fail_streak} 篇评论抓取失败"
+            f"（{reason}），熔断后续评论抓取 —— 本轮只入库正文/媒体，"
+            f"评论留到冷却后再补。")
 
     async def create_xhs_client(self, httpx_proxy: Optional[str]) -> XiaoHongShuClient:
         """Create Xiaohongshu client"""
@@ -792,13 +1440,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 "pragma": "no-cache",
                 "priority": "u=1, i",
                 "referer": f"{self.index_url}/",
-                "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+                "sec-ch-ua": '"Chromium";v="137", "Google Chrome";v="137", "Not.A/Brand";v="99"',
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Windows"',
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-site",
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
                 "Cookie": cookie_str,
             },
             playwright_page=self.context_page,

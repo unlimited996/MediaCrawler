@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import random
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update, delete, or_
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.db_session import get_async_engine
@@ -35,8 +37,12 @@ from database.models_v2 import (
     Author, Comment, MediaAttachment, SourceSite, Story, StoryChapter,
     StoryEditLog, StoryTag, Tag,
 )
+import config
+import httpx
+
 from tools import utils
 from tools.crawler_util import safe_int
+from tools.paths import DATA_DIR
 from tools.sentiment import analyze_sentiment
 
 #: story.ext 里缓存「发帖人核心观点」的键；判定逻辑升级时改版本号即自动失效重算
@@ -187,6 +193,178 @@ async def _upsert_media(session, chapter_id: int, url: str, idx: int,
             pass
     return "inserted"
 
+
+# ---------------------------------------------------------------------------
+# 评论图片：入库 + S3 备份（target_type='comment'）
+# 评论的图片在 v1 仅以 pictures 文本形式存在，v2 之前完全没落盘/备份；
+# 这里在评论同步时把每张图下载到本地、登记 media_attachment，再入 S3 备份队列。
+# 兼容三种 pictures 来源：实时抓取 [{url_default,url}]、PDF 导入/旧数据逗号分隔串、纯字符串列表。
+# ---------------------------------------------------------------------------
+
+def _normalize_picture_urls(pictures: Any) -> List[str]:
+    """把 pictures 字段归一化成 http(s) URL 列表。"""
+    out: List[str] = []
+    if not pictures:
+        return out
+    if isinstance(pictures, str):
+        for part in pictures.split(","):
+            part = part.strip()
+            if part.startswith(("http://", "https://")):
+                out.append(part)
+        return out
+    if isinstance(pictures, (list, tuple)):
+        for p in pictures:
+            if isinstance(p, str):
+                if p.startswith(("http://", "https://")):
+                    out.append(p)
+            elif isinstance(p, dict):
+                url = p.get("url_default") or p.get("url") or ""
+                if url.startswith(("http://", "https://")):
+                    out.append(url)
+    return out
+
+
+# 评论图下载 UA：与 API 请求头刻意保持一致（Windows + Chrome 137），
+# 避免「同一会话两种指纹」被平台关联识别。
+_COMMENT_IMAGE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+)
+
+
+async def _download_comment_image(url: str, dest: Path,
+                                  client: Optional[httpx.AsyncClient] = None
+                                  ) -> Optional[Path]:
+    """尽力下载评论图片到本地（抓取时 URL 尚新鲜）。失败返回 None，不抛异常。
+
+    client 可复用：由调用方持有单个 AsyncClient，避免每张图都新建/销毁连接
+    （之前每张图一个独立 client，虽然串行，但建连开销大、指纹也不稳定）。
+    """
+    try:
+        from media_downloader.paths import guess_extension
+
+        ext = guess_extension(url, default=".jpg")
+        dest = dest.with_suffix(ext) if not dest.suffix else dest
+        if dest.exists() and dest.stat().st_size > 0:
+            return dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        own = client is None
+        if own:
+            client = httpx.AsyncClient(follow_redirects=True, timeout=15.0)
+        try:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": _COMMENT_IMAGE_UA,
+                    "Referer": "https://www.xiaohongshu.com/",
+                },
+            )
+            if r.status_code == 200 and r.content:
+                dest.write_bytes(r.content)
+                return dest
+        finally:
+            if own and client is not None:
+                await client.aclose()
+    except Exception as e:
+        utils.logger.warning(f"[v2_sync] 评论图下载失败 {url[:80]}: {e}")
+    return None
+
+
+async def _upsert_comment_media(session, comment_id: int, url: str, idx: int,
+                                local_path: str, platform_code: str,
+                                content_id: str, story_id: Optional[int]) -> None:
+    """评论媒体入库（按 source_url / local_path 幂等）+ 入 S3 备份队列。
+
+    去重说明：同一张评论图在「重新抓取」时 XHS 会下发带新 CDN 签名的 URL，
+    source_url 因此变化，仅靠 (target_type, target_id, source_url) 唯一约束拦不住，
+    会重复建媒体行并重复备份。但下载落盘文件名是确定性的
+    （{comment_id}_{idx:03d}），同一张图永远落到同一个 local_path，所以额外按
+    local_path 命中已存在行即可彻底去重。
+    """
+    conditions = [
+        MediaAttachment.target_type == "comment",
+        MediaAttachment.target_id == comment_id,
+    ]
+    if local_path:
+        conditions.append(
+            (MediaAttachment.source_url == url)
+            | (MediaAttachment.local_path == local_path)
+        )
+    else:
+        conditions.append(MediaAttachment.source_url == url)
+    existing = (await session.execute(
+        select(MediaAttachment).where(*conditions)
+    )).scalar_one_or_none()
+    if existing is not None:
+        # 刷新为最新 CDN 签名 URL（若本次重抓拿到新签名），保留本地副本不变
+        if url and existing.source_url != url:
+            existing.source_url = url
+            existing.source_status = "alive"
+        if local_path and not existing.local_path:
+            existing.local_path = local_path
+            existing.download_status = "done"
+            existing.storage_type = "local"
+        if platform_code:
+            try:
+                from tools.media_backup import enqueue_backup
+
+                await enqueue_backup(session, existing, platform_code,
+                                     content_id, story_id)
+            except Exception:
+                pass
+        return
+    media = MediaAttachment(
+        target_type="comment", target_id=comment_id,
+        media_type="image", source_url=url, local_path=local_path or None,
+        sort_order=idx - 1,
+        download_status="done" if local_path else "pending",
+        storage_type="local" if local_path else "url",
+        source_status="alive" if url else "unknown",
+    )
+    session.add(media)
+    await session.flush()
+    if platform_code:
+        try:
+            from tools.media_backup import enqueue_backup
+
+            await enqueue_backup(session, media, platform_code,
+                                 content_id, story_id)
+        except Exception:
+            pass
+
+
+async def _sync_comment_media(session, comment_id: int, pictures: Any,
+                              platform_code: str, content_id: str,
+                              story_id: Optional[int]) -> None:
+    """评论同步时把评论图片下载/登记/入 S3 备份队列。
+
+    幂等：重复同步同一评论不会重复建媒体行（按 source_url 唯一约束）。
+    """
+    if not getattr(config, "ENABLE_COMMENT_IMAGE_BACKUP", True):
+        return
+    urls = _normalize_picture_urls(pictures)
+    if not urls:
+        return
+    from media_downloader.paths import build_media_dir
+
+    media_dir = (build_media_dir(DATA_DIR, platform_code, content_id)
+                 / "comments" / str(comment_id))
+    stem_base = str(comment_id)
+    # 复用单个 client：评论图之间加小随机间隔，避免抓取期零间隔密集请求
+    # （之前每张图独立 client 且零间隔，是被风控的隐藏放大器之一）。
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+        for idx, url in enumerate(urls, 1):
+            local_path = ""
+            lp = await _download_comment_image(
+                url, media_dir / f"{stem_base}_{idx:03d}", client)
+            if lp is not None:
+                local_path = str(lp)
+            await _upsert_comment_media(session, comment_id, url, idx, local_path,
+                                        platform_code, content_id, story_id)
+            if idx < len(urls):
+                await asyncio.sleep(random.uniform(0.3, 1.2))
+
+
 async def record_story_edit(session, story_id: int, chapter_id: Optional[int],
                             before: Dict[str, Any], after: Dict[str, Any],
                             source: str = "crawl") -> bool:
@@ -314,28 +492,456 @@ async def _get_site_id(session: AsyncSession, platform_code: str) -> Optional[in
     return row.id if row else None
 
 
+def comment_completeness(fetched: int, declared: int) -> float:
+    """评论完整率 = 已抓评论数 / 原帖显示评论量。
+
+    declared（平台声明的评论数）为 0/缺失时返回 1.0：没有评论需求的帖子
+    天然算「抓全了」，不该被反复重抓。
+    """
+    if declared <= 0:
+        return 1.0
+    return max(0.0, min(1.0, float(fetched) / float(declared)))
+
+
+def is_comment_complete(fetched: int, declared: int,
+                        target_ratio: float = 0.0) -> bool:
+    """评论是否已抓够：fetched / declared >= target_ratio（默认配置的 90%）。
+
+    这是增量任务「跳过 / 重抓」的唯一判据 —— 不再有「最多重试几次」的
+    硬上限，抓没抓全由数据本身回答。
+    """
+    if target_ratio <= 0:
+        target_ratio = float(getattr(config, "COMMENT_COMPLETENESS_TARGET", 0.0) or 0.9)
+    return comment_completeness(fetched, declared) >= target_ratio
+
+
+def plan_backfill(incomplete: List[tuple], backfill_limit: int = 0,
+                  backfill_max_comments: int = 0):
+    """把「未达标帖子」切成 (本轮补抓, 顺延下一轮) 两份。
+
+    incomplete 的元素是 (content_id, fetched, declared, ratio)。
+
+    挑选规则：
+      1. 差得越少越先补（declared-fetched 升序）—— 差 16 条的几分钟就能达标，
+         差 8000 条的要跑几小时；先啃小的整体达标率上升更快。
+      2. backfill_limit > 0：最多挑这么多篇。
+      3. backfill_max_comments > 0：本轮「待补条数」累计不超过该预算
+         （第一条永远放行，避免单篇超大帖把预算卡成 0 篇死锁）。
+
+    注意：顺延不是放弃 —— 这些帖子的完整率仍 < 阈值，下一轮照样进候选池。
+    """
+    # 优先级铁律：**评论为 0 的帖子（fetched=0）最优先** —— 它们才是真正
+    # 「没抓到评论」的坏数据，用户显式要求先补它们。否则按「差多少」升序，
+    # 差得少的先补（快速达标）。
+    # 这样评论为空的帖子不再被「快满的帖子」永远压在队列底部饿死：每轮先啃
+    # 一批空评论帖（同档内按声明数升序，小帖先补、快速出成果），大帖（声明
+    # 几千条）自然排在同档末尾，待小帖清空后轮到它，而不是被无限顺延。
+    ordered = sorted(incomplete, key=lambda x: (0 if x[1] == 0 else 1, x[2] - x[1], x[2]))
+    selected = ordered
+    if backfill_limit > 0:
+        selected = selected[:backfill_limit]
+    if backfill_max_comments > 0:
+        picked, acc = [], 0
+        for row in selected:
+            gap = max(0, row[2] - row[1])
+            if picked and acc + gap > backfill_max_comments:
+                break
+            picked.append(row)
+            acc += gap
+        selected = picked
+    return selected, ordered[len(selected):]
+
+
+async def get_archived_content_ids(platform_code: str,
+                                   target_ratio: float = 0.0,
+                                   backfill_limit: int = 0,
+                                   backfill_max_comments: int = 0) -> set:
+    """返回该平台「已归档完整」的帖子 ID 集合（story_chapter.source_content_id）。
+
+    account 模式（点赞/收藏）用它做增量：已归档的帖子不再重抓详情+评论。
+
+    完整性判定（唯一标准）：
+    **已抓评论数 / 原帖显示评论量 >= target_ratio（默认 90%）**。
+
+    这里不再有「零评论帖最多重试 N 次」这种拍脑袋的上限（2026-10-28 用户
+    明确否掉）：是否重抓完全由数据说话 —— 评论抓够了就跳过，没抓够就补。
+    上一轮撞验证码只存了正文的帖子，完整率是 0%，会一直留在待补池里。
+
+    backfill_limit / backfill_max_comments > 0 时限流：本轮只挑差得最少的
+    若干篇（并受总条数预算约束）去补，其余不达标的帖子本轮先跳过（仍在待补
+    池里，下一轮继续），避免 100+ 篇、单篇几千条评论一次性打出去再次触发
+    风控。**这不是重试次数上限** —— 没有任何帖子会因为「试过几次」被永久放弃。
+
+    两条排除规则：
+    1. 已标 deleted / hidden 的帖子不算归档完成 —— 可能只是临时不可见。
+    2. 平台声明评论数为 0/缺失时视为完整（`comment_completeness` 返回 1.0）。
+
+    查询失败（数据库不可达）时返回空集合，调用方按「全部都要抓」处理。
+    """
+    if target_ratio <= 0:
+        target_ratio = float(getattr(config, "COMMENT_COMPLETENESS_TARGET", 0.0) or 0.9)
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return set()
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return set()
+            # 一条查询拿全：帖子 ID + 状态 + 声明评论数 + 已抓评论数（避免逐篇 N+1）
+            rows = (await session.execute(
+                select(StoryChapter.source_content_id, Story.status, Story.id,
+                       StoryChapter.declared_comment_count,
+                       StoryChapter.comment_count,
+                       Story.comment_count,
+                       func.count(Comment.id))
+                .join(Story, Story.id == StoryChapter.story_id, isouter=True)
+                .outerjoin(Comment, Comment.story_id == Story.id)
+                .where(StoryChapter.source_site_id == site_id)
+                .group_by(StoryChapter.source_content_id, Story.status, Story.id,
+                          StoryChapter.declared_comment_count,
+                          StoryChapter.comment_count,
+                          Story.comment_count)
+            )).all()
+
+            ids = set()
+            incomplete: List[tuple] = []    # (content_id, fetched, declared, ratio)
+            for (content_id, status, story_id, declared_c, chapter_c,
+                 story_c, cmt_count) in rows:
+                if not content_id or story_id is None:
+                    continue
+                if (status or "") in ("deleted", "hidden"):
+                    continue
+                # 声明数优先级：章节字段（详情接口原值）> 章节冗余 > story 冗余
+                declared = int(declared_c or chapter_c or story_c or 0)
+                fetched = int(cmt_count or 0)
+                if is_comment_complete(fetched, declared, target_ratio):
+                    ids.add(str(content_id))
+                else:
+                    incomplete.append((str(content_id), fetched, declared,
+                                       comment_completeness(fetched, declared)))
+
+            if incomplete:
+                selected, deferred = plan_backfill(
+                    incomplete, backfill_limit, backfill_max_comments)
+                if deferred:
+                    # 本轮暂缓的帖子先当「已归档」跳过，但它们仍未达标，
+                    # 下一轮仍会重新进入待补池 —— 不会被永久放弃
+                    for cid, _f, _d, _r in deferred:
+                        ids.add(cid)
+                    utils.logger.info(
+                        f"[v2_sync] 增量：另有 {len(deferred)} 篇未达标，按本轮"
+                        f"预算（≤{backfill_limit or '不限'} 篇 / "
+                        f"≤{backfill_max_comments or '不限'} 条）顺延到下一轮补抓")
+                detail = "，".join(
+                    f"{cid} {fetched}/{declared}({ratio:.0%})"
+                    for cid, fetched, declared, ratio in selected[:10])
+                utils.logger.info(
+                    f"[v2_sync] 增量：{len(selected)} 篇帖子评论完整率未达 "
+                    f"{target_ratio:.0%}，本次要重抓（跳过 {len(ids)} 篇已达标）。"
+                    f"待补明细：{detail}"
+                    + ("…" if len(selected) > 10 else ""))
+            return ids
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 读取已归档帖子 ID 失败 {platform_code}: {e}")
+        return set()
+
+
+# ---------------------------------------------------------------------------
+# 评论断点续抓：把每篇帖子的「评论分页游标」持久化到 story_chapter.ext，
+# 抓取中断后下一次执行从最后一个成功抓取的评论之后继续，不重头开始、不重复。
+# 续抓进度结构（存于 ext["comment_resume"]）：
+#   {
+#     "top_cursor": str,        # 主评论下一页游标（从它继续即跳过已抓页）
+#     "top_count": int,         # 已抓一级评论条数（承接 max_count 上限，避免重复计数）
+#     "sub_cursors": {root_id: cursor},  # 楼中楼没翻完的根评论，待续抓收尾
+#     "reached_end": bool,      # 是否已翻到 has_more=False（真·抓全）
+#     "updated_at": int,
+#   }
+# ---------------------------------------------------------------------------
+COMMENT_RESUME_KEY = "comment_resume"
+
+
+async def get_comment_resume(platform_code: str,
+                            content_id: str) -> Optional[Dict[str, Any]]:
+    """读取某帖的评论续抓进度（story_chapter.ext["comment_resume"]）。
+
+    返回进度字典；不存在/查不到时返回 None。
+    """
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return None
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return None
+            chapter = (await session.execute(
+                select(StoryChapter).where(
+                    StoryChapter.source_site_id == site_id,
+                    StoryChapter.source_content_id == str(content_id))
+            )).scalar_one_or_none()
+            if chapter is None:
+                return None
+            ext = chapter.ext or {}
+            return ext.get(COMMENT_RESUME_KEY)
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 读取评论续抓进度失败 {platform_code}/{content_id}: {e}")
+        return None
+
+
+async def save_comment_resume(platform_code: str, content_id: str,
+                             top_cursor: str, top_count: int,
+                             sub_cursors: Dict[str, str],
+                             reached_end: bool = False) -> None:
+    """把评论续抓进度写回 story_chapter.ext["comment_resume"]。
+
+    每翻完一页评论就调用一次（page 级持久化），保证中断后能从最近一页之后恢复；
+    sub_cursors 里只保留仍带游标（未翻完）的根评论，已翻完的会被剔除。
+    """
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return
+            chapter = (await session.execute(
+                select(StoryChapter).where(
+                    StoryChapter.source_site_id == site_id,
+                    StoryChapter.source_content_id == str(content_id))
+            )).scalar_one_or_none()
+            if chapter is None:
+                utils.logger.warning(
+                    f"[v2_sync] 续抓进度写入失败：找不到章节 "
+                    f"{platform_code}/{content_id}")
+                return
+            ext = dict(chapter.ext or {})
+            ext[COMMENT_RESUME_KEY] = {
+                "top_cursor": top_cursor or "",
+                "top_count": int(top_count or 0),
+                "sub_cursors": {
+                    str(k): str(v) for k, v in (sub_cursors or {}).items() if v
+                },
+                "reached_end": bool(reached_end),
+                "updated_at": int(time.time() * 1000),
+            }
+            chapter.ext = ext
+            await session.commit()
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 写入评论续抓进度失败 {platform_code}/{content_id}: {e}")
+
+
+async def clear_comment_resume(platform_code: str, content_id: str) -> None:
+    """评论抓全（reached_end）后清掉续抓进度，避免下轮误续或误判未完成。"""
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return
+            chapter = (await session.execute(
+                select(StoryChapter).where(
+                    StoryChapter.source_site_id == site_id,
+                    StoryChapter.source_content_id == str(content_id))
+            )).scalar_one_or_none()
+            if chapter is None:
+                return
+            ext = dict(chapter.ext or {})
+            if COMMENT_RESUME_KEY in ext:
+                ext.pop(COMMENT_RESUME_KEY)
+                chapter.ext = ext
+                await session.commit()
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 清除评论续抓进度失败 {platform_code}/{content_id}: {e}")
+
+
+async def get_declared_comment_counts(platform_code: str,
+                                      content_ids: Optional[List[str]] = None
+                                      ) -> Dict[str, int]:
+    """批量取帖子的「原帖显示评论量」，供抓取时推算单篇评论上限。
+
+    返回 {source_content_id: declared}；查不到的不在字典里（调用方按 0 处理）。
+    """
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return {}
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return {}
+            stmt = select(StoryChapter.source_content_id,
+                          StoryChapter.declared_comment_count,
+                          StoryChapter.comment_count,
+                          Story.comment_count).join(
+                Story, Story.id == StoryChapter.story_id, isouter=True
+            ).where(StoryChapter.source_site_id == site_id)
+            if content_ids:
+                stmt = stmt.where(
+                    StoryChapter.source_content_id.in_([str(i) for i in content_ids]))
+            rows = (await session.execute(stmt)).all()
+            out: Dict[str, int] = {}
+            for content_id, declared_c, chapter_c, story_c in rows:
+                if not content_id:
+                    continue
+                out[str(content_id)] = int(declared_c or chapter_c or story_c or 0)
+            return out
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 读取声明评论数失败 {platform_code}: {e}")
+        return {}
+
+
+async def refresh_comment_completeness(platform_code: str,
+                                       content_ids: Optional[List[str]] = None
+                                       ) -> int:
+    """把「已抓评论数 / 原帖显示评论量」写回 story_chapter。
+
+    - `fetched_comment_count` / `completeness` 两个字段此前一直是空的
+      （只有一次性迁移脚本写过），现在每次抓完评论就刷一次；
+    - 增量跳过判定（get_archived_content_ids）虽然自己实时聚合，但前端
+      「完整率」展示依赖这两个字段；
+    - content_ids 为空时刷新该平台全部章节。
+
+    返回更新的章节条数。
+    """
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return 0
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return 0
+            stmt = select(StoryChapter, Story.comment_count,
+                          func.count(Comment.id)).join(
+                Story, Story.id == StoryChapter.story_id, isouter=True
+            ).outerjoin(
+                Comment, Comment.story_id == Story.id
+            ).where(StoryChapter.source_site_id == site_id).group_by(
+                StoryChapter.id, Story.comment_count)
+            if content_ids:
+                stmt = stmt.where(StoryChapter.source_content_id.in_(
+                    [str(i) for i in content_ids]))
+            rows = (await session.execute(stmt)).all()
+
+            updated = 0
+            for chapter, story_c, cmt_count in rows:
+                declared = int(chapter.declared_comment_count
+                               or chapter.comment_count or story_c or 0)
+                fetched = int(cmt_count or 0)
+                chapter.fetched_comment_count = fetched
+                if declared > 0:
+                    chapter.completeness = round(
+                        comment_completeness(fetched, declared), 4)
+                updated += 1
+            if updated:
+                await session.commit()
+            return updated
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 刷新评论完整率失败 {platform_code}: {e}")
+        return 0
+
+
 async def _get_or_create_author(session: AsyncSession, site_id: int,
                                 anon_hash: str, nickname: str = "",
                                 avatar: str = "",
                                 profile_url: str = "") -> Optional[int]:
-    if not anon_hash:
-        return None
-    row = (await session.execute(
-        select(Author).where(Author.source_site_id == site_id,
-                             Author.anon_hash == anon_hash)
-    )).scalar_one_or_none()
-    if not row:
+    """取/建作者，并尽力回填缺失字段（头像 / 主页）。
+
+    身份匹配优先级：
+      1) anon_hash（实时抓取与导入通常一致）
+      2) profile_url（实时重抓必带真实主页链接；可救回「导入时哈希不一致」
+         或「导入时头像/主页缺失」的历史作者 —— 这是"重新抓取自动恢复"的关键）
+
+    命中后：头像/主页为空则回填；若以 profile_url 命中但与现有 anon_hash 不符，
+    统一为本次（实时）哈希，避免下次再走 profile_url 分支。
+
+    若同一 profile_url 下存在多条作者（重复导入导致，例如同一人既有空头像行
+    又有带头像行），自动合并：评论迁到「规范行」（优先有头像、否则 id 最小），
+    并删掉未被 story 引用的孤儿重复行。
+    """
+    anon_hash = anon_hash or ""
+    profile_url = profile_url or ""
+
+    # 1) 优先按 anon_hash 匹配
+    row = None
+    if anon_hash:
+        row = (await session.execute(
+            select(Author).where(Author.source_site_id == site_id,
+                                 Author.anon_hash == anon_hash)
+        )).scalar_one_or_none()
+
+    # 2) 回退按 profile_url 匹配（实时重抓必带真实主页链接；可救回「导入时哈希
+    #    不一致」或「导入时头像/主页缺失」的历史作者 —— 这是"重新抓取自动恢复"的关键）
+    if row is None and profile_url:
+        dupes = (await session.execute(
+            select(Author).where(Author.source_site_id == site_id,
+                                 Author.profile_url == profile_url)
+        )).scalars().all()
+        if dupes:
+            # 规范行：优先已有头像，否则 id 最小
+            if any(a.avatar_url for a in dupes):
+                row = max(dupes, key=lambda a: (bool(a.avatar_url), -a.id))
+            else:
+                row = min(dupes, key=lambda a: a.id)
+
+    if row is None:
         row = Author(source_site_id=site_id, anon_hash=anon_hash,
                      nickname=nickname or None, avatar_url=avatar or None,
                      profile_url=profile_url or None)
         session.add(row)
         await session.flush()
-    else:
-        if avatar and not row.avatar_url:
-            row.avatar_url = avatar
-        if profile_url and not row.profile_url:
-            row.profile_url = profile_url
+        return row.id
+
+    # 已存在：若 profile_url 非空，先把同 profile_url 的重复作者合并进本行
+    #（消除"同一人既有空头像行又有带头像行"的重复，评论一并迁到规范行）
+    if profile_url:
+        await _merge_duplicate_authors(session, site_id, profile_url, row.id)
+
+    # 回填空字段
+    if avatar and not row.avatar_url:
+        row.avatar_url = avatar
+    if profile_url and not row.profile_url:
+        row.profile_url = profile_url
+    # 以 profile_url 命中但哈希不一致 → 统一为实时哈希，后续直连命中
+    if anon_hash and row.anon_hash != anon_hash:
+        row.anon_hash = anon_hash
     return row.id
+
+
+async def _merge_duplicate_authors(session: AsyncSession, site_id: int,
+                                  profile_url: str, keep_id: int) -> None:
+    """把同 profile_url 的其它作者行合并进 keep_id。
+
+    仅迁移评论引用；删除未被任何 story 引用的孤儿重复行（保留被 story 引用的，
+    避免外键 / 数据丢失）。幂等：合并一次后不再有重复。
+    """
+    dupes = (await session.execute(
+        select(Author).where(Author.source_site_id == site_id,
+                             Author.profile_url == profile_url,
+                             Author.id != keep_id)
+    )).scalars().all()
+    if not dupes:
+        return
+    dupe_ids = [a.id for a in dupes]
+    # 评论：全部迁到规范行
+    await session.execute(
+        update(Comment).where(Comment.author_id.in_(dupe_ids))
+        .values(author_id=keep_id)
+    )
+    # 删除未被 story 引用的孤儿重复行
+    referenced = (await session.execute(
+        select(Story.author_id).where(Story.author_id.in_(dupe_ids))
+    )).scalars().all()
+    safe_del = [i for i in dupe_ids if i not in set(referenced)]
+    if safe_del:
+        await session.execute(
+            delete(Author).where(Author.id.in_(safe_del))
+        )
 
 
 async def _get_or_create_tag(session: AsyncSession, site_id: int, name: str) -> Optional[int]:
@@ -497,6 +1103,11 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                         story.author_id = author_id
                 chapter.like_count = like_count
                 chapter.comment_count = comment_count
+                # 声明评论数必须跟着刷新：它既是「评论完整率」的分母，
+                # 也是单篇评论抓取上限的依据（见 core.batch_get_note_comments）。
+                # 只在拿到有效值时才覆盖，避免某次详情缺字段把分母清空。
+                if comment_count:
+                    chapter.declared_comment_count = comment_count
                 if publish_ts:
                     chapter.publish_ts = publish_ts
                 # source_url 有新值就覆盖：早期数据/测试数据的 URL 可能缺
@@ -613,6 +1224,203 @@ async def get_content_index(platform_code: str, user_id: str = "",
     except Exception as e:
         utils.logger.warning(f"[v2_sync] 读取内容索引失败 {platform_code}: {e}")
         return {}
+
+
+async def get_run_crawl_stats(platform_code: str, start_ts: int,
+                              end_ts: int) -> tuple:
+    """统计 [start_ts, end_ts]（epoch ms）时间窗内被抓取的内容数。
+
+    账号维度（登录用户点赞/收藏）任务用：抓来的帖子作者各异，没法按
+    user_id / content_id 预读索引，改为按「执行时间窗」归因——
+    chapter.ext.crawled_at 落在窗内的 story 即本轮抓过；
+    story.created_at 也在窗内 = 本轮新增，否则 = 本轮刷新。
+    返回 (新增, 已刷新)。
+    """
+    new = updated = 0
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return (0, 0)
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return (0, 0)
+            rows = (await session.execute(
+                select(StoryChapter.ext, Story.created_at)
+                .join(Story, Story.id == StoryChapter.story_id)
+                .where(StoryChapter.source_site_id == site_id)
+            )).all()
+            for ext, created_at in rows:
+                ts = 0
+                if isinstance(ext, dict):
+                    try:
+                        ts = int(ext.get("crawled_at") or 0)
+                    except (TypeError, ValueError):
+                        ts = 0
+                if not (start_ts <= ts <= end_ts):
+                    continue
+                if created_at is not None:
+                    try:
+                        created_ts = int(created_at.timestamp() * 1000)
+                    except (TypeError, ValueError, OSError):
+                        created_ts = 0
+                    if created_ts >= start_ts:
+                        new += 1
+                        continue
+                updated += 1
+    except Exception as e:
+        utils.logger.warning(f"[v2_sync] 统计执行窗内容失败 {platform_code}: {e}")
+    return (new, updated)
+
+
+async def get_completeness_snapshot(platform_code: str) -> Dict[str, Dict]:
+    """抓取前拍「评论完整率」快照：content_id -> {fetched, declared, completeness}。
+
+    **必须在起子进程之前调用**。抓完 tuning.completeness 会被
+    `refresh_comment_completeness()` 覆盖成本轮结果，事后再查只剩「之后」，
+    两次数相减才是「本轮补齐了多少」。
+    """
+    out: Dict[str, Dict] = {}
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return out
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return out
+            rows = (await session.execute(
+                select(StoryChapter.source_content_id,
+                       StoryChapter.declared_comment_count,
+                       StoryChapter.comment_count,
+                       Story.comment_count,
+                       func.count(Comment.id))
+                .join(Story, Story.id == StoryChapter.story_id, isouter=True)
+                .outerjoin(Comment, Comment.story_id == Story.id)
+                .where(StoryChapter.source_site_id == site_id)
+                .group_by(StoryChapter.source_content_id,
+                          StoryChapter.declared_comment_count,
+                          StoryChapter.comment_count, Story.comment_count)
+            )).all()
+            for cid, dc, cc, sc, cmt in rows:
+                if not cid:
+                    continue
+                declared = int(dc or cc or sc or 0)
+                fetched = int(cmt or 0)
+                out[str(cid)] = {
+                    "fetched": fetched,
+                    "declared": declared,
+                    "completeness": round(
+                        comment_completeness(fetched, declared), 4),
+                }
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 拍摄完整率快照失败 {platform_code}: {e}")
+    return out
+
+
+async def get_run_crawl_detail(platform_code: str, start_ts: int, end_ts: int,
+                               before_map: Optional[Dict[str, Dict]] = None
+                               ) -> Dict[str, Any]:
+    """本次执行动了哪些帖子、评论补齐率前后各是多少（执行记录下拉用）。
+
+    归因规则与 `get_run_crawl_stats` 完全一致（chapter.ext.crawled_at 落在
+    执行窗内；story.created_at 也在窗内算新增，否则算刷新），保证明细条数与
+    运行记录上的 headline 计数对得上。
+
+    `before_map` 为 `get_completeness_snapshot()` 在抓取前拍的快照；缺失项
+    （本轮新入库的帖子）按 fetched=0 处理，展示成 0% → X%。
+    """
+    before_map = before_map or {}
+    added: List[Dict] = []
+    updated: List[Dict] = []
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return {"added": added, "updated": updated}
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return {"added": added, "updated": updated}
+
+            # 「之前」= 本轮开始前已入库的评论数，按评论入库时间戳还原。
+            # 比抓取前的内存快照更可靠：历史运行记录也能回填出前后对比。
+            cut_dt = datetime.fromtimestamp(start_ts / 1000.0, tz=timezone.utc)
+            before_cnt: Dict[int, int] = {}
+            for sid, c in (await session.execute(
+                    select(Comment.story_id, func.count(Comment.id))
+                    .where(Comment.created_at < cut_dt)
+                    .group_by(Comment.story_id))).all():
+                before_cnt[int(sid)] = int(c or 0)
+
+            rows = (await session.execute(
+                select(StoryChapter.source_content_id,
+                       StoryChapter.declared_comment_count,
+                       StoryChapter.comment_count,
+                       Story.comment_count,
+                       Story.created_at, Story.title,
+                       Story.id,
+                       func.count(Comment.id),
+                       StoryChapter.ext)
+                .join(Story, Story.id == StoryChapter.story_id)
+                .outerjoin(Comment, Comment.story_id == Story.id)
+                .where(StoryChapter.source_site_id == site_id)
+                .group_by(StoryChapter.source_content_id,
+                          StoryChapter.declared_comment_count,
+                          StoryChapter.comment_count, Story.comment_count,
+                          Story.created_at, Story.title, Story.id,
+                          StoryChapter.ext)
+            )).all()
+
+            for cid, dc, cc, sc, created_at, title, story_id, cmt, ext in rows:
+                if not cid:
+                    continue
+                ts = 0
+                if isinstance(ext, dict):
+                    try:
+                        ts = int(ext.get("crawled_at") or 0)
+                    except (TypeError, ValueError):
+                        ts = 0
+                if not (start_ts <= ts <= end_ts):
+                    continue  # 不是本轮抓的
+
+                declared = int(dc or cc or sc or 0)
+                fetched = int(cmt or 0)
+                after = {
+                    "fetched": fetched,
+                    "declared": declared,
+                    "completeness": round(
+                        comment_completeness(fetched, declared), 4),
+                }
+                prev = int(before_cnt.get(int(story_id or 0)) or 0)
+                before = {
+                    "fetched": prev,
+                    "declared": declared,
+                    "completeness": round(
+                        comment_completeness(prev, declared), 4),
+                }
+
+                is_new = False
+                if created_at is not None:
+                    try:
+                        is_new = int(created_at.timestamp() * 1000) >= start_ts
+                    except (TypeError, ValueError, OSError):
+                        is_new = False
+
+                item = {
+                    "content_id": str(cid),
+                    "title": (title or "")[:80],
+                    "before": before,
+                    "after": after,
+                    # 本轮实际补进来的评论条数
+                    "gained": max(0, after["fetched"] - before["fetched"]),
+                }
+                (added if is_new else updated).append(item)
+
+            # 补齐多的排前面，方便一眼看出本轮最有价值的成果
+            for bucket in (added, updated):
+                bucket.sort(key=lambda x: (-x["gained"], x["content_id"]))
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 统计执行窗明细失败 {platform_code}: {e}")
+    return {"added": added, "updated": updated}
 
 
 async def backfill_comment_sentiments(story_id: Optional[int] = None,
@@ -776,11 +1584,16 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 str(item.get("author_url") or ""),
             )
 
+            # 评论所属内容 ID（笔记 note_id）：两分支共用
+            content_id = str(_pick(item, ("note_id", "content_id")) or "")
+
             if existing is not None:
                 # 刷新点赞 / 子评论数 / 头像
                 existing.like_count = safe_int(item.get("like_count") or 0)
                 existing.sub_count = safe_int(item.get("sub_comment_count") or 0)
-                if author_id and not existing.author_id:
+                # 重抓解析出的规范作者若与当前不同（profile_url 合并/去重场景），
+                # 把老评论重归属到规范作者，使其头像一并恢复
+                if author_id and existing.author_id != author_id:
                     existing.author_id = author_id
                 # 老数据没有情感判定：补上（后续抓取都会带）
                 if not existing.sentiment:
@@ -798,12 +1611,34 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                     existing.stance_tag_code = _d.get("tag_code")
                     existing.stance_confidence = _d.get("confidence")
                     existing.stance_judged_ver = _d.get("version")
+                # 评论 IP 属地：重抓带回时补上（小概率变化，仅在缺失时回填）
+                _ip = item.get("ip_location") or ""
+                if _ip and not existing.ip_location:
+                    existing.ip_location = str(_ip)
+
+                # 对话目标：重抓带回真实 target_comment 时刷新 ext，
+                # 由抓取结束后的 backfill_comment_links 重新对齐层级。
+                # 旧数据扁平化（parent 全指向主评论）靠这里纠正。
+                _new_parent_src = str(item.get("parent_comment_id") or "")
+                if _new_parent_src:
+                    _ext = dict(existing.ext or {})
+                    if _ext.get("parent_comment_id") != _new_parent_src:
+                        _ext["parent_comment_id"] = _new_parent_src
+                        existing.ext = _ext
+
+                # 评论图片入库 + S3 备份（幂等；实时抓取会带回 pictures）
+                try:
+                    await _sync_comment_media(session, existing.id,
+                                              item.get("pictures"), platform_code,
+                                              content_id, existing.story_id)
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[v2_sync] 评论图同步失败 {comment_id}: {e}")
 
                 await session.commit()
                 return True
 
             # 找到评论所属的 story / chapter
-            content_id = str(_pick(item, ("note_id", "content_id")) or "")
             chapter = None
             if content_id:
                 chapter = (await session.execute(
@@ -823,7 +1658,7 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
             _c_text = str(item.get("content") or "")
             _c_sent = _judge_sentiment(item)
             _c_st = await _stance_detail_for(story_id, _c_text, _c_sent)
-            session.add(Comment(
+            comment = Comment(
                 story_id=story_id,
                 chapter_id=chapter_id,
                 source_site_id=site_id,
@@ -836,6 +1671,7 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 like_count=safe_int(item.get("like_count") or 0),
                 sub_count=safe_int(item.get("sub_comment_count") or 0),
                 publish_ts=safe_int(_pick(item, ("create_time", "publish_time")) or 0) or None,
+                ip_location=str(item.get("ip_location") or "") or None,
                 sentiment=_c_sent,
                 stance=_c_st.get("stance", "neutral"),
                 stance_tag_id=_c_st.get("tag_id"),
@@ -844,7 +1680,17 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 stance_judged_ver=_c_st.get("version"),
                 # parent 原始 ID 先落 ext，等父评论到达后由 backfill_comment_links 回填
                 ext={"parent_comment_id": str(item.get("parent_comment_id") or "")},
-            ))
+            )
+            session.add(comment)
+            await session.flush()  # 拿评论 id 供评论图登记
+            # 评论图片入库 + S3 备份（幂等；实时抓取会带回 pictures）
+            try:
+                await _sync_comment_media(session, comment.id,
+                                          item.get("pictures"), platform_code,
+                                          content_id, story_id)
+            except Exception as e:
+                utils.logger.warning(
+                    f"[v2_sync] 评论图同步失败 {comment_id}: {e}")
             await session.commit()
             return True
     except Exception as e:
@@ -868,10 +1714,15 @@ async def _ensure_orphan_story(session: AsyncSession, site_id: int,
 
 
 async def backfill_comment_links(platform_code: str) -> int:
-    """回填评论的 parent_id / root_id / depth。
+    """回填/重排评论的 parent_id / root_id / depth。
 
     实时同步时评论常常先于其父评论到达（父评论可能还没抓到），
     这里在抓完一批后统一修补。幂等，可反复执行。
+
+    重抓纠正：存量评论重抓后 ext.parent_comment_id 会被刷新为真实
+    target_comment（旧数据可能是扁平化的「全指向主评论」），这里把
+    挂接层级与 ext 对齐；父评论缺失（已删/未抓到）时保留旧挂接不动，
+    保证评论不会从楼中楼里消失。
     """
     try:
         async with _v2_session() as session:
@@ -880,47 +1731,42 @@ async def backfill_comment_links(platform_code: str) -> int:
             site_id = await _get_site_id(session, platform_code)
             if site_id is None:
                 return 0
-            # 只加载「待回填」的评论 + 被引用为父的评论，别把整表读进内存
-            pending = (await session.execute(
-                select(Comment).where(
-                    Comment.source_site_id == site_id,
-                    Comment.ext.isnot(None),
-                ).order_by(Comment.id)
+            # 全站评论源 id → 对象映射：父评论可能是无 ext 的存量行，必须都在映射里
+            comments = (await session.execute(
+                select(Comment).where(Comment.source_site_id == site_id)
             )).scalars().all()
-            pending = [c for c in pending if (c.ext or {}).get("parent_comment_id")]
+            by_src: Dict[str, Comment] = {
+                c.source_comment_id: c for c in comments if c.source_comment_id}
+            pending = [c for c in comments if (c.ext or {}).get("parent_comment_id")]
             if not pending:
                 return 0
 
-            parent_srcs = {(c.ext or {})["parent_comment_id"] for c in pending}
-            parents = (await session.execute(
-                select(Comment).where(
-                    Comment.source_site_id == site_id,
-                    Comment.source_comment_id.in_(parent_srcs),
-                )
-            )).scalars().all()
-            by_src = {p.source_comment_id: p for p in parents}
-
-            # 多轮收敛：父评论自己也可能待回填，一轮下来它的 depth 还是 0，
-            # 直接算会给子评论算错层级（多级嵌套尤其容易错）。
             updated = 0
-            for _round in range(5):
+            for _round in range(10):
                 batch = 0
                 for c in pending:
-                    if c.parent_id is not None:
+                    parent_src = str((c.ext or {}).get("parent_comment_id") or "")
+                    parent = by_src.get(parent_src)
+                    if parent is None or parent is c:
+                        # 父评论缺失：保留旧挂接，不破坏展示
                         continue
-                    parent_src = (c.ext or {}).get("parent_comment_id")
-                    parent = by_src.get(str(parent_src)) if parent_src else None
-                    if parent is None or (
-                        parent.parent_id is None and (parent.ext or {}).get("parent_comment_id")
-                    ):
-                        # 父自己也还待回填，等下一轮再定层级
+                    if parent.parent_id is None and (parent.ext or {}).get("parent_comment_id"):
+                        # 父自己也待回填，等下一轮定层级（多级嵌套收敛）
                         continue
-                    c.parent_id = parent.id
-                    c.root_id = parent.root_id or parent.id
-                    c.depth = int(parent.depth or 0) + 1
+                    new_parent = parent.id
+                    new_root = parent.root_id or parent.id
+                    new_depth = int(parent.depth or 0) + 1
+                    if (c.parent_id, c.root_id, c.depth) == (new_parent, new_root, new_depth):
+                        # 已对齐：清 ext 即完成（幂等）
+                        c.ext = {}
+                        batch += 1
+                        continue
+                    c.parent_id = new_parent
+                    c.root_id = new_root
+                    c.depth = new_depth
                     c.ext = {}      # 用完即清；ext 非空列，不能置 None
                     batch += 1
-                updated += batch
+                    updated += 1
                 if batch == 0:
                     break
             await session.commit()
@@ -974,13 +1820,20 @@ async def persist_to_v2(platform_code: str, item: Dict[str, Any], kind: str) -> 
     return ok
 
 
-async def mark_story_deleted(platform_code: str, content_id: str) -> bool:
-    """平台侧内容已被删除时，把本地 story 标记为 deleted。
+async def mark_story_status(platform_code: str, content_id: str, status: str) -> bool:
+    """平台侧内容状态变化时，把本地 story 标记为指定状态。
 
-    调用时机：爬虫重新抓取该内容时平台返回空（note 不存在/已删），
-    由平台 core 在拿到空结果后调用。标记后数据仍保留在库里可查，
-    前端会显示「已删除」徽标，而不是从列表里悄悄消失。
+    status 取值：
+      - "deleted"（已删除，平台 code -510000）：作者/平台删了笔记
+      - "hidden" （作者已隐藏，平台 code -510001）：笔记仅自己/粉丝可见
+
+    调用时机：爬虫重新抓取该内容时平台返回对应的错误码，由平台 core 在
+    捕获到 NoteNotFoundError / NoteHiddenError 后调用。标记后数据仍保留在
+    库里可查，前端会显示对应徽标（【原贴已删除】/【原贴已隐藏】），而不是
+    从列表里悄悄消失。status 已是目标值时不重复写（幂等）。
     """
+    if status not in ("deleted", "hidden"):
+        return False
     try:
         async with _v2_session() as session:
             if session is None:
@@ -998,13 +1851,20 @@ async def mark_story_deleted(platform_code: str, content_id: str) -> bool:
             story = (await session.execute(
                 select(Story).where(Story.id == chapter.story_id)
             )).scalar_one_or_none()
-            if story is None or story.status == "deleted":
+            if story is None or story.status == status:
                 return False
-            story.status = "deleted"
+            story.status = status
             await session.commit()
             utils.logger.info(
-                f"[v2_sync] 平台内容已删除，标记 story {story.id} ({platform_code}/{content_id})")
+                f"[v2_sync] 平台内容状态变化，标记 story {story.id} "
+                f"({platform_code}/{content_id}) → {status}")
             return True
     except Exception as e:
-        utils.logger.warning(f"[v2_sync] 标记删除失败 {platform_code}/{content_id}: {e}")
+        utils.logger.warning(
+            f"[v2_sync] 标记状态失败 {platform_code}/{content_id}={status}: {e}")
         return False
+
+
+async def mark_story_deleted(platform_code: str, content_id: str) -> bool:
+    """向后兼容封装：标记 story 为 deleted（旧调用方仍可用）。"""
+    return await mark_story_status(platform_code, content_id, "deleted")

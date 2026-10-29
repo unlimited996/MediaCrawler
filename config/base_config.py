@@ -163,6 +163,11 @@ ENABLE_GET_COMMENTS = True
 # 30 = 首页 + 一页翻页的典型量，请求数可控。需要更多可在配置面板/CLI 覆盖。
 CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 30
 
+# 评论完整率目标：已抓评论数 / 原帖显示评论量 达到该比例即视为「抓全了」，
+# 增量任务下次不再重抓；未达标则继续补抓（不再有「最多重试 N 次」的硬上限）。
+# 用途见 tools/v2_sync.get_archived_content_ids()。
+COMMENT_COMPLETENESS_TARGET = 0.9
+
 # Whether to enable the mode of crawling second-level comments. By default, crawling of second-level comments is not enabled.
 # If the old version of the project uses db, you need to refer to schema/tables.sql line 287 to add table fields.
 ENABLE_GET_SUB_COMMENTS = False
@@ -202,8 +207,10 @@ SCHEDULER_ENABLED = _env_bool("SCHEDULER_ENABLED", True)
 SCHEDULER_MAX_CONCURRENCY = _env_int("SCHEDULER_MAX_CONCURRENCY", 1)
 # 调度循环粒度（秒）：每个 tick 检查哪些任务到点
 SCHEDULER_TICK_SEC = _env_int("SCHEDULER_TICK_SEC", 15)
-# 到点时爬虫正忙：等待腾出抓取通道的最长时间（秒），超时记 skipped
-SCHEDULER_BUSY_WAIT_SEC = _env_int("SCHEDULER_BUSY_WAIT_SEC", 300)
+# 到点时爬虫正忙：等待腾出抓取通道的最长时间（秒），超时记 skipped。
+# 一次手动重抓（整帖+楼中楼）常要 15-25 分钟，300s 太短会让刚点的任务
+# 静悄悄被跳过，故默认放宽到 30 分钟；等待期间每 30s 打一条排队日志。
+SCHEDULER_BUSY_WAIT_SEC = _env_int("SCHEDULER_BUSY_WAIT_SEC", 1800)
 # 单次执行的运行记录保留条数（按任务）
 SCHEDULER_RUN_HISTORY = _env_int("SCHEDULER_RUN_HISTORY", 100)
 

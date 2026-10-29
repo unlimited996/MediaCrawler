@@ -91,6 +91,36 @@ class AccountPool:
             if engine:
                 await engine.dispose()
 
+    async def get_account(self, account_id: int) -> Optional[Dict[str, Any]]:
+        """按 ID 取账号（含解密后的 cookie），不存在返回 None。
+
+        与 pick() 的区别：pick 按健康度挑「某一个」；定时任务的「登录用户」
+        维度盯的是特定账号（可能同时扫码登录多个），必须按 ID 精确取。
+        """
+        from database.models_v2 import Account
+
+        engine, session = _engine_session()
+        if session is None:
+            return None
+        try:
+            row = (await session.execute(
+                select(Account).where(Account.id == int(account_id))
+            )).scalar_one_or_none()
+            if not row:
+                return None
+            return {
+                "id": row.id,
+                "account_name": row.account_name,
+                "cookie": decrypt_cookie(row.cookie_cipher or ""),
+                "profile_dir": row.profile_dir,
+                "health_score": row.health_score,
+                "status": row.status,
+            }
+        finally:
+            await session.close()
+            if engine:
+                await engine.dispose()
+
     async def report(self, account_id: int, ok: bool, risk_code: Optional[str] = None) -> None:
         """反馈结果：成功恢复健康度，失败降权 + 冷却，连续失败过多则禁用。"""
         from database.models_v2 import Account

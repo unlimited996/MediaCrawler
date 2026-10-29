@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import hashlib
 import random
 import time
 import uuid
@@ -242,6 +243,23 @@ def detect_fatal_target_error(*texts: Any) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# 任务维度
+#
+# 定时任务按「关注对象」分三个维度，前端按维度筛选、分维度创建：
+#   author  —— 关注的用户（盯作者主页，task_type=profile）
+#   note    —— 关注的帖子（盯单帖更新，task_type=note）
+#   account —— 扫码登录用户（盯其点赞/收藏的图文帖，task_type=account）
+# 同一对象反复关注只复用同一条任务（task_code 锚点），不会堆积。
+# ---------------------------------------------------------------------------
+
+DIMENSION_BY_TASK_TYPE = {
+    "profile": "author",
+    "note": "note",
+    "account": "account",
+}
+
+
 @asynccontextmanager
 async def _session():
     """调度器专用的 v2 库会话（与 tools/v2_sync 同一套 engine 缓存）。"""
@@ -279,6 +297,8 @@ class TaskScheduler:
     def __init__(self):
         self._states: Dict[int, _TaskState] = {}
         self._sem: Optional[asyncio.Semaphore] = None
+        #: 后台执行任务的强引用集合，防止 create_task 的结果被 GC 掉
+        self._bg_tasks: set = set()
         self._loop_task: Optional[asyncio.Task] = None
         self._stopping = False
         self.started = False
@@ -577,8 +597,27 @@ class TaskScheduler:
     # ---------- 执行 ----------
 
     async def trigger(self, task_id: int) -> Dict[str, Any]:
-        """手动触发一次（API 用）。"""
-        return await self._execute(task_id, trigger="manual")
+        """手动触发一次（API 用）。**立即返回，不等执行结束**。
+
+        一次抓取动辄几十分钟，若在这里同步 await 整轮执行，HTTP 请求会一直
+        挂到前端 axios 超时（30s）断开 —— 于是弹「触发失败」，但任务其实
+        还在后台跑得好好的，用户白白以为失败了（2026-10-29 修）。
+        改成和 tick 到点触发一致：后台 create_task，立刻给回执；
+        进度与结果看执行记录 / 日志面板。
+        """
+        state = self._states.get(task_id)
+        if state is None:
+            state = _TaskState()
+            self._states[task_id] = state
+        if state.lock.locked():
+            return {"status": "skipped", "reason": "already_running",
+                    "message": "该任务正在执行中，已跳过本次触发（幂等保护）"}
+        task = asyncio.create_task(self._execute(task_id, trigger="manual"))
+        # 保留强引用：asyncio 不会自动持有，裸 create_task 可能被 GC
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return {"status": "started",
+                "message": "已在后台开始执行，可在下方执行记录查看进度与结果"}
 
     async def _execute(self, task_id: int, trigger: str = "manual") -> Dict[str, Any]:
         from .profile_crawler import execute_task
@@ -616,8 +655,25 @@ class TaskScheduler:
                 # 并发闸口：多个任务同时到点时按 SCHEDULER_MAX_CONCURRENCY 放行
                 assert self._sem is not None
                 async with self._sem:
-                    # 登录态兜底：任务没存 cookie 就从账号池取
+                    # 登录态兜底：任务没存 cookie 就从账号池取。
+                    # 账号维度（account）必须按 target（账号池 ID）精确取——
+                    # 用户可能同时扫码登录多个账号，随便取一个会抓错人的
+                    # 点赞/收藏列表。
                     opts = dict(task_dict.get("options") or {})
+                    if not (opts.get("cookies") or "").strip():
+                        if task_dict.get("task_type") == "account":
+                            try:
+                                from account import AccountPool
+
+                                account_id = int(str(task_dict.get("target") or "").strip())
+                                account = await AccountPool().get_account(account_id)
+                                if account and account.get("cookie"):
+                                    opts["cookies"] = account["cookie"]
+                                    opts["login_type"] = "cookie"
+                                    if account.get("account_name"):
+                                        opts["account_name"] = account["account_name"]
+                            except Exception:
+                                pass
                     if not (opts.get("cookies") or "").strip():
                         try:
                             from .crawler_manager import crawler_manager
@@ -650,19 +706,39 @@ class TaskScheduler:
                         except Exception:
                             pass
 
+                    # 同平台 + 同登录态串行：前面还有任务没跑完就排队等。
+                    # 明确不做的事：不 kill、不 cancel、不停掉正在运行的任务 ——
+                    # 那个任务跑完释放执行权后，排队的才会开跑（2026-10-29）。
+                    queue_key = self._queue_key(task_dict)
+
                     # 反风控：任务真正发起前随机抖动 1-5s。
                     # 多个任务同时到点时错开起跑，固定节奏是风控识别特征
-                    await anti_risk.jitter_sleep(
-                        lo=float(getattr(config, "SCHEDULER_JITTER_MIN_SEC", 1) or 1),
-                        hi=float(getattr(config, "SCHEDULER_JITTER_MAX_SEC", 5) or 5),
-                        reason=f"任务「{task_dict.get('name') or task_id}」触发抖动")
+                    if await self._acquire_slot(queue_key, on_log=_on_log):
+                        try:
+                            await anti_risk.jitter_sleep(
+                                lo=float(getattr(config, "SCHEDULER_JITTER_MIN_SEC", 1) or 1),
+                                hi=float(getattr(config, "SCHEDULER_JITTER_MAX_SEC", 5) or 5),
+                                reason=f"任务「{task_dict.get('name') or task_id}」触发抖动")
 
-                    result = await execute_task(
-                        task_dict,
-                        busy_wait_sec=int(config.SCHEDULER_BUSY_WAIT_SEC),
-                        is_busy=self._channel_busy,
-                        on_log=_on_log,
-                    )
+                            result = await execute_task(
+                                task_dict,
+                                busy_wait_sec=int(config.SCHEDULER_BUSY_WAIT_SEC),
+                                is_busy=self._channel_busy,
+                                on_log=_on_log,
+                            )
+                        finally:
+                            # 无论成功/失败/超时都要还执行权，否则排队的永远卡住
+                            self._queue_lock(queue_key).release()
+                    else:
+                        # 排队超时：只放弃自己这一次，跑着的任务继续跑完
+                        from .profile_crawler import CrawlExecutionResult
+
+                        result = CrawlExecutionResult()
+                        result.status = "skipped"
+                        result.started_at = datetime.now()
+                        result.finished_at = datetime.now()
+                        result.error = "同账号任务排队超时，本次跳过（正在运行的任务未受影响）"
+                        _on_log(result.error, "warning")
 
                 summary = {
                     "status": result.status,
@@ -673,6 +749,8 @@ class TaskScheduler:
                     "error": result.error,
                     "run_id": run_id,
                     "duration_ms": result.duration_ms,
+                    # 细粒度统计（新增/更新帖子 + 完整率前后），落进 run.stats_json
+                    "stats": result.stats,
                 }
                 await self._finish_run(task_id, run_id, summary, result.log_tail or log_lines)
                 return summary
@@ -708,6 +786,11 @@ class TaskScheduler:
                         run.attempt_count = int(summary.get("attempts") or 1)
                         run.error_message = (summary.get("error") or "")[:500] or None
                         run.log_json = (log_tail or [])[-200:]
+                        # 本轮明细：新增/更新了哪些帖子、评论完整率前后对比。
+                        # 老运行记录没有这一列，前端对空值做了兜底。
+                        stats = summary.get("stats")
+                        if stats:
+                            run.stats_json = stats
                 if task is not None:
                     task.last_run_at = utc_now()
                     task.last_status = summary.get("status", "failed")
@@ -804,6 +887,79 @@ class TaskScheduler:
             "last_error": self.last_error,
         }
 
+    # ---------- 同账号串行 / 排队 ----------
+
+    #: 排队键 -> 互斥锁。同一个 key 的任务串行执行（先到的先拿到锁）。
+    #  2026-10-29：多个定时任务共用同平台 + 同登录态时，并发请求等于用同一个
+    #  账号同时打接口，是平台风控的典型特征。这里改成「排队」，明确**不**
+    #  kill / cancel / 停止正在运行的那个任务 —— 它跑完才会把锁让出来。
+    _QUEUE_KEYS: Dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _queue_key(task: Dict[str, Any]) -> str:
+        """按「平台 + 登录身份」算排队键。
+
+        账号维度直接看账号池 ID（target），同一账号就是同一个 token；
+        其余维度退化为 cookie 指纹；都没有则归到 anon。
+        """
+        platform = str(task.get("platform") or "unknown")
+        opts = task.get("options") or {}
+        identity = ""
+        if str(task.get("task_type") or "") == "account":
+            identity = f"acct:{str(task.get('target') or '').strip()}"
+        if not identity:
+            cookie = (opts.get("cookies") or "").strip()
+            if cookie:
+                identity = "ck:" + hashlib.md5(
+                    cookie.encode("utf-8")).hexdigest()[:12]
+        if not identity and opts.get("account_id"):
+            identity = f"acct:{opts['account_id']}"
+        return f"{platform}#{identity or 'anon'}"
+
+    def _queue_lock(self, key: str) -> asyncio.Lock:
+        lock = self._QUEUE_KEYS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._QUEUE_KEYS[key] = lock
+        return lock
+
+    async def _acquire_slot(self, key: str, on_log=None) -> bool:
+        """同 key 串行取执行权：前面还有任务在跑就**排队等待**。
+
+        返回 False 只表示「等太久这次不跑了」，正在运行的任务完全不受影响。
+        全程没有任何 stop / kill 动作。
+        """
+        lock = self._queue_lock(key)
+        if not lock.locked():
+            await lock.acquire()
+            return True
+
+        max_wait = int(getattr(config, "SCHEDULER_QUEUE_WAIT_SEC", 21600) or 21600)
+        started = time.monotonic()
+        last_note = 0.0
+        if on_log:
+            on_log(
+                f"同账号（{key}）已有任务在执行，进入排队等待"
+                f"（最长 {max_wait}s，不打断正在运行的任务）", "info")
+        while lock.locked():
+            waited = time.monotonic() - started
+            if waited >= max_wait:
+                if on_log:
+                    on_log(
+                        f"排队超过 {max_wait}s，本次触发放弃"
+                        f"（正在运行的任务继续跑完，不受影响）", "warning")
+                return False
+            if waited - last_note >= 60:
+                last_note = waited
+                if on_log:
+                    on_log(f"排队中…已等待 {int(waited)}s", "info")
+            await asyncio.sleep(1.0)
+        await lock.acquire()
+        waited = time.monotonic() - started
+        if on_log and waited >= 1:
+            on_log(f"排队结束，获得执行权（等待 {int(waited)}s），开始抓取", "info")
+        return True
+
     # ---------- 序列化 ----------
 
     @staticmethod
@@ -815,6 +971,7 @@ class TaskScheduler:
             "name": row.name,
             "platform": row.platform,
             "task_type": row.task_type,
+            "dimension": DIMENSION_BY_TASK_TYPE.get(row.task_type, row.task_type),
             "target": row.target,
             "mode": row.mode,
             "schedule_type": row.schedule_type,
@@ -853,6 +1010,7 @@ class TaskScheduler:
             "attempt_count": int(row.attempt_count or 1),
             "error_message": row.error_message,
             "log_tail": row.log_json or [],
+            "stats_json": row.stats_json,
         }
 
 

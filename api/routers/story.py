@@ -73,7 +73,9 @@ def _ensure_tag_maps() -> None:
 
 def _comment_public(c: Comment, author_name: Optional[str],
                      author_avatar: Optional[str] = None,
-                     author_url: Optional[str] = None) -> Dict[str, Any]:
+                     author_url: Optional[str] = None,
+                     pictures: Optional[List[Dict[str, Any]]] = None,
+                     reply_to: Optional[str] = None) -> Dict[str, Any]:
     _ensure_tag_maps()
     return {
         "id": c.id,
@@ -86,6 +88,12 @@ def _comment_public(c: Comment, author_name: Optional[str],
         "publish_ts": c.publish_ts,
         "depth": c.depth,
         "parent_id": c.parent_id,
+        "root_id": c.root_id,
+        # 对话目标：子评论回复的作者昵称（由后端按 parent_id 映射得出，
+        # 子评论之间互相回复时指向被回复的那条子评论作者，而非永远指向主评论作者）
+        "reply_to": reply_to or None,
+        # 评论 IP 属地（原站「IP属地：xx」），重抓带回时入库
+        "ip_location": c.ip_location or "",
         "sentiment": c.sentiment,
         "stance": c.stance,
         # 态度标签（P3）：徽标展示用，没判过的回落为空
@@ -94,7 +102,64 @@ def _comment_public(c: Comment, author_name: Optional[str],
         "stance_tag_color": TAG_COLOR_BY_CODE.get(c.stance_tag_code or ""),
         "stance_confidence": (float(c.stance_confidence)
                               if c.stance_confidence is not None else None),
+        # 评论配图（表情包 / 图片评论）：后端已解析成本地 / S3 / 远程 URL，
+        # 前端直接网格渲染。此前这个字段从未随评论下发，导致表情包看不到。
+        "pictures": pictures or [],
     }
+
+
+async def _load_comment_pictures(session, comment_ids: List[int]
+                                 ) -> Dict[int, List[Dict[str, Any]]]:
+    """批量取出评论配图（target_type='comment'）并解析成前端可直出的 URL。
+
+    返回 {comment_id: [{url, local_url, backup_url, source}]}。
+    URL 解析优先级（与帖子媒体一致）：本地副本 → S3 备份 → 平台远程外链。
+    本地副本走 /api/data/raw/{local_path}（绕 CDN 防盗链 + 签名过期 403）。
+    """
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    if not comment_ids:
+        return out
+    media_rows = (await session.execute(
+        select(MediaAttachment).where(
+            MediaAttachment.target_type == "comment",
+            MediaAttachment.target_id.in_(comment_ids),
+        ).order_by(MediaAttachment.target_id, MediaAttachment.sort_order)
+    )).scalars().all()
+    if not media_rows:
+        return out
+    media_ids = [m.id for m in media_rows]
+    backups = (await session.execute(
+        select(MediaBackup.media_id, MediaBackup.object_key).where(
+            MediaBackup.media_id.in_(media_ids))
+    )).all()
+    backup_map = {mid: key for mid, key in backups}
+    from tools.paths import DATA_DIR
+    for m in media_rows:
+        local_url = None
+        if m.local_path:
+            try:
+                rel = Path(m.local_path).relative_to(DATA_DIR).as_posix()
+            except Exception:
+                rel = str(m.local_path).replace("\\", "/")
+            local_url = f"/api/data/raw/{rel}"
+        backup_url = (f"/api/s3-backup/object/{backup_map[m.id]}"
+                      if m.id in backup_map else None)
+        resolved = local_url or backup_url or (m.source_url or None)
+        src = ("local" if local_url else
+               "backup" if backup_url else
+               "remote" if m.source_url else "none")
+        lst = out.setdefault(m.target_id, [])
+        # 去重保险：同一张图可能因重抓产生两条媒体记录（不同 CDN 签名 URL、
+        # 相同 local_path），按 local_url 跳过重复，避免前端重复渲染同一张图。
+        if local_url and any(e.get("local_url") == local_url for e in lst):
+            continue
+        lst.append({
+            "url": resolved,
+            "local_url": local_url,
+            "backup_url": backup_url,
+            "source": src,
+        })
+    return out
 
 
 @router.get("")
@@ -117,7 +182,7 @@ async def list_stories(
         return {"items": [], "total": 0, "page": page, "page_size": page_size,
                 "note": "配置库不可用"}
     try:
-        q = select(Story).where(Story.deleted_at.is_(None), Story.status.in_(("active", "deleted")))
+        q = select(Story).where(Story.deleted_at.is_(None), Story.status.in_(("active", "deleted", "hidden")))
 
         if platform:
             q = q.join(SourceSite, Story.primary_site_id == SourceSite.id).where(
@@ -304,10 +369,10 @@ async def list_authors(
         return {"items": [], "total": 0}
     try:
         q = (select(Author.id, Author.nickname, Author.avatar_url, Author.profile_url,
-                    func.count(Story.id).label("story_count"))
-             .join(Story, Story.author_id == Author.id)
-             .where(Story.deleted_at.is_(None),
-                    Story.status.in_(("active", "deleted"))))
+                func.count(Story.id).label("story_count"))
+         .join(Story, Story.author_id == Author.id)
+         .where(Story.deleted_at.is_(None),
+                Story.status.in_(("active", "deleted", "hidden"))))
         if platform:
             q = q.where(Story.primary_site_id.in_(
                 select(SourceSite.id).where(SourceSite.code == platform)))
@@ -628,13 +693,25 @@ async def get_story_comments(
             urls = {r[0]: r[3] for r in rows if r[3]}
 
         subs_by_root: Dict[int, List[Dict[str, Any]]] = {}
+        all_ids = list(main_ids) + [s.id for s in subs]
+        pics = await _load_comment_pictures(session, all_ids)
+        # 对话目标：按 parent_id 映射出被回复作者的昵称（子评论互回也正确指向，
+        # 而非永远指向主评论作者）
+        id2author = {c.id: names.get(c.author_id) for c in mains + subs}
+
+        def _pub(c: Comment) -> Dict[str, Any]:
+            # 与原站一致：只有回复其他子评论（parent != root）才标对话目标；
+            # 直接回复主评论的不显示「回复 @」前缀
+            rt = id2author.get(c.parent_id) if (c.parent_id and c.parent_id != c.root_id) else None
+            return _comment_public(c, names.get(c.author_id), avatars.get(c.author_id),
+                                   urls.get(c.author_id), pics.get(c.id), reply_to=rt)
+
         for s in subs:
-            subs_by_root.setdefault(s.root_id, []).append(
-                _comment_public(s, names.get(s.author_id), avatars.get(s.author_id), urls.get(s.author_id)))
+            subs_by_root.setdefault(s.root_id, []).append(_pub(s))
 
         items = []
         for m in mains:
-            payload = _comment_public(m, names.get(m.author_id), avatars.get(m.author_id), urls.get(m.author_id))
+            payload = _pub(m)
             subs = subs_by_root.get(m.id, [])
             payload["reply_count"] = len(subs)
             payload["replies"] = subs if (reply_limit <= 0 or reply_limit >= len(subs)) else subs[:reply_limit]
@@ -671,7 +748,15 @@ async def get_comment_replies(
             .offset((page - 1) * page_size).limit(page_size)
         )).scalars().all()
 
+        # 主评论（根）也参与作者解析：顶层子评论回复主评论时，reply_to 指向主评论作者
+        root = (await session.execute(
+            select(Comment).where(Comment.id == comment_id,
+                                  Comment.deleted_at.is_(None))
+        )).scalar_one_or_none()
+
         author_ids = {c.author_id for c in subs if c.author_id}
+        if root and root.author_id:
+            author_ids.add(root.author_id)
         names: Dict[int, str] = {}
         avatars: Dict[int, str] = {}
         urls: Dict[int, str] = {}
@@ -684,7 +769,17 @@ async def get_comment_replies(
             avatars = {r[0]: r[2] for r in rows if r[2]}
             urls = {r[0]: r[3] for r in rows if r[3]}
 
-        items = [_comment_public(s, names.get(s.author_id), avatars.get(s.author_id), urls.get(s.author_id))
+        pics = await _load_comment_pictures(session, [s.id for s in subs])
+        # 对话目标昵称：按 parent_id 映射（根 + 全部子评论都在映射内）。
+        # 与原站一致：只有回复其他子评论（parent != root）才返回 reply_to，
+        # 直接回复主评论的不显示「回复 @」前缀
+        id2author: Dict[int, Optional[str]] = {s.id: names.get(s.author_id) for s in subs}
+        if root:
+            id2author[root.id] = names.get(root.author_id)
+        items = [_comment_public(s, names.get(s.author_id), avatars.get(s.author_id),
+                                urls.get(s.author_id), pics.get(s.id),
+                                reply_to=id2author.get(s.parent_id)
+                                if (s.parent_id and s.parent_id != s.root_id) else None)
                  for s in subs]
         return {"items": items, "total": total, "page": page, "page_size": page_size}
     finally:
@@ -732,18 +827,76 @@ async def stats_overview():
         await engine.dispose()
 
 
-@router.get("/tags/list")
-async def list_tags(limit: int = Query(50, ge=1, le=200)):
+@router.post("/{story_id}/tags")
+async def add_story_tag(story_id: int,
+                        name: str = Query(..., min_length=1, max_length=128)):
+    """给帖子加一个自定义标签（详情页标签栏的「+」入口）。
+
+    标签按名字全局复用（tag_type=custom、source_site_id 为空表示自建），
+    已存在就只补关联，重复点击不会建出重复标签。
+    """
+    tag_name = name.strip()
+    if not tag_name:
+        raise HTTPException(status_code=400, detail="标签名不能为空")
     engine, session = await _session()
     if session is None:
-        return {"items": []}
+        raise HTTPException(status_code=503, detail="数据库不可用")
     try:
+        story = await session.get(Story, story_id)
+        if story is None:
+            raise HTTPException(status_code=404, detail="内容不存在")
+        tag = (await session.execute(
+            select(Tag).where(Tag.name == tag_name, Tag.source_site_id.is_(None))
+        )).scalars().first()
+        if tag is None:
+            tag = Tag(name=tag_name, tag_type="custom")
+            session.add(tag)
+            await session.flush()
+        linked = (await session.execute(
+            select(StoryTag).where(StoryTag.story_id == story_id,
+                                   StoryTag.tag_id == tag.id)
+        )).scalar_one_or_none()
+        if linked is None:
+            session.add(StoryTag(story_id=story_id, tag_id=tag.id))
+        await session.commit()
+        return {"status": "ok", "name": tag_name, "tag_id": int(tag.id)}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/tags/list")
+async def list_tags(limit: int = Query(50, ge=1, le=500),
+                    offset: int = Query(0, ge=0),
+                    q: Optional[str] = Query(None, description="标签名模糊搜索")):
+    """标签候选：支持分页（懒加载）+ 关键词搜索。
+
+    原先固定按热度取前 50 条且没返回总数，下拉里只能看到一小部分标签，
+    也没法滚到底继续加载（2026-10-29）。返回 total 供前端判断还有没有更多。
+    """
+    engine, session = await _session()
+    if session is None:
+        return {"items": [], "total": 0, "offset": offset, "limit": limit}
+    try:
+        base = select(Tag.name, func.count(StoryTag.story_id)).join(
+            StoryTag, StoryTag.tag_id == Tag.id).group_by(Tag.name)
+        if q:
+            base = base.where(Tag.name.ilike(f"%{q.strip()}%"))
         rows = (await session.execute(
-            select(Tag.name, func.count(StoryTag.story_id))
-            .join(StoryTag, StoryTag.tag_id == Tag.id)
-            .group_by(Tag.name).order_by(func.count(StoryTag.story_id).desc()).limit(limit)
+            base.order_by(func.count(StoryTag.story_id).desc())
+            .offset(offset).limit(limit)
         )).all()
-        return {"items": [{"name": n, "count": c} for n, c in rows]}
+        # 总数是「去重后的标签个数」，与上面 group_by 口径一致
+        total_stmt = select(func.count(func.distinct(Tag.name)))
+        if q:
+            total_stmt = total_stmt.where(Tag.name.ilike(f"%{q.strip()}%"))
+        total = (await session.execute(total_stmt)).scalar() or 0
+        return {
+            "items": [{"name": n, "count": c} for n, c in rows],
+            "total": int(total),
+            "offset": offset,
+            "limit": limit,
+        }
     finally:
         await session.close()
         await engine.dispose()

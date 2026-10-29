@@ -1,7 +1,7 @@
 import axios from 'axios'
 import type { QueueList, QueueAddPayload } from '@/types/crawler'
 import type { ScheduledTask, ScheduledTaskRun, SchedulerStatus,
-              ScheduledTaskPayload } from '@/types/scheduler'
+              ScheduledTaskPayload, SchedulerDimensions } from '@/types/scheduler'
 
 const api = axios.create({
   baseURL: '/api',
@@ -304,8 +304,12 @@ export const storyApi = {
   commentReplies: (id: number, commentId: number, page = 1, page_size = 500) =>
     api.get<{ items: any[]; total: number; page: number; page_size: number }>(
       `/stories/${id}/comments/${commentId}/replies`, { params: { page, page_size } }),
-  tags: (limit = 50) =>
-    api.get<{ items: { name: string; count: number }[] }>('/stories/tags/list', { params: { limit } }),
+  addStoryTag: (storyId: number, name: string) =>
+    api.post<{ status: string; name: string; tag_id: number }>(
+      `/stories/${storyId}/tags`, null, { params: { name } }).then((r) => r.data),
+  tags: (params: { limit?: number; offset?: number; q?: string } = {}) =>
+    api.get<{ items: { name: string; count: number }[]; total: number }>(
+      '/stories/tags/list', { params }),
   stats: () => api.get<Record<string, any>>('/stories/stats/overview'),
   /** 关注状态：【关注此贴】(note) / 【关注此人】(author) */
   watch: (id: number) =>
@@ -357,6 +361,7 @@ export default api
 // ---------------- 定时拉取任务 ----------------
 export const schedulerApi = {
   status: () => api.get<SchedulerStatus>('/scheduler/status'),
+  dimensions: () => api.get<SchedulerDimensions>('/scheduler/dimensions'),
   listTasks: () => api.get<ScheduledTask[]>('/scheduler/tasks'),
   getTask: (id: number) => api.get<ScheduledTask>(`/scheduler/tasks/${id}`),
   createTask: (payload: ScheduledTaskPayload) =>

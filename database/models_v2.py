@@ -177,6 +177,8 @@ class Comment(BaseV2, TimestampMixin, SoftDeleteMixin):
     like_count = Column(BigInteger, nullable=False, server_default="0")
     sub_count = Column(Integer, nullable=False, server_default="0")
     publish_ts = Column(BigInteger)
+    # 评论 IP 属地（原站「IP属地：xx」）。重抓时由 store 层从评论原始 JSON 提取。
+    ip_location = Column(String(64))
 
     sentiment = Column(String(16))                # AI 分析产物
     # 立场：相对发帖人核心观点的 agree / neutral / oppose（内容赞同度指标）
@@ -608,6 +610,10 @@ class ScheduledTaskRun(BaseV2):
     attempt_count = Column(Integer, nullable=False, server_default="1")   # 实际尝试次数（含重试）
     error_message = Column(Text)
     log_json = Column(JsonType)                                            # 最近若干行子进程日志
+    # 本次运行的细粒度统计：新增/更新了哪些帖子 + 补抓前后的评论完整率。
+    # 只靠 new_count/updated_count 三个数字说不清「刷了谁、补了多少」，
+    # 前端执行记录下拉据此展示明细。
+    stats_json = Column(JsonType)
 
     __table_args__ = (
         Index("idx_run_task_started", "task_id", "started_at"),

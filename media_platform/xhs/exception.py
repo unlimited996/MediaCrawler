@@ -34,4 +34,15 @@ class PlatformAccessError(RequestError):
 
 
 class NoteNotFoundError(RequestError):
-    """Note does not exist or is abnormal"""
+    """Note does not exist (deleted): code -510000"""
+
+
+class NoteHiddenError(RequestError):
+    """Note is hidden by the author (only visible to author / abnormal): code -510001"""
+
+
+class CaptchaError(RequestError):
+    """触发了平台验证码（HTTP 461 / 471）——继续重试只会加重风控。
+
+    拿到这个异常就该立刻收手（并在上层熔断剩余任务），等冷却或人工过验证码。
+    """

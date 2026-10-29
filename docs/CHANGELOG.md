@@ -5,6 +5,542 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-29] 统一「本次抓取上限」：补抓与新帖共用一个上限
+
+### 变更：删除冗余的 XHS_COMMENT_BACKFILL_MAX_NOTES，补抓篇数上限并入「本次抓取上限」
+- 背景：UI「本次抓取上限」(任务选项 `max_notes`) 落到爬虫侧是 `XHS_BEHAVIOR_MAX_NOTES`
+  （默认 100，管新帖）；而评论补抓另有一个独立变量 `XHS_COMMENT_BACKFILL_MAX_NOTES`
+  （默认 20，管待补老帖）。两者各算各的 —— 任务不填 `max_notes` 时，补抓回落到 20，
+  于是出现「上限设了 100、一轮却只补 20 篇就停」的歧义（这正是 run#96/98 只更新
+  十几篇的原因）。
+- 做法：删除 `XHS_COMMENT_BACKFILL_MAX_NOTES`，`config/xhs_config.py` 与
+  `media_platform/xhs/core.py` 的 `get_archived_content_ids` 调用统一改用
+  `XHS_BEHAVIOR_MAX_NOTES`；`api/services/profile_crawler.py::build_crawler_env`
+  只在 `max_notes` 有值时设置 `XHS_BEHAVIOR_MAX_NOTES`（不再单独设补抓额度）。
+- 保留 `XHS_COMMENT_BACKFILL_MAX_COMMENTS`（评论「条数」总预算，默认 3000）作为
+  防马拉松会话的第二道闸 —— 它与「篇数上限」是不同维度，不归到「本次抓取上限」字段。
+
+### 验证
+- `py_compile` 三个改动文件通过；全仓已无 `XHS_COMMENT_BACKFILL_MAX_NOTES` 代码引用
+  （仅历史 CHANGELOG / 注释保留）。
+
+## [2026-10-29] 评论抓取支持「断点续抓」
+
+### 新增：评论分页进度持久化与断点续抓
+背景：抓取大量帖子时按评论量由少到多排序，评论量大的帖子（动辄数万条）单次会话
+可能持续数小时，一旦被中断（风控熔断 / 子进程被杀 / 手动停止），下一次执行会从头
+重翻该帖全部评论 —— 既浪费额度又拉长会话、更易触发风控。
+
+- DB 不新增表：续抓进度复用 `story_chapter.ext["comment_resume"]`，结构
+  `{top_cursor, top_count, sub_cursors, reached_end, updated_at}`，幂等可回退。
+- `tools/v2_sync`：
+  - `get_comment_resume / save_comment_resume / clear_comment_resume`
+    —— 读写/清除续抓进度（查不到/写失败都静默降级，不影响主流程）。
+- `media_platform/xhs/client.py`：
+  - `get_note_all_comments` 新增 `start_cursor / top_count_in / sub_cursors /
+    progress_callback` 参数：从「上次中断处」继续，而非重头翻；每翻完一页调一次
+    `progress_callback` 持久化，翻到 `has_more=False` 时标记 `reached_end`。
+  - 抽出 `_fetch_sub_pages`（单根楼中楼翻页），`get_comments_all_sub_comments`
+    改为返回 `(评论列表, open_sub)`，`open_sub` 记录「没翻完的根评论游标」供续抓
+    收尾；支持 `start_sub_cursors` 从指定游标续抓楼中楼。
+- `media_platform/xhs/core.py`：
+  - `get_comments` 抓取前读 `get_comment_resume` 作为续抓起点；抓取中经
+    `progress_callback` 持久化；`reached_end` 时 `clear_comment_resume`（抓全），
+    风控熔断/异常中断时不清除（保留最近一页游标）。评论按 `source_comment_id`
+    upsert，中断重翻同页不产生重复数据。
+
+### 测试
+- 新增 `tests/test_xhs_comment_resume.py`：①顶层评论多轮中断（每轮 2 页）累计抓全
+  120 条、不重复不漏、不重头翻；②楼中楼续抓原语（中断返回最后有效游标、续抓收尾
+  无重复）；③续抓进度助手读写 `ext` 正确。
+- 同步修正 `test_xhs_risk_circuit.py` 两个 fake client 的 `get_note_all_comments`
+  签名（兼容新增 kwargs）。
+
+### 验证
+- `test_xhs_comment_resume.py` / `test_xhs_comment_completeness.py` 20 项全过；
+  `test_xhs_risk_circuit.py` 3 项全过。
+
+## [2026-10-29] 执行记录展示统计明细 + 修复「抓取上限形同虚设」
+
+### 修复：抓取上限设了 100，却只更新 20 篇就停
+- 两条额度互不相干：任务选项 `max_notes` 只注入 `XHS_BEHAVIOR_MAX_NOTES`
+  （**新帖**额度），而控制「已入库但评论未补齐的老帖每轮补多少」的
+  `XHS_COMMENT_BACKFILL_MAX_NOTES` 一直取配置默认值 **20**，不受任务选项约束。
+- 结果：本轮没有真正的新帖时，唯一有活干的就是补抓通道，而它一轮最多 20 篇 →
+  现象就是「上限设了 100，更新 20 篇就结束」。
+- `build_crawler_env`：任务选项 `max_notes` 现在**同时**注入补抓预算，
+  「抓取上限」才名副其实。
+
+### 新增：执行记录下拉显示「新增/更新了哪些帖子 + 前后补齐率」
+- DB：`scheduled_task_run.stats_json`（JSONB），走 `init_v2.ADD_COLUMN_SQL`
+  幂等补列，老记录为 NULL、前端有空值兜底。
+- `tools/v2_sync`：
+  - `get_completeness_snapshot(platform)` —— 抓取**前**拍完整率快照。
+    必须在起子进程之前调用，抓完会被 `refresh_comment_completeness()` 覆盖。
+  - `get_run_crawl_detail(platform, start, end, before_map)` —— 按同一套
+    `crawled_at` 执行窗归因，返回 added / updated 明细，含 before/after 的
+    fetched/declared/completeness 与本轮实际补进条数 `gained`。
+- `api/services/profile_crawler.py`：`CrawlExecutionResult.stats`，
+  `_run_once` 前拍快照、后算明细（统计失败不阻断主流程）。
+- `api/services/task_scheduler.py`：summary 透传 → `_finish_run` 落
+  `run.stats_json` → `_run_dict` 下发；`ScheduledTaskRunOut` 补
+  `stats_json` 字段（否则 Pydantic response_model 会把新字段过滤掉）。
+- 前端：展开 run 后先显示统计区（新增/刷新分组、每行 `ID 前%→后%
+  fetched 前→后/声明 +N 标题`），超过 50 行折叠计数，再显示原运行日志。
+
+### 验证
+- 真库：快照 243 篇；run 94 窗口 added 0 / **updated 18**，与记录的
+  `updated_count=18` 完全一致；run 90 窗口 added 81，新增帖归因正确（0% 起算）。
+- 接口：`/api/scheduler/runs` 已下发 `stats_json`（历史记录为 null）。
+- 前端 `tsc -b && vite build` 通过；xhs 相关 + api 限制测试 39 项全过。
+
+## [2026-10-28·续5] 修复增量补抓「评论为空的帖子永远轮不到」
+
+### 根因（run 94：12:08–12:49，点赞账户任务，success / upd=18 / new=0）
+- 增量补抓用 `plan_backfill` 按「差多少（gap）升序」挑每轮要重抓的帖子，
+  **评论为 0 的帖子缺口最大（gap=声明数），永远排在队列最底部**。
+- 只要还有任何「差几条就满」的帖子占着每轮 20 个名额，那 196 篇评论为空的
+  帖子（尤其你看得见的大帖 8989/7510/1735 条评论）就**永远顺延、饿死**。
+- 实测：run 94 重抓的 18 篇全是 gap 极小的「快满了」的帖子（55/78/2/14/53…），
+  评论为空的帖子 0 篇被补 → 现象就是「只刷了 18 条、没有新增数据、空评论帖没动」。
+
+### 修复（`tools/v2_sync.py::plan_backfill`）
+- 优先级铁律：**评论为 0（fetched=0）的帖子最优先**，其余再按 gap 升序。
+- 同档内按声明数升序（小帖先补、快速出成果）；大帖（声明几千条）自然排在同档
+  末尾，待小帖清空后轮到 —— 不再被「快满的帖子」无限压在底部饿死。
+- 验证：`get_archived_content_ids` 在 `backfill_limit=20 / maxc=3000` 下，
+  `selected` 现已 **20 篇全为评论为 0**（修复前只有 17 篇、且混排 3 篇快满帖）。
+- 测试：`test_xhs_comment_completeness.py` 修正旧断言 + 新增
+  `test_backfill_comment_empty_first`，15 项全过。
+
+### 提示
+- 每轮仍只补 `XHS_COMMENT_BACKFILL_MAX_NOTES`（默认 20）篇，想一次多补几篇
+  把该值调大即可（注意配合 `timeout_sec` 与风控预算）。
+- 爬虫是调度器现起子进程、每次运行重新 import，改完无需重启后端。
+
+## [2026-10-28·续4] 风控放大器根治：被 461 后不再狂打接口、UA 指纹自洽
+
+### 根因（run 92 / 08:41–09:06，点赞账户任务）
+- 列表 + 详情阶段前 24 分钟正常，`new_count=2`；09:05:58 起瞬间爆发
+  几百条 `461 CAPTCHA（Verifytype 217）`，每秒 10+ 条，把账号彻底锁死。
+- 真正放大器：**详情阶段被风控后，每篇帖子仍级联发 4 个接口**
+  （feed → html+cookie → html-cookie → SSR），且**失败路径零间隔**，
+  加上 `RISK_FAIL_LIMIT=3` 允许风控状态下继续撞 3 篇才停 → 几十篇帖子
+  在数秒内连发几百个 461。
+- 叠加指纹矛盾：API 请求头 `user-agent=Mac/Chrome137` 但
+  `sec-ch-ua=136` 且 `sec-ch-ua-platform=Windows`，三重不一致，强风控指纹。
+- 评论图下载每张图独立 client 且零间隔，是抓取期另一个隐藏密度源。
+
+### 变更 / 修复
+- **461/471 验证码（CaptchaError）= 账号级风控，首次命中即熔断整批**
+  （新增 `_abort(reason, exc_type)`，验证码分支首次即停；403/429/IP 限流等
+  非验证码仍走连续 `RISK_FAIL_LIMIT` 次才熔断，避免偶发单条误杀整批）。
+- **兜底通道（html / html-nocookie / SSR）每个都捕获风控并立即熔断**，
+  不再级联发请求；只有「非风控」的空结果 / token 过期才走兜底。
+- **失败路径也加退避**（`xhs_sleep` 详情失败间隔），避免零间隔紧挨着打下一帖。
+- **UA 指纹自洽**：统一为 `Windows NT 10.0 + Chrome/137`，且 `sec-ch-ua`
+  版本号从 136 改成 137，与 UA、platform 三者一致（评论图下载 UA 已同款）。
+- **评论图下载降密度**：复用单个 `httpx.AsyncClient`，每张图之间加
+  `0.3–1.2s` 随机间隔（`tools/v2_sync._download_comment_image` /
+  `_sync_comment_media`）。
+- 测试 `test_xhs_risk_circuit.py` 重写以匹配新语义：验证码首次即停
+  （calls==1）、非验证码连续失败才熔断、成功后清零 streak。
+
+### 验证
+- xhs 四套测试 26 项全绿；后端 8081 已重启加载新代码。
+- 注意：账号当前仍在验证码风控冷却期，跑之前先在浏览器过验证码或等 1–2
+  小时冷却，任务上限先设小（20–30）。
+
+## [2026-10-28·续3] 评论抓够与否改为「完整率」判据，删掉拍脑袋的重试次数
+
+### 变更
+- **删掉「零评论帖最多重试 3 次」的硬上限**（`story.ext.comment_retry_count`
+  与 `incomplete_retry_limit` 一并移除）。这个数字跟帖子到底抓没抓全毫无
+  关系：撞风控的帖子 3 轮后照样被当成已归档，评论永远补不上；真·零评论的
+  帖子则白跑 3 轮。
+- **新的唯一判据**：`已抓评论数 / 原帖显示评论量 >= 90%`
+  （`tools/v2_sync.is_comment_complete` / `COMMENT_COMPLETENESS_TARGET`，
+  可在 `config/base_config.py` 调整）。未达标的帖子会一直留在待补池，
+  每轮增量自动继续补，没有次数上限；声明数为 0/缺失视为无评论需求，直接
+  算完整。
+- 单篇抓取上限改为按声明数推算（`XHS_COMMENT_MAX_PER_NOTE=0` 不限制，
+  `_comment_max_count`），不再统一吃全局 `CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES=30`
+  —— 声明 800 条只抓 30 条，完整率 3.7%，却被增量当成已归档。
+- `story_chapter.declared_comment_count` 在内容更新的分支也会刷新（原先
+  只在建行时写一次）。
+- 新增 `refresh_comment_completeness()`：每次抓完评论把
+  `fetched_comment_count` / `completeness` 写回章节表（这两个字段此前只有
+  一次性迁移脚本写过，其余时间一直是空的）。
+- 每轮补抓有工作量预算（`XHS_COMMENT_BACKFILL_MAX_NOTES=20` 篇 /
+  `XHS_COMMENT_BACKFILL_MAX_COMMENTS=3000` 条），差得少的优先补，超预算的
+  顺延下一轮。**这不是重试次数**：顺延的帖子仍未达标，下轮照样进候选池。
+
+### 修复
+- `client.get_note_all_comments`：`max_count` 改为约束**一级评论**条数
+  （原先用 `len(result)` 混算子评论，子评论多的帖子主评论只抓到几条就判
+  「够了」）；`max_count<=0` 表示翻到 `has_more=False`。
+- `get_comments` 打印每篇的「原帖显示 N 条 → 本次最多抓 M 条」，跑完
+  `get_note_all_comments` 打印「一级评论 X 条 / 含子评论 Y 条」，便于核对
+  完整率。
+
+### 验证
+- 新增 `tests/test_xhs_comment_completeness.py`（14 项）：90% 阈值边界、
+  风控零评论必须继续重抓、声明数为 0 视为完整、单篇上限跟随声明数、
+  子评论不占额度、补抓预算切片（篇数 / 条数 / 不死锁）。
+- 真实库跑通：128 篇里 11 篇达标、117 篇未达标（多为上一轮风控留下的
+  0% 帖）；按本轮预算只挑 20 篇补、97 篇顺延。
+- 回归：`test_xhs_behavior_paging` / `test_xhs_risk_circuit` / `test_api_limits`
+  全绿（顺手修了 `test_api_limits` 里 mock 仍返回 `True` 的旧契约）。
+
+## [2026-10-28·续2] 点赞帖「只入库正文、没有评论」根因修复（并发 + 风控熔断）
+
+### 现象
+07:09 那轮点赞任务抓回 100 篇帖子（正文/图片正常），但**评论一条都没有**
+（平台声明合计 28 万条）；任务却仍报 **success**。
+
+### 根因
+1. **详情请求并发失控**：`get_account_behavior_notes` 给每篇详情都
+   `asyncio.Semaphore(_xhs_concurrency())` new 一个信号量 —— 100 篇等于
+   同时并发 100 个请求，秒级打爆风控。改为**整批共用**一个信号量。
+2. **触发验证码后还继续加码**：461/471 原本抛裸 `Exception`，被 tenacity
+   重试 3 次 → 每篇 3 次请求 × 100 篇 = 300 次无效请求；
+   `get_comments` 对每篇只记一条 warning 后继续，从不熔断。
+3. **失败被吞**：一条笔记评论失败不影响退出码，任务显示 success，
+   用户只能自己猜「是没评论还是被风控」。
+
+### 修复
+- 新增 `media_platform/xhs/exception.py::CaptchaError`（461/471 专用，
+  不重试）；验证码响应头缺失时不再抛 KeyError。
+- `get_comments`：CaptchaError / IPBlockError / PlatformAccessError 分别
+  记录真实原因（RetryError 会解出 `last_attempt` 的根因），连续
+  `RISK_FAIL_LIMIT`(3) 次即**熔断整批评论**，剩余笔记不再发请求。
+- 熔断时打印 `[MEDIACRAWLER_RISK_ABORT]`；`profile_crawler` 扫到该标记
+  就把运行记录标为 **failed**（附原文），而不是 success。
+- 详情请求整批共用一个并发闸门。
+
+### 连带修复：增量把「零评论」帖永久跳过
+风控中断后那 100 篇被判为「已归档」，下次增量会永远跳过、评论再无机会补。
+`get_archived_content_ids` 现在把**零评论的帖子视为未归档**
+（→ 2026-10-28·续3 已把这段「重试 3 次」改成按评论完整率判定）。
+
+### 验证
+- `tests/test_xhs_risk_circuit.py`：20 篇全撞验证码时只尝试 3 次即熔断；
+  前 2 篇失败后成功则清零计数、不误熔断。
+- 实测改完后 `CaptchaError` 能直接暴露「HTTP 461 Verifytype 217」，
+  不再是一句无信息的 RetryError。
+
+### 续（同日 07:5x）——上一节改动引入的回归，已修
+`CaptchaError` 改成「不重试」后，**详情页那段 `except RetryError: pass`
+就抓不到它了**，异常从 `get_note_detail_async_task` 直接冒出去，把
+`asyncio.gather` 打崩 → 整个爬虫进程挂掉（实测 07:45 的 traceback）。
+
+- `get_note_detail_async_task`：补 catch `CaptchaError / IPBlockError /
+  PlatformAccessError`，计入风控连续失败并熔断，返回 None。
+- `get_account_behavior_notes`：**身份检查和列表阶段**就撞验证码时立刻
+  收手（原先会先翻 25 页列表、再抓 100 篇详情，白打几百个请求），
+  两处都打印 `[MEDIACRAWLER_RISK_ABORT]`。
+- `batch_get_note_comments`：详情已熔断时不再起评论请求。
+- 列表翻页间隔由 client 默认的 **1s/页**改为小红书统一的 5-15s 随机
+  （点赞列表要翻几十页，1s 一页太急）。
+- 新增回归用例 `test_captcha_in_detail_task_does_not_crash`：详情接口抛
+  CaptchaError 时 `asyncio.gather` 必须正常返回 `[None]*5` 而不是崩溃。
+
+## [2026-10-28·续] 点赞/收藏列表抓取补完（额度截断 + 增量 + 翻页收敛）
+
+### 修复
+- **点赞列表只抓到 20 条就停、收藏一条不抓**（真根因：额度用错）。
+  `get_all_behavior_notes` 用全局 `len(result) < CRAWLER_MAX_NOTES_COUNT`
+  （默认 **15**，本意是「单博主最多抓几条」）做翻页条件：
+  - 点赞 10 条/页，2 页就到 20 条 → 点赞被截断（实测本号 **495 条**点赞）；
+  - 点赞一旦超过 15 条，收藏的 while 条件直接为假 → **收藏一条都不抓**。
+  改为「每个行为独立计额度 + 调用方喊停」：
+  - 列表本身翻到 `has_more=False` 为止（跨过的老帖不消耗额度）；
+  - 新增 `config.XHS_BEHAVIOR_MAX_NOTES`（默认 **100 条/行为**，任务选项
+    `max_notes` 可覆盖），只对「本次要抓的新帖」计额度；
+  - 回调支持 `return False` 叫停翻页，不再靠调小上限实现（那样会永远卡在
+    最前面几页、翻不到后面的新内容）。
+- **account 模式的收藏列表即使有数据也不抓**：同上，额度独立后
+  `likes,collects` 两个行为都会跑完。
+- **楼中楼单条主评论翻 40+ 页空转**：`get_comments_all_sub_comments` 里
+  `has_more` 恒为 true、游标一直在漂、整页都是重复评论时会一直翻下去
+  （每页 8-15s，实测把任务拖成几十分钟）。现在「整页均为重复评论」即收尾。
+
+### 新增
+- **account 模式增量抓取**（`XHS_BEHAVIOR_INCREMENTAL`，默认开）：
+  `tools/v2_sync.get_archived_content_ids()` 取库内已归档帖子 ID，
+  已归档的跳过详情+评论，只补新点赞；`mode=full` 或环境变量设 0 时全量重抓。
+  495 条点赞全量重抓评论要十几小时，日常备份任务按增量跑才有可行性。
+- 点赞/收藏接口补上与网页端一致的 `xsec_token` / `xsec_source`（空值）参数。
+
+### 验证
+- 新增回归测试 `tests/test_xhs_behavior_paging.py`（造 495 条点赞 + 37 条收藏，
+  不连网不连库）：全量模式 495/37（旧实现 20/**0**）；每行为额度 25 各自生效；
+  「前 200 条已归档 + 额度 30」时能跳过老帖继续翻到第 21 页之后；游标不前进即停。
+- 真实账号实跑（额度 2）：点赞第 3 页凑够额度叫停、收藏正常抓到 8 条，
+  跳过视频 19 篇 / 跳过已归档 7 篇 / 待抓图文 4 篇（2+2，按行为独立）。
+
+## [2026-10-28] 点赞/收藏任务拉不到数据根因修复 + 楼中楼回复对象顺序
+
+### 修复
+- **account 维度「拉取我的点赞/收藏」永远为空**（根因：用错了 user_id）。
+  `XiaoHongShuClient.get_self_user_id()` 原先跳过 `/user/me`，直接落到
+  `you/mentions` 兜底，而 mentions 里的 `item_info.user_info.userid` 是
+  「提到我的那条笔记的作者」，极可能是别人（实测本号真实 ID `6689eeca…`，
+  兜底拿到 `64494df1…`）。拿别人的 ID 去查点赞/收藏，接口自然稳定返回
+  `{"notes": [], "has_more": false}`——签名、登录态其实都是好的。
+  现改为：`/api/sns/web/v2/user/me` → `/v1/user/me` → selfinfo → mentions
+  （最后一档打 warning 提示可能不准）。修复后同一账号点赞 20 条、
+  图文帖 7 篇（视频帖按规则跳过 13 篇）正常入库。
+- **楼中楼「回复 @xxx」显示顺序**：原渲染为「回复 @被回复者 作者名：内容」，
+  作者名跑到后面；改为与原站一致的「作者名 回复 @被回复者：内容」
+  （`webui/src/components/data/platform/shared.tsx`）。
+
+### 变更
+- **定时任务等待抓取通道期间可见化**：`profile_crawler._wait_for_channel`
+  等待时每 30s 打一条「排队等待中：已等 Ns / 上限 Ms」日志（此前 300s
+  静默等待，用户点了「立即执行」看不到任何动静）；通道空闲时补一条
+  「已等待 Ns，开始抓取」。
+- `SCHEDULER_BUSY_WAIT_SEC` 默认 300s → **1800s**：整帖重抓常要 15-25 分钟，
+  300s 会让刚点的任务静悄悄被跳过。
+- 跳过原因文案补全（说明是「通道被占用」而非幂等保护），前端
+  `useRunTask` 优先展示后端 `error`，不再一律提示「该任务正在执行中」。
+
+### 新增
+- `XiaoHongShuCrawler._collect_behavior_notes_via_page()`：接口拿不到列表时
+  的后备路径——在浏览器页面打开本人主页「赞过/收藏」并滚动，截获页面自身
+  发出的列表请求；页面上下文自动注入账号 cookie（CDP 复用失败落到全新
+  浏览器时也能带上登录态）。附诊断日志：页地址/标题、是否点中标签、
+  页面实际请求过的接口清单，便于改版后排查。
+
+## [2026-10-27] 子评论对话目标 + IP 属地/时间展示
+
+### 新增
+- **评论 IP 属地**：`comment` 表新增 `ip_location` 列（`database/init_v2.py`
+  补列迁移）；`store/xhs/__init__.py` 从评论原始 JSON 提取
+  `comment_item.ip_location`，经 `persist_to_v2` → `sync_comment_to_v2`
+  写入 v2（create/update 均回填，空值不覆盖已有）。API `_comment_public`
+  下发 `ip_location`，前端主评论信息行与楼中楼均显示「IP属地：xx」。
+- **子评论对话目标（回复 @xxx）**：子评论并非都回复主评论——XHS 原始
+  `target_comment` 才是真实被回复对象。store 层已把 `target_comment.id`
+  写入 `parent_comment_id`，`sync_comment_to_v2` 多轮收敛回填
+  parent_id/root_id/depth（深度 ≥2 支持子评论互回）。API 按 parent_id
+  映射出被回复者昵称下发 `reply_to`，前端渲染「回复 @xxx」前缀。
+- **时间显示**：楼中楼每条子评论统一显示 `fmtTs(publish_ts)` 时间。
+
+### 变更
+- `reply_to` 仅当 `parent_id != root_id`（回复其他子评论）时下发：
+  直接回复主评论的不显示「回复 @」前缀，与原站一致；原实现对所有子评论
+  都注入回复目标，会把直接回复也渲染成「回复 @主评论作者」。
+
+### 验证
+- story 50（v1 含 910 条跨子回复）API 实测：depth=2 评论 `reply_to`
+  与数据库中 parent 评论作者逐一吻合（momo / 桃子小大人 / ᅠᅠᅠ）；
+  `GET /api/stories/50/comments/{id}/replies` 同样正确。
+- story 62（「男生视角怎么看？…」）重抓后 `ip_location` 由全空逐步回填，
+  跨子回复随子评论抓取进度入库；历史扁平数据（PDF 导入来源）无法本地恢复，
+  依赖登录态重抓。
+
+## [2026-10-27] 评论配图「看不到」根因修复 + 获取/备份去重
+
+### 修复
+- **评论配图前端看不到的真正根因：前端始终没构建**。
+  此前 `CommentImages` 组件与 `XhsLayout`/`CommentReplies` 的渲染调用虽已落地，
+  但 `webui` 从未 `npm run build`，`api/webui/assets` 里的产物是旧包、不含
+  `CommentImages`，所以浏览器永远不画评论图。本次重新 `npm run build`
+  （产物 `index-CBO2MFQL.js`），后端 `/api/data/raw/` 早已能 200 出图，
+  刷新即生效。
+- **获取去重（防重复入库 + 重复备份）**：
+  `tools/v2_sync._upsert_comment_media` 原仅按 `(target_type, target_id,
+  source_url)` 唯一约束去重。重抓时 XHS 下发带新 CDN 签名的 URL 使 source_url
+  变化，约束拦不住 → 同一张图被插两遍（本地同一 `local_path`、S3 同一对象键、
+  两条 `media_backup`）。现额外按确定性 `local_path` 命中已存在行，
+  并顺带把最新 CDN 签名刷回 `source_url`。
+- **显示去重（防重复渲染）**：`api/routers/story._load_comment_pictures` 按
+  `local_url` 跳过重复媒体，前端不再同一张图出现两次。
+- **存量重复数据清理**：`scripts/_t_cleanup_dup_comment_media.py` 按
+  `(target_id, local_path)` 分组删重（全局清掉 12 条重复行），经
+  `purge_media_backups` 的「交叉引用保护」删除其备份记录时保留仍被保留行
+  引用的同一 S3 对象，无对象误删。
+
+### 验证
+- 目标评论 `6a635b3b`（「后续的聊天记录…纯爱」，story 62 / 内容
+  `6a635a78000000001b01fe77`）`pictures` 由 16 条（8 唯一 ×2）降为 8 条唯一；
+  8 条均各带 1 条 `media_backup`（S3 uploaded），全局无残留 `local_path` 重复组。
+- `GET /api/data/raw/xhs/media/6a635a78000000001b01fe77/comments/4991/4991_001.jpg`
+  → 200 / 88KB；`index.html` 已引用新包 `index-CBO2MFQL.js` 且可 200 加载。
+
+## [2026-10-27] 评论表情包渲染 + 修复头像部分恢复诊断
+
+### 修复
+- **评论表情包看不到（前端 + API 双层缺口）**：
+  - 后端 `api/routers/story.py::_comment_public` 此前从不返回评论 `pictures`
+    字段；前端 `XhsLayout` 评论区从不渲染评论配图。评论图其实已被
+    `tools/v2_sync._sync_comment_media` 下载到本地并登记
+    `MediaAttachment(target_type='comment')` + S3 备份，只是没下发/没画。
+  - 新增 `_load_comment_pictures` 批量解析评论配图 URL（本地 `/api/data/raw/`
+    → S3 `/api/s3-backup/object/` → 平台远程，按 source 标注），并注入
+    `get_stories/{id}/comments` 与 `.../replies` 两接口。
+  - 前端 `shared.tsx` 新增 `CommentImages` 组件（单图大、多图三列网格，
+    新标签开原图），`XhsLayout` 主评论与 `CommentReplies` 楼中楼均渲染。
+  - 修 Windows 路径坑：`relative_to(DATA_DIR)` 出反斜杠导致 URL 路由匹配不到，
+    改用 `.as_posix()` 转正斜杠。
+- **API 验证**：`/api/stories/68/comments` 对带图评论返回 `pictures` 本地 URL，
+  raw 路由 200 出图；`npm run build` 通过。
+
+### 说明
+- **头像「部分恢复」非代码缺陷，是数据回填口径**：前端头像取 `Author.
+  avatar_url`，`_sync_author` 仅空值补；PDF 导入时评论头像为空 → 这些作者
+  一直缺头像。本次重抓主评论被重新抓取并回填作者头像（恢复），但楼中楼回复
+  因风控 `DataFetchError` 未能重抓（不恢复）→ 表现为部分恢复。
+- **CDP 404**：日志里 `connect_over_cdp` 超时后回退标准模式（账号池 cookie，
+  login=True），不影响笔记/主评论；回复抓不到是风控，不是 CDP。
+
+## [2026-10-27] 定时任务三维度 + 重拉时区分已删除/已隐藏
+
+### 背景
+- 重新拉取帖子时平台会返回两种「目标没了」：作者/平台删除（code -510000）
+  与作者隐藏（code -510001）。此前一律按 deleted 标记，无法区分
+  「婆婆对我要离婚的态度」类已删帖与「有点无解 好无力」类已隐藏帖。
+- 定时任务只有「主页/单帖」两类粒度，无法按业务维度配置与筛选
+  （关注的用户 / 关注的帖子 / 扫码登录用户的点赞·收藏图文帖）。
+
+### 新增
+- **原贴状态区分**：`xhs/exception.py` 新增 `NoteHiddenError`；
+  `client.py` 按 -510000 / -510001 分别抛 `NoteNotFoundError` /
+  `NoteHiddenError`；`core.py` 捕获后调 `tools/v2_sync.mark_story_status`
+  （原 `mark_story_deleted` 保留为向后兼容封装）标 `deleted` / `hidden`；
+  列表与作者筛选把 `hidden` 纳入可见；详情页新增【原贴已隐藏】徽标
+  （橙色，与粉色【已删除】并列）。
+- **任务维度体系**（api/services/task_scheduler.py）：
+  `DIMENSION_BY_TASK_TYPE` 把 profile→author（关注的用户）、note→note
+  （关注的帖子）、account→account（扫码登录用户）三个维度落到任务行，
+  `_task_dict` 输出 `dimension` 字段；`GET /api/scheduler/dimensions`
+  返回维度元信息 + 账号池可用的扫码登录账号。
+- **账号维度抓取**（task_type=account）：
+  - `cmd_arg` 增加 `account` 枚举与 `--account_id`；`config/xhs_config.py`
+    增加 `XHS_ACCOUNT_ID` / `XHS_ACCOUNT_BEHAVIORS`（likes,collects）。
+  - `xhs/client.py`：`get_self_user_id`（selfinfo 多路径 + 互动列表
+    `you/mentions` 兜底取本人 user_id）、`get_user_liked_notes`
+    （`/api/sns/web/v1/note/like/page`）、`get_user_collected_notes`
+    （`/api/sns/web/v2/note/collect/page`）、`get_all_behavior_notes`
+    分页去重拉全。
+  - `xhs/core.py`：`get_account_behavior_notes` 拉点赞+收藏图文帖
+    （视频帖跳过），复用 `get_note_detail_async_task` 详情管线——
+    评论/媒体/S3 备份全链路继承；v2 upsert 天然去重，已存在帖子
+    增量刷新评论。无浏览器模式登录态按 `XHS_ACCOUNT_ID` 从账号池
+    精确解析（`AccountPool.get_account` 按 ID 取，多账号互不串）。
+  - `profile_crawler`：account → `--type account --account_id`，
+    行为来源经 `XHS_ACCOUNT_BEHAVIORS` 环境变量注入；执行统计走
+    `tools/v2_sync.get_run_crawl_stats`（按执行时间窗归因新增/刷新）。
+  - 调度器执行时 account 任务按 target（账号池 ID）精确取该账号 cookie，
+    不落入「随便挑一个账号」的兜底。
+- **前端**（ScheduledTasksView）：维度筛选栏（全部/关注用户/关注帖子/
+  登录用户，带各维度计数）；创建/编辑表单三维度切换，账号维度选账号池
+  账号 + 勾选行为来源（点赞/收藏）；任务卡片按维度显示徽标与账号名。
+  `types/scheduler.ts` 增加 `TaskDimension` / `BehaviorSource` /
+  `SchedulerDimensions`；i18n zh/en 补键。
+
+### 变更
+- `api/schemas/scheduler.py`：`task_type` 增加 `account`；`TaskOptions`
+  增加 `behaviors` / `account_id` / `account_name`；`ScheduledTaskOut`
+  增加 `dimension`。`scheduler` 路由 options 归一化统一走
+  `_normalize_options`（白名单放行账号维度字段）。
+
+### 已知限制
+- 网页端没有「我评论过的笔记」列表接口，账号维度的评论来源暂不支持
+  （UI 已注明）。
+- `note/like/page` 与 `note/collect/page` 对非页面上下文请求可能返回
+  空列表（平台风控，会话级 X-S-Common 绑定页面请求）。列表为空时任务
+  正常结束并在日志给出明确警告；有数据时建议浏览器模式（CDP）执行。
+
+### 验证
+- 服务启动回归：`/api/stories/authors/list`、`/api/stories` 正常。
+- `GET /api/scheduler/dimensions` 返回三维度 + 账号池账号（id=5 default）。
+- 创建/删除 account 任务 API 全字段往返正确（dimension=account、
+  behaviors/account_id/account_name 落库）。
+- `build_crawler_command` 生成 `--type account --account_id 5`，
+  `XHS_ACCOUNT_BEHAVIORS` 环境变量正确。
+- 在线冒烟：账号 cookie 解析 → pong → mentions 兜底取到本人 user_id
+  （64494df1000000000f007053）→ 点赞/收藏列表空（该会话被风控拦截），
+  优雅降级并给出警告，无异常退出。
+
+## [2026-10-27] 评论头像/图片缺失修复 + 评论图 S3 备份
+
+### 背景（根因）
+- momo（author_id=3847，含《男生视角怎么看？发现男朋友和前任的秘密》等 9 帖）
+  的 11,575 条评论中 95% 评论者无头像。根因：这 9 帖全部来自 `pdf_archive`
+  留档导入，`scripts/import_pdf_archive.py` 当时把每条评论的
+  `user_info.image`（评论者头像）与 `pictures`（评论图片）硬编码为空，
+  导致评论者 `author.avatar_url` 从未被填充、评论图也从未入库。
+- PDF 留档本身不内嵌「评论者头像」与「评论图」，因此从 PDF 无法补全，
+  必须从用户页用登录态重新抓取（与用户此前要求一致）。
+
+### 新增
+- `tools/v2_sync.py` 评论图入库 + S3 备份：`_normalize_picture_urls` /
+  `_download_comment_image` / `_upsert_comment_media` / `_sync_comment_media`
+  接入 `sync_comment_to_v2` 两个分支（新增与更新）。评论 `pictures` 归一化后
+  下载到本地 `data/{platform}/media/{note_id}/comments/{comment_id}/`，
+  登记 `MediaAttachment(target_type='comment')` 并按 `source_url` 幂等，
+  同时入 S3 备份队列（`enqueue_backup`）。开关 `ENABLE_COMMENT_IMAGE_BACKUP`。
+- `scripts/backfill_comment_avatars.py`：存量 9 帖头像/图片回填脚本。按
+  `--author-profile <hash>` 或 `--note-ids` 取笔记，用登录态 cookie 模式
+  重抓评论并落库。cookie 来源优先 `config.COOKIES`，其次 account 账号池
+  （扫码登录后会写入），无需手动填值。`--with-sub` 同时抓楼中楼补齐更多
+  评论者头像；`--max-comments` 控单帖量。
+- `import_pdf_archive.py`：评论 item 增加注释，明确 PDF 不内嵌头像/图片，
+  须改走实时抓取（`backfill_comment_avatars.py`）补齐。
+
+### 修复
+- 评论者头像链路打通：实时重抓经 `store/xhs.update_xhs_note_comment` 写入
+  顶层 `author_avatar`（`pick_avatar` 取 `user_info.image`），`v2_sync`
+  `_get_or_create_author` 仅在 author 头像为空时补，因此重抓即可回填全部
+  （含楼中楼）评论者头像，且不覆盖已有真实头像。
+
+### 验证
+- 静态：`py_compile` 三文件全通过；`_normalize_picture_urls` 对
+  list-dict / csv / list-str / 空串 / None 五种来源归一化正确；
+  `guess_extension` 取扩展名正确。
+- 链路核对：`store/xhs.update_xhs_note_comment` 第 141/144 行确实产出
+  `author_avatar` 与 `pictures`；`sync_comment_to_v2` 两分支均已调用
+  `_sync_comment_media`；`XiaoHongShuClient.get_note_all_comments` 的
+  `callback` 签名 `(note_id, comments)` 与 `batch_update_xhs_note_comments` 一致。
+- 运行时回填需在有效登录态下执行（小红书评论接口需 cookie）：
+  `python scripts/backfill_comment_avatars.py --author-profile 5cc009750000000016009a5a --with-sub`
+- 待执行验证：登录态就绪后跑上述命令，抽查 `author.avatar_url` 覆盖率与
+  `media_attachment(target_type='comment')` 行数。
+
+## [2026-10-27·续] 重新抓取自愈机制（系统性防复发）
+
+### 背景（更深层根因）
+- 上一轮把根因归结为「PDF 导入硬编码空头像」。进一步追查发现更关键的阻断点：
+  ① 9 帖在 `story_chapter.source_url` 上**其实存了真实的小红书链接**，所以
+  前端「重新拉取」本就能抓到真数据；② 但 PDF 导入的评论 author 与实时重抓的
+  评论 author **哈希不一致**——同一人（如 momo）被建成两条 author
+  （3832 空头像 / 3847 有头像）。`_get_or_create_author` 只按 `anon_hash`
+  匹配，重抓会新建/命中另一行，老评论仍指向空头像旧行 → 头像永远补不回来。
+- 结论：要让「重新抓取」真正自愈，必须在作者身份上做**按主页链接(profile_url)
+  的归并**，而不仅是「补空值」。
+
+### 变更（让重新抓取自动恢复）
+- `tools/v2_sync.py` `_get_or_create_author` 重写：身份匹配优先级
+  `anon_hash` → `profile_url`；命中后回填空头像/空主页；若以 profile_url 命中
+  但哈希不一致，统一为实时哈希（后续直连命中）。新增 `_merge_duplicate_authors`：
+  同一 `profile_url` 下的重复 author 自动合并，评论迁到「规范行」（优先有头像、
+  否则 id 最小），并删掉未被 story 引用的孤儿重复行。
+- `sync_comment_to_v2`「已存在评论」分支：若重抓解析出的规范作者与当前不同
+  （profile_url 合并/去重场景），把老评论重归属到规范作者，使其头像一并恢复。
+- `scripts/import_pdf_archive.py`：评论 item 新增 `author_url`，用提取到的
+  `user_id` 经 `build_profile_url` 现算主页链接。使**未来**导入的作者也带
+  profile_url，重抓时能被同一机制对上 —— 从导入侧杜绝「身份不可恢复」。
+- 评论图入库 + S3 备份（`_sync_comment_media`）保持：每次抓取/重抓都会补下
+  缺失的评论图并触发 S3 备份（幂等）。
+
+### 效果
+- 现在对任一帖子点「重新拉取」（或按作者主页重抓），系统会：补齐评论者头像
+  （含楼中楼）、下载缺失评论图并 S3 备份、合并重复作者、把老评论重归属到规范
+  作者 —— **无需任何一次性脚本**。旧的 `scripts/backfill_comment_avatars.py`
+  仅作为可选的批量触发手段保留，正常自愈走 UI「重新拉取」即可。
+
 ## [2026-10-25] hash 路由 + 访客浏览页
 
 ### 新增

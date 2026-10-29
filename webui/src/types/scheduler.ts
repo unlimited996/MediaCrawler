@@ -1,6 +1,10 @@
 // 定时拉取任务相关类型（与后端 api/schemas/scheduler.py 对应）
 
-export type TaskType = 'profile' | 'note'
+export type TaskType = 'profile' | 'note' | 'account'
+/** 任务维度：author=关注的用户 / note=关注的帖子 / account=扫码登录用户 */
+export type TaskDimension = 'author' | 'note' | 'account'
+/** 账号维度可抓取的行为来源（网页端无「评论过的帖」列表接口） */
+export type BehaviorSource = 'likes' | 'collects'
 export type TaskMode = 'full' | 'incremental'
 export type ScheduleType = 'interval' | 'cron'
 export type RunStatus = 'running' | 'success' | 'failed' | 'timeout' | 'skipped'
@@ -15,6 +19,14 @@ export interface TaskOptions {
   headless: boolean
   cookies: string
   max_comments_count: number | null
+  /** 账号维度：抓取哪些行为来源的帖子 */
+  behaviors?: BehaviorSource[]
+  /** 账号维度：账号池账号 ID */
+  account_id?: number | null
+  /** 账号维度：账号展示名 */
+  account_name?: string | null
+  /** 账号维度：本次每个行为最多抓多少条新帖（不填用爬虫默认 100） */
+  max_notes?: number | null
 }
 
 export interface ScheduledTask {
@@ -23,6 +35,7 @@ export interface ScheduledTask {
   name: string
   platform: string
   task_type: TaskType
+  dimension: TaskDimension
   target: string
   mode: TaskMode
   schedule_type: ScheduleType
@@ -58,6 +71,30 @@ export interface ScheduledTaskRun {
   attempt_count: number
   error_message: string | null
   log_tail: string[]
+  /** 细粒度统计（历史运行记录可能为 null） */
+  stats_json: RunStats | null
+}
+
+/** 单篇帖子的补抓前后对比 */
+export interface RunStatsItem {
+  content_id: string
+  title: string
+  before: RunStatsSnapshot
+  after: RunStatsSnapshot
+  /** 本轮实际补进来的评论条数 */
+  gained: number
+}
+
+export interface RunStatsSnapshot {
+  fetched: number
+  declared: number
+  /** 0~1，已抓评论数 / 原帖显示评论量 */
+  completeness: number
+}
+
+export interface RunStats {
+  added: RunStatsItem[]
+  updated: RunStatsItem[]
 }
 
 export interface SchedulerStatus {
@@ -70,6 +107,27 @@ export interface SchedulerStatus {
   running_tasks: number
   last_tick_at: string | null
   last_error: string
+}
+
+/** GET /scheduler/dimensions：维度元信息 + 账号池可选账号 */
+export interface DimensionMeta {
+  key: TaskDimension
+  task_type: TaskType
+  target_kind: 'profile_url' | 'note_url' | 'account_id'
+  behaviors?: BehaviorSource[]
+}
+
+export interface AccountOption {
+  id: number
+  account_name: string
+  status: string
+  health_score: number
+  has_cookie: boolean
+}
+
+export interface SchedulerDimensions {
+  dimensions: DimensionMeta[]
+  accounts: AccountOption[]
 }
 
 export interface ScheduledTaskPayload {

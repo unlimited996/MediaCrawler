@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """定时拉取任务的 API 数据模型。"""
 
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -10,6 +10,11 @@ from .crawler import LoginTypeEnum, PlatformEnum, SaveDataOptionEnum
 
 MIN_INTERVAL_SEC = 60          # 1 分钟
 MAX_INTERVAL_SEC = 2592000     # 30 天
+
+#: 任务维度：profile=关注的用户 / note=关注的帖子 / account=扫码登录用户（点赞·收藏图文帖）
+TaskType = Literal["profile", "note", "account"]
+#: 账号维度可抓取的行为来源（网页端无「我评论过的笔记」列表接口，评论暂不可用）
+BehaviorLiteral = Literal["likes", "collects"]
 
 
 class TaskOptions(BaseModel):
@@ -22,13 +27,18 @@ class TaskOptions(BaseModel):
     headless: bool = True
     cookies: str = ""
     max_comments_count: Optional[int] = Field(default=None, ge=1, le=10000)
+    #: 账号维度专属：抓取哪些行为来源的帖子（likes=点赞 / collects=收藏）
+    behaviors: List[BehaviorLiteral] = Field(default_factory=lambda: ["likes", "collects"])
+    #: 账号维度专属：账号池账号 ID（人读名一并存，便于列表展示）
+    account_id: Optional[int] = None
+    account_name: Optional[str] = None
 
 
 class ScheduledTaskCreate(BaseModel):
     """创建定时任务。"""
     name: str = Field(min_length=1, max_length=128)
     platform: PlatformEnum
-    task_type: Literal["profile", "note"]
+    task_type: TaskType
     target: str = Field(min_length=1)
     mode: Literal["full", "incremental"] = "incremental"
     schedule_type: Literal["interval", "cron"] = "interval"
@@ -113,6 +123,8 @@ class ScheduledTaskOut(BaseModel):
     name: str
     platform: str
     task_type: str
+    #: 维度（由 task_type 派生）：author=关注的用户 / note=关注的帖子 / account=扫码登录用户
+    dimension: str = "note"
     target: str
     mode: str
     schedule_type: str
@@ -148,6 +160,9 @@ class ScheduledTaskRunOut(BaseModel):
     attempt_count: int = 1
     error_message: Optional[str] = None
     log_tail: list = Field(default_factory=list)
+    # 细粒度统计：{added:[...], updated:[...]}，含前后评论完整率。
+    # 历史运行记录没有该字段，前端渲染前做空值兜底。
+    stats_json: Optional[dict] = None
 
 
 class SchedulerStatusOut(BaseModel):

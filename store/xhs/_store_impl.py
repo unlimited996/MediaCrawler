@@ -231,6 +231,13 @@ class XhsDbStoreImplement(AbstractStore):
             value = comment_item.get(key)
             if value:
                 update_data[key] = value
+        # 对话目标 / 配图：重抓带回真实 target_comment，必须刷新。
+        # 旧实现不更新 parent_comment_id，导致存量评论永远保持扁平化的
+        # 父级指向（子评论互回的目标丢失）
+        if "parent_comment_id" in comment_item:
+            update_data["parent_comment_id"] = str(comment_item.get("parent_comment_id") or "")
+        if "pictures" in comment_item:
+            update_data["pictures"] = json.dumps(comment_item.get("pictures"))
         stmt = update(XhsNoteComment).where(XhsNoteComment.comment_id == comment_id).values(**update_data)
         await session.execute(stmt)
 

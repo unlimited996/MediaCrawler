@@ -63,6 +63,7 @@ class CrawlerTypeEnum(str, Enum):
     SEARCH = "search"
     DETAIL = "detail"
     CREATOR = "creator"
+    ACCOUNT = "account"
 
 
 class SaveDataOptionEnum(str, Enum):
@@ -276,6 +277,14 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 rich_help_panel="Basic Configuration",
             ),
         ] = "",
+        account_id: Annotated[
+            str,
+            typer.Option(
+                "--account_id",
+                help="Account pool ID in account mode (the logged-in user whose liked/collected posts are crawled)",
+                rich_help_panel="Basic Configuration",
+            ),
+        ] = "",
         max_comments_count_singlenotes: Annotated[
             int,
             typer.Option(
@@ -354,6 +363,9 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         # Parse specified_id and creator_id into lists
         specified_id_list = [id.strip() for id in specified_id.split(",") if id.strip()] if specified_id else []
         creator_id_list = [id.strip() for id in creator_id.split(",") if id.strip()] if creator_id else []
+        # account 模式：账号池里的账号 ID（数字），用来指定「哪个扫码登录用户」的
+        # 点赞/收藏列表。空 = 用账号池里健康度最高的账号。
+        account_id_value = (account_id or "").strip()
 
         # override global config
         config.PLATFORM = platform.value
@@ -412,6 +424,9 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                     _normalize_tieba_creator_url(item) for item in creator_id_list
                 ]
 
+        # account 模式：记录账号池 ID（xhs 专属，其它平台后续支持）
+        config.XHS_ACCOUNT_ID = account_id_value
+
         return SimpleNamespace(
             platform=config.PLATFORM,
             lt=config.LOGIN_TYPE,
@@ -427,6 +442,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             cookies=config.COOKIES,
             specified_id=specified_id,
             creator_id=creator_id,
+            account_id=account_id_value,
         )
 
     command = typer.main.get_command(app)

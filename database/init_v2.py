@@ -289,6 +289,10 @@ ADD_COLUMN_SQL = [
     ("comment", "stance_tag_code", "VARCHAR(32)"),
     ("comment", "stance_confidence", "NUMERIC(4,2)"),
     ("comment", "stance_judged_ver", "BIGINT"),
+    ("comment", "ip_location", "VARCHAR(64)"),
+    # 运行记录细粒度统计（新增/更新帖子 + 前后完整率），2026-10-29 加。
+    # 不填则老记录下拉不显示统计区，前端做了空值兜底。
+    ("scheduled_task_run", "stats_json", "JSONB"),
 ]
 
 

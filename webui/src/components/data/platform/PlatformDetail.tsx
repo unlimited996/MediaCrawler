@@ -546,6 +546,15 @@ export function PlatformStoryDetail({
             {t('manage.deletedBadge') || '已删除'}
           </span>
         )}
+        {/* 平台侧作者已隐藏原贴（数据仍保留可查） */}
+        {d.status === 'hidden' && (
+          <span
+            className="rounded-full bg-cyber-neon-orange/15 px-2.5 py-0.5 text-[11px] font-medium text-cyber-neon-orange"
+            title={t('manage.hiddenHint') || '原内容已被作者隐藏（仅自己可见），以下是最后抓到的快照'}
+          >
+            {t('manage.hiddenBadge') || '原贴已隐藏'}
+          </span>
+        )}
         {/* 标题栏只显示去掉话题后的纯标题 */}
         <span className="truncate text-sm text-cyber-text-primary">{d.title || ''}</span>
         {detailQ.isFetching && (

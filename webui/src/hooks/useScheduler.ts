@@ -24,6 +24,15 @@ export function useSchedulerStatus() {
   })
 }
 
+/** 维度元信息 + 账号池可选账号（新建任务面板用，账号列表不常变，60s 轮询） */
+export function useSchedulerDimensions() {
+  return useQuery({
+    queryKey: ['schedulerDimensions'],
+    queryFn: async () => (await schedulerApi.dimensions()).data,
+    refetchInterval: 60000,
+  })
+}
+
 export function useSchedulerRuns(limit = 50) {
   return useQuery({
     queryKey: [...RUNS_QK, limit],
@@ -102,7 +111,9 @@ export function useRunTask() {
     onSuccess: (res) => {
       const d = res.data
       if (d.status === 'skipped') {
-        toast.info(d.message || '该任务正在执行中，已跳过本次触发（幂等保护）')
+        // 跳过的原因可能是「通道被占用超时」也可能是「本任务正在执行」，
+        // 后端把真实原因放在 error 里，优先展示它，别一律说成幂等保护
+        toast.info(d.error || d.message || '本次触发已跳过')
       } else if (d.status === 'success') {
         toast.success(`执行成功：新增 ${d.new_count ?? 0}，刷新 ${d.updated_count ?? 0}`)
       } else if (d.status === 'failed' || d.status === 'timeout') {

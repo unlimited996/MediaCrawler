@@ -122,14 +122,14 @@ async def wait_for_human_verify(page, timeout_sec: int = 300,
     流程：打印醒目指引 → 轮询页面验证码是否消失 → 消失即放行；
     超时返回 False（调用方决定重试或中止）。
 
-    page 为 None 时无法人工操作，按上限等待后返回 False。
+    page 为 None 时无法人工操作，直接返回 False（不再空等 30s：
+    没人能在这台机器上点验证码，等下去只是拖慢整批任务）。
     """
     timeout_sec = int(timeout_sec or 300)
     if page is None:
         utils.logger.warning(
             "[anti_risk] 触发验证码但当前是无浏览器模式，无法人工介入，"
-            f"等待 {min(timeout_sec, 30)}s 后返回")
-        await asyncio.sleep(min(timeout_sec, 30))
+            "直接跳过该目标")
         return False
 
     utils.logger.warning(

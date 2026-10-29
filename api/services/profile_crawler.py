@@ -38,6 +38,10 @@ PROFILE_MAX_NOTES = 10000
 # 等待抓取通道空闲的轮询间隔
 CHANNEL_POLL_SEC = 5
 
+# 爬虫侧熔断标记（media_platform/<platform>/core.py 里同名常量）
+# 子进程退出码为 0 但日志含它 = 评论阶段被风控拦下，任务要按失败处理
+RISK_ABORT_MARKER = "[MEDIACRAWLER_RISK_ABORT]"
+
 _XHS_USER_RE = re.compile(r"/user/profile/([^/?#]+)")
 _XHS_NOTE_RE = re.compile(r"/(?:explore|discovery/item)/([^/?#]+)")
 _HEX24_RE = re.compile(r"^[0-9a-f]{24}$")
@@ -55,6 +59,8 @@ class CrawlExecutionResult:
         self.attempts = 0
         self.error = ""
         self.log_tail: List[str] = []
+        # 细粒度统计：新增/更新了哪些帖子 + 评论完整率前后对比（见 v2_sync.get_run_crawl_detail）
+        self.stats: Optional[Dict[str, Any]] = None
         self.started_at: Optional[datetime] = None
         self.finished_at: Optional[datetime] = None
 
@@ -74,6 +80,7 @@ class CrawlExecutionResult:
             "attempts": self.attempts,
             "error": self.error,
             "log_tail": self.log_tail,
+            "stats": self.stats,
             "duration_ms": self.duration_ms,
         }
 
@@ -219,20 +226,28 @@ def build_crawler_command(task: Dict[str, Any]) -> List[str]:
 
     与 api/services/crawler_manager.py::_build_command 保持一致的参数风格，
     但这里允许任务级覆盖（并发 / 限流 / 帖子数上限）。
+
+    任务维度 → 抓取类型：
+      profile（关注的用户）  → --type creator  --creator_id {主页}
+      note（关注的帖子）    → --type detail   --specified_id {帖子}
+      account（登录用户）   → --type account  --account_id {账号池 ID}
     """
     platform = task["platform"]
     task_type = task["task_type"]
     opts = task.get("options") or {}
     target = task["target"]
 
+    type_map = {"profile": "creator", "note": "detail", "account": "account"}
     cmd = [sys.executable, "main.py",
            "--platform", platform,
            "--lt", opts.get("login_type", "cookie"),
-           "--type", "creator" if task_type == "profile" else "detail",
+           "--type", type_map.get(task_type, "detail"),
            "--save_data_option", opts.get("save_option", "postgres")]
 
     if task_type == "profile":
         cmd.extend(["--creator_id", target])
+    elif task_type == "account":
+        cmd.extend(["--account_id", target])
     else:
         cmd.extend(["--specified_id", target])
 
@@ -254,6 +269,24 @@ def build_crawler_env(task: Dict[str, Any]) -> Dict[str, str]:
     env["PYTHONUNBUFFERED"] = "1"
     env["MAX_CONCURRENCY_NUM"] = str(int(task.get("max_concurrency") or 1))
     env["CRAWLER_MAX_SLEEP_SEC"] = str(float(task.get("rate_interval_sec") or 3))
+    if task.get("task_type") == "account":
+        # 账号维度：行为来源（点赞/收藏）由任务选项决定，经环境变量传给爬虫
+        opts = task.get("options") or {}
+        behaviors = opts.get("behaviors") or ["likes", "collects"]
+        env["XHS_ACCOUNT_BEHAVIORS"] = ",".join(
+            str(b) for b in behaviors if str(b) in ("likes", "collects")) or "likes,collects"
+        # 列表抓取额度：account 模式必须有自己的额度，不能沿用
+        # CRAWLER_MAX_NOTES_COUNT（默认 15）——否则点赞只抓 2 页 20 条、
+        # 收藏直接一条不抓（2026-10-28 修）。任务选项 max_notes（即 UI
+        # 「本次抓取上限」）同时作为「新帖额度」与「补抓篇数上限」的统一值，
+        # 二者不再分设（2026-10-29 修：删除独立的 XHS_COMMENT_BACKFILL_MAX_NOTES）。
+        if opts.get("max_notes"):
+            env["XHS_BEHAVIOR_MAX_NOTES"] = str(int(opts["max_notes"]))
+        # 增量：默认只补新点赞；任务选项 mode=full 时强制全量重抓
+        mode = (opts.get("mode") or task.get("mode") or "incremental")
+        env["XHS_BEHAVIOR_INCREMENTAL"] = "0" if str(mode) == "full" else "1"
+        env.pop("XHS_CREATOR_INCREMENTAL", None)
+        return env
     if task.get("task_type") == "profile":
         # 主页拉取默认不限条数（翻到尾），增量模式靠整页早停收敛
         env["CRAWLER_MAX_NOTES_COUNT"] = str(PROFILE_MAX_NOTES)
@@ -266,17 +299,34 @@ def build_crawler_env(task: Dict[str, Any]) -> Dict[str, str]:
 
 
 async def _wait_for_channel(busy_wait_sec: int,
-                            is_busy) -> Tuple[bool, str]:
+                            is_busy, on_log=None) -> Tuple[bool, str]:
     """等待抓取通道空闲（手动抓取 / 其它定时任务占用时排队等待）。
 
     返回 (ok, reason)。超时未轮到 → reason='crawler_busy'。
+
+    等待期间每 30s 打一条日志：此前是纯静默等待 300s 再跳过，用户点了
+    「立即执行」后界面上什么都看不到，会误以为任务没生效。
     """
-    deadline = time.monotonic() + max(0, busy_wait_sec)
+    started = time.monotonic()
+    deadline = started + max(0, busy_wait_sec)
+    last_note = 0.0
     while True:
         if not is_busy():
+            waited = time.monotonic() - started
+            if on_log and waited >= 10:
+                on_log(f"抓取通道已空闲（等待 {int(waited)}s），开始抓取", "info")
             return True, ""
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= deadline:
             return False, "crawler_busy"
+        # 首次 + 之后每 30s 提示一次，让执行记录/控制台看得到「在排队」
+        if on_log and now - last_note >= 30:
+            on_log(
+                f"抓取通道被占用（手动抓取或其它任务正在跑），排队等待中："
+                f"已等 {int(now - started)}s / 上限 {int(busy_wait_sec)}s",
+                "info",
+            )
+            last_note = now
         await asyncio.sleep(CHANNEL_POLL_SEC)
 
 
@@ -286,11 +336,14 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
     res = CrawlExecutionResult()
     res.started_at = datetime.now()
 
-    # 1) 等抓取通道
-    ok, reason = await _wait_for_channel(busy_wait_sec, is_busy)
+    # 1) 等抓取通道（占用时排队；期间持续打日志，避免用户以为任务没动静）
+    ok, reason = await _wait_for_channel(busy_wait_sec, is_busy, on_log=on_log)
     if not ok:
         res.status = "skipped"
-        res.error = f"抓取通道被占用超过 {busy_wait_sec}s，本次跳过"
+        res.error = (
+            f"抓取通道被占用超过 {busy_wait_sec}s，本次跳过"
+            f"（有手动抓取或其它定时任务在跑，通道空闲后重新触发即可）"
+        )
         res.finished_at = datetime.now()
         if on_log:
             on_log(res.error, "warning")
@@ -299,6 +352,21 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
     # 2) 预读内容索引（增量统计 + xhs 增量翻页的地基）
     platform = task["platform"]
     before: Dict[str, int] = {}
+    # 账号维度：抓来的帖子作者各异，无法按作者/单帖预读索引，
+    # 改为记录执行时间窗，结束后按 crawled_at 归因统计新增/刷新
+    account_window_start = int(time.time() * 1000) if task.get("task_type") == "account" else 0
+    # 评论完整率「之前」的快照。抓完会跑 refresh_comment_completeness() 把
+    # 完整率覆盖成本轮结果，这里不先拍下来就比不出本轮实际补齐了多少
+    # （执行记录下拉的前后对比要靠它）。
+    completeness_before: Dict[str, Dict] = {}
+    if task.get("task_type") == "account":
+        try:
+            from tools.v2_sync import get_completeness_snapshot
+
+            completeness_before = await get_completeness_snapshot(platform)
+        except Exception as e:
+            if on_log:
+                on_log(f"完整率快照失败（不影响执行）：{e}", "warning")
     try:
         if task.get("task_type") == "profile":
             info = parse_profile_target(platform, task["target"])
@@ -380,7 +448,25 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
 
     # 5) 后读内容索引，算增量
     try:
-        if task.get("task_type") == "profile":
+        if task.get("task_type") == "account":
+            from tools.v2_sync import get_run_crawl_stats
+
+            res.new_count, res.updated_count = await get_run_crawl_stats(
+                platform, account_window_start, int(time.time() * 1000))
+            res.skipped_count = 0
+            # 明细跟上：动了哪些帖子、完整率前后各多少。与上面同源同时窗，
+            # 保证明细条数和 headline 计数一致。失败不影响主流程。
+            try:
+                from tools.v2_sync import get_run_crawl_detail
+
+                res.stats = await get_run_crawl_detail(
+                    platform, account_window_start, int(time.time() * 1000),
+                    completeness_before)
+            except Exception as stat_exc:
+                if on_log:
+                    on_log(f"执行明细统计失败（不影响结果）：{stat_exc}",
+                           "warning")
+        elif task.get("task_type") == "profile":
             info = parse_profile_target(platform, task["target"])
             if info.get("user_id"):
                 after = await get_content_index(platform, user_id=info["user_id"])
@@ -397,9 +483,18 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
             on_log(f"统计增量失败（不影响执行结果）：{e}", "warning")
 
     res.finished_at = datetime.now()
+    # 风控熔断：子进程退出码仍是 0，但评论阶段被平台验证码/限流整批拦下。
+    # 这种情况必须报失败——否则任务显示 success，用户只看得到「帖子进来了、
+    # 评论是空的」，还无从判断是没评论还是被风控了。
+    risk_line = next((l for l in lines if RISK_ABORT_MARKER in l), "")
     if timed_out:
         res.status = "timeout"
         res.error = f"执行超过 {timeout}s 已终止"
+    elif risk_line:
+        res.status = "failed"
+        res.error = f"触发平台风控，评论未抓全：{risk_line[-200:]}"
+        if on_log:
+            on_log(res.error, "error")
     elif exit_code == 0:
         res.status = "success"
         res.error = ""

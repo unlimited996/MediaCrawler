@@ -2,7 +2,8 @@ import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   CalendarClock, Loader2, Play, Plus, RefreshCw, Square, Trash2, X,
-  CheckCircle2, XCircle, Clock, MinusCircle, TimerReset, ListTree,
+  CheckCircle2, XCircle, Clock, MinusCircle, TimerReset, ListTree, Filter,
+  UserRound, FileText, ScanFace,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -10,10 +11,11 @@ import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Badge } from '@/components/ui/badge'
 import {
-  useSchedulerTasks, useSchedulerStatus, useSchedulerRuns,
+  useSchedulerTasks, useSchedulerStatus, useSchedulerRuns, useSchedulerDimensions,
   useCreateTask, useUpdateTask, useDeleteTask, useToggleTask, useRunTask,
 } from '@/hooks/useScheduler'
-import type { ScheduledTask, ScheduledTaskPayload, TaskType, RunStatus } from '@/types/scheduler'
+import type { ScheduledTask, ScheduledTaskPayload, TaskType, TaskDimension,
+              RunStatus, RunStatsItem } from '@/types/scheduler'
 
 const PLATFORMS = [
   { value: 'xhs', label: '小红书' },
@@ -32,6 +34,34 @@ const SAVE_OPTIONS = [
   { value: 'csv', label: 'CSV 文件' },
   { value: 'sqlite', label: 'SQLite' },
 ]
+
+/** 补齐率百分比：0~1 -> 92% */
+const fmtPct = (v: number) => `${Math.round((v || 0) * 100)}%`
+
+/** 明细行数上限：一轮可能上百篇，全部渲染会把面板撑爆 */
+const STAT_ROW_LIMIT = 50
+
+function StatRow({ item }: { item: RunStatsItem }) {
+  const b = item.before
+  const a = item.after
+  return (
+    <div className="flex items-center gap-1.5 text-[9px] font-mono leading-4">
+      <span className="text-cyber-text-muted">{item.content_id.slice(0, 8)}</span>
+      <span className="text-cyber-text-secondary shrink-0">
+        {fmtPct(b.completeness)}→{fmtPct(a.completeness)}
+      </span>
+      <span className="text-cyber-text-muted shrink-0">
+        {b.fetched}→{a.fetched}/{a.declared}
+      </span>
+      {item.gained > 0 && (
+        <span className="text-cyber-neon-green shrink-0">+{item.gained}</span>
+      )}
+      <span className="text-cyber-text-muted truncate max-w-[110px]" title={item.title}>
+        {item.title}
+      </span>
+    </div>
+  )
+}
 
 const EMPTY_FORM: ScheduledTaskPayload = {
   name: '',
@@ -56,8 +86,25 @@ const EMPTY_FORM: ScheduledTaskPayload = {
     headless: true,
     cookies: '',
     max_comments_count: null,
+    behaviors: ['likes', 'collects'],
+    account_id: null,
+    account_name: null,
+    max_notes: null,
   },
   enabled: true,
+}
+
+/** 维度 → 展示元信息（徽标 / 筛选 / 图标） */
+const DIMENSION_META: Record<TaskDimension, { label: string; icon: typeof UserRound }> = {
+  author: { label: '关注用户', icon: UserRound },
+  note: { label: '关注帖子', icon: FileText },
+  account: { label: '登录用户', icon: ScanFace },
+}
+
+function dimensionOf(task: ScheduledTask): TaskDimension {
+  if (task.dimension) return task.dimension
+  return task.task_type === 'profile' ? 'author'
+    : task.task_type === 'account' ? 'account' : 'note'
 }
 
 function fmtTime(iso: string | null): string {
@@ -83,6 +130,7 @@ export function ScheduledTasksView() {
   const tasksQ = useSchedulerTasks()
   const statusQ = useSchedulerStatus()
   const runsQ = useSchedulerRuns(60)
+  const dimensionsQ = useSchedulerDimensions()
 
   const createM = useCreateTask()
   const updateM = useUpdateTask()
@@ -94,12 +142,28 @@ export function ScheduledTasksView() {
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<ScheduledTaskPayload>(EMPTY_FORM)
   const [expandedRun, setExpandedRun] = useState<number | null>(null)
+  // 任务列表维度筛选：全部 / 关注用户 / 关注帖子 / 登录用户
+  const [dimFilter, setDimFilter] = useState<'all' | TaskDimension>('all')
 
   const tasks = tasksQ.data || []
   const runs = runsQ.data || []
   const status = statusQ.data
+  const dimensions = dimensionsQ.data
+  const accounts = dimensions?.accounts || []
   const busy = createM.isPending || updateM.isPending || deleteM.isPending
     || toggleM.isPending || runM.isPending
+
+  const filteredTasks = useMemo(
+    () => (dimFilter === 'all' ? tasks : tasks.filter((x) => dimensionOf(x) === dimFilter)),
+    [tasks, dimFilter]
+  )
+
+  // 各维度任务数（筛选栏上用）
+  const dimCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: tasks.length, author: 0, note: 0, account: 0 }
+    for (const x of tasks) counts[dimensionOf(x)] = (counts[dimensionOf(x)] || 0) + 1
+    return counts
+  }, [tasks])
 
   const openCreate = () => {
     setEditing(null)
@@ -131,11 +195,24 @@ export function ScheduledTasksView() {
 
   const submit = () => {
     if (!form.name.trim()) return
-    if (!form.target.trim()) return
+    let payload = form
+    if (form.task_type === 'account') {
+      // 账号维度：target = 账号池 ID，账号名一并写进 options 便于列表展示
+      const accountId = form.options.account_id
+      if (!accountId) return
+      const account = accounts.find((a) => a.id === accountId)
+      payload = {
+        ...form,
+        target: String(accountId),
+        options: { ...form.options, account_name: account?.account_name ?? null },
+      }
+    } else if (!form.target.trim()) {
+      return
+    }
     if (editing) {
-      updateM.mutate({ id: editing.id, payload: form }, { onSuccess: () => setShowForm(false) })
+      updateM.mutate({ id: editing.id, payload }, { onSuccess: () => setShowForm(false) })
     } else {
-      createM.mutate(form, { onSuccess: () => setShowForm(false) })
+      createM.mutate(payload, { onSuccess: () => setShowForm(false) })
     }
   }
 
@@ -224,25 +301,120 @@ export function ScheduledTasksView() {
 
           <div className="space-y-1">
             <Label className="text-[11px] text-cyber-text-secondary font-mono">{t('field.taskType')}</Label>
-            <div className="grid grid-cols-2 gap-2">
-              {(['profile', 'note'] as TaskType[]).map((tt) => (
-                <button key={tt} onClick={() => setForm({ ...form, task_type: tt })}
-                  className={`rounded-md border px-2.5 py-1.5 text-left text-[11px] font-mono transition-all ${
-                    form.task_type === tt
-                      ? 'border-cyber-neon-purple/60 bg-cyber-neon-purple/10 text-cyber-text-primary'
-                      : 'border-cyber-border-subtle text-cyber-text-muted hover:border-cyber-border-DEFAULT'
-                  }`}>
-                  {tt === 'profile' ? t('field.typeProfile') : t('field.typeNote')}
-                </button>
-              ))}
+            <div className="grid grid-cols-3 gap-2">
+              {(['profile', 'note', 'account'] as TaskType[]).map((tt) => {
+                const dim: TaskDimension = tt === 'profile' ? 'author' : tt === 'account' ? 'account' : 'note'
+                const Icon = DIMENSION_META[dim].icon
+                return (
+                  <button key={tt} onClick={() => setForm({ ...form, task_type: tt })}
+                    className={`rounded-md border px-2.5 py-1.5 text-left text-[11px] font-mono transition-all ${
+                      form.task_type === tt
+                        ? 'border-cyber-neon-purple/60 bg-cyber-neon-purple/10 text-cyber-text-primary'
+                        : 'border-cyber-border-subtle text-cyber-text-muted hover:border-cyber-border-DEFAULT'
+                    }`}>
+                    <span className="flex items-center gap-1">
+                      <Icon className="w-3 h-3" />
+                      {tt === 'profile' ? t('field.typeProfile') : tt === 'note' ? t('field.typeNote') : t('field.typeAccount')}
+                    </span>
+                  </button>
+                )
+              })}
             </div>
+            {form.task_type === 'account' && (
+              <p className="text-[10px] text-cyber-text-muted">{t('field.typeAccountHint')}</p>
+            )}
           </div>
 
-          <div className="space-y-1">
-            <Label className="text-[11px] text-cyber-text-secondary font-mono">{t('field.target')}</Label>
-            <Input value={form.target} onChange={(e) => setForm({ ...form, target: e.target.value })}
-              className="h-8 text-[11px] font-mono" placeholder={targetPlaceholder} />
-          </div>
+          {form.task_type === 'account' ? (
+            <div className="space-y-1">
+              <Label className="text-[11px] text-cyber-text-secondary font-mono">{t('field.account')}</Label>
+              {accounts.length > 0 ? (
+                <select
+                  value={form.options.account_id ?? ''}
+                  onChange={(e) => {
+                    const id = Number(e.target.value) || null
+                    const account = accounts.find((a) => a.id === id)
+                    setForm({
+                      ...form,
+                      target: id ? String(id) : '',
+                      options: { ...form.options, account_id: id, account_name: account?.account_name ?? null },
+                    })
+                  }}
+                  className="w-full h-8 rounded-md border border-cyber-border-DEFAULT bg-cyber-bg-tertiary px-2 text-[11px] font-mono text-cyber-text-primary">
+                  <option value="">{t('field.accountPlaceholder')}</option>
+                  {accounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.account_name}（#{a.id}{a.status !== 'active' ? ` · ${a.status}` : ''}）
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <p className="text-[10px] text-cyber-neon-orange py-1">{t('field.noAccounts')}</p>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-1">
+              <Label className="text-[11px] text-cyber-text-secondary font-mono">{t('field.target')}</Label>
+              <Input value={form.target} onChange={(e) => setForm({ ...form, target: e.target.value })}
+                className="h-8 text-[11px] font-mono" placeholder={targetPlaceholder} />
+            </div>
+          )}
+
+          {form.task_type === 'account' && (
+            <div className="space-y-1">
+              <Label className="text-[11px] text-cyber-text-secondary font-mono">{t('field.behaviors')}</Label>
+              <div className="flex items-center gap-4">
+                {(['likes', 'collects'] as const).map((b) => (
+                  <label key={b}
+                    className="flex items-center gap-1.5 text-[11px] font-mono text-cyber-text-secondary cursor-pointer">
+                    <Checkbox
+                      checked={(form.options.behaviors || []).includes(b)}
+                      onCheckedChange={(v) => {
+                        const cur = form.options.behaviors || []
+                        const next = v ? [...new Set([...cur, b])] : cur.filter((x) => x !== b)
+                        setForm({ ...form, options: { ...form.options, behaviors: next } })
+                      }} />
+                    {b === 'likes' ? t('field.behaviorLikes') : t('field.behaviorCollects')}
+                  </label>
+                ))}
+              </div>
+              <p className="text-[10px] text-cyber-text-muted">{t('field.behaviorsHint')}</p>
+            </div>
+          )}
+
+          {form.task_type === 'account' && (
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <Label className="text-[11px] text-cyber-text-secondary font-mono">{t('field.mode')}</Label>
+                <div className="grid grid-cols-2 gap-2">
+                  {(['incremental', 'full'] as const).map((m) => (
+                    <button key={m} onClick={() => setForm({ ...form, mode: m })}
+                      className={`rounded-md border px-2.5 py-1.5 text-left text-[11px] font-mono transition-all ${
+                        form.mode === m
+                          ? 'border-cyber-neon-cyan/60 bg-cyber-neon-cyan/10 text-cyber-text-primary'
+                          : 'border-cyber-border-subtle text-cyber-text-muted hover:border-cyber-border-DEFAULT'
+                      }`}>
+                      {m === 'incremental' ? t('field.modeIncrementalAccount') : t('field.modeFullAccount')}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label className="text-[11px] text-cyber-text-secondary font-mono">{t('field.maxNotes')}</Label>
+                <Input type="number" min={1} value={form.options.max_notes ?? ''}
+                  placeholder="100"
+                  onChange={(e) => setForm({
+                    ...form,
+                    options: {
+                      ...form.options,
+                      max_notes: e.target.value ? Number(e.target.value) : null,
+                    },
+                  })}
+                  className="h-8 text-[11px] font-mono" />
+              </div>
+              <p className="col-span-2 text-[10px] text-cyber-text-muted">{t('field.maxNotesHint')}</p>
+            </div>
+          )}
 
           {form.task_type === 'profile' && (
             <div className="space-y-1">
@@ -381,7 +553,9 @@ export function ScheduledTasksView() {
               className="h-8 border-cyber-border-DEFAULT font-mono text-[11px]">
               {t('actions.cancel')}
             </Button>
-            <Button size="sm" onClick={submit} disabled={busy || !form.name.trim() || !form.target.trim()}
+            <Button size="sm" onClick={submit}
+              disabled={busy || !form.name.trim()
+                || (form.task_type === 'account' ? !form.options.account_id : !form.target.trim())}
               className="h-8 bg-cyber-neon-purple text-white font-mono text-[11px] font-bold hover:bg-cyber-neon-purple/90">
               {(createM.isPending || updateM.isPending) && <Loader2 className="w-3 h-3 animate-spin" />}
               {editing ? t('actions.save') : t('actions.create')}
@@ -394,21 +568,46 @@ export function ScheduledTasksView() {
       <div className="flex-1 grid grid-cols-1 xl:grid-cols-[1fr_360px] gap-4 overflow-hidden min-h-0">
         {/* 任务列表 */}
         <div className="flex flex-col gap-2 overflow-y-auto min-h-0 pr-1">
+          {/* 维度筛选栏 */}
+          <div className="flex-shrink-0 flex items-center gap-2 flex-wrap">
+            <span className="flex items-center gap-1 text-[10px] font-mono text-cyber-text-muted">
+              <Filter className="w-3 h-3" />
+              {t('filter.label')}
+            </span>
+            {([
+              ['all', t('filter.all')],
+              ['author', DIMENSION_META.author.label],
+              ['note', DIMENSION_META.note.label],
+              ['account', DIMENSION_META.account.label],
+            ] as Array<[('all' | TaskDimension), string]>).map(([key, label]) => (
+              <button key={key} onClick={() => setDimFilter(key)}
+                className={`rounded-full border px-2.5 py-0.5 text-[10px] font-mono transition-all ${
+                  dimFilter === key
+                    ? 'border-cyber-neon-purple/60 bg-cyber-neon-purple/10 text-cyber-text-primary'
+                    : 'border-cyber-border-subtle text-cyber-text-muted hover:border-cyber-border-DEFAULT'
+                }`}>
+                {label}
+                <span className="ml-1 text-cyber-text-muted">{dimCounts[key] || 0}</span>
+              </button>
+            ))}
+          </div>
           {tasksQ.isLoading && (
             <div className="flex items-center justify-center py-10 text-cyber-text-muted">
               <Loader2 className="w-4 h-4 animate-spin" />
             </div>
           )}
-          {!tasksQ.isLoading && tasks.length === 0 && (
+          {!tasksQ.isLoading && filteredTasks.length === 0 && (
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <ListTree className="w-8 h-8 text-cyber-text-muted mb-3" />
               <p className="text-xs font-mono text-cyber-text-secondary">{t('empty')}</p>
               <p className="text-[10px] text-cyber-text-muted mt-1 max-w-xs">{t('emptyHint')}</p>
             </div>
           )}
-          {tasks.map((task) => {
+          {filteredTasks.map((task) => {
             const meta = task.last_status ? runStatusMeta(task.last_status as RunStatus, t) : null
             const running = task.status === 'running'
+            const dim = dimensionOf(task)
+            const DimIcon = DIMENSION_META[dim].icon
             return (
               <div key={task.id}
                 className={`rounded-lg glass-panel border p-3 transition-all ${running ? 'border-cyber-neon-cyan/40' : 'border-cyber-border-subtle hover:border-cyber-border-DEFAULT'}`}>
@@ -416,11 +615,17 @@ export function ScheduledTasksView() {
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-xs font-mono font-semibold text-cyber-text-primary truncate">{task.name}</span>
-                      <Badge variant="outline" className={`text-[9px] font-mono ${task.task_type === 'profile' ? 'border-cyber-neon-purple/40 text-cyber-neon-purple' : 'border-cyber-neon-cyan/40 text-cyber-neon-cyan'}`}>
-                        {task.task_type === 'profile' ? '主页' : '单帖'}
+                      <Badge variant="outline" className="text-[9px] font-mono border-cyber-neon-purple/40 text-cyber-neon-purple">
+                        <DimIcon className="w-2.5 h-2.5 mr-0.5" />{DIMENSION_META[dim].label}
                       </Badge>
-                      {task.mode === 'incremental' && task.task_type === 'profile' && (
+                      {dim === 'author' && task.mode === 'incremental' && (
                         <Badge variant="outline" className="text-[9px] font-mono border-cyber-border-subtle text-cyber-text-muted">增量</Badge>
+                      )}
+                      {dim === 'account' && (task.options?.behaviors || []).length > 0 && (
+                        <Badge variant="outline" className="text-[9px] font-mono border-cyber-border-subtle text-cyber-text-muted">
+                          {(task.options?.behaviors || []).includes('likes') ? '点赞' : ''}
+                          {(task.options?.behaviors || []).includes('collects') ? ' 收藏' : ''}
+                        </Badge>
                       )}
                       {!task.enabled && (
                         <Badge variant="outline" className="text-[9px] font-mono border-cyber-border-subtle text-cyber-text-muted">已停用</Badge>
@@ -431,7 +636,11 @@ export function ScheduledTasksView() {
                         </Badge>
                       )}
                     </div>
-                    <p className="text-[10px] text-cyber-text-muted mt-1 truncate" title={task.target}>{task.target}</p>
+                    <p className="text-[10px] text-cyber-text-muted mt-1 truncate" title={task.target}>
+                      {dim === 'account'
+                        ? `${t('field.account')}: ${task.options?.account_name || `#${task.target}`}`
+                        : task.target}
+                    </p>
                     <div className="flex items-center gap-3 mt-1.5 text-[10px] font-mono text-cyber-text-muted flex-wrap">
                       <span className="flex items-center gap-1">
                         {task.schedule_type === 'cron'
@@ -526,6 +735,56 @@ export function ScheduledTasksView() {
                       <p className="text-[10px] text-cyber-neon-pink line-clamp-2">{run.error_message}</p>
                     )}
                   </button>
+                  {open && run.stats_json && (() => {
+                    const st = run.stats_json
+                    const all = [...st.added, ...st.updated]
+                    const gained = all.reduce((s, i) => s + (i.gained || 0), 0)
+                    const page = (list: RunStatsItem[]) => list.slice(0, STAT_ROW_LIMIT)
+                    return (
+                      <div className="mt-1.5 space-y-1 rounded bg-cyber-bg-primary/40 p-2">
+                        <div className="flex items-center gap-2 text-[9px] font-mono flex-wrap">
+                          <span className="text-cyber-neon-purple font-semibold">{t('runs.statsTitle')}</span>
+                          <span className="text-cyber-neon-green">{t('runs.statsGained', { count: gained })}</span>
+                        </div>
+                        {all.length === 0 ? (
+                          <p className="text-[9px] font-mono text-cyber-text-muted">{t('runs.statsEmpty')}</p>
+                        ) : (
+                          <>
+                            {st.added.length > 0 && (
+                              <div>
+                                <p className="text-[9px] font-mono text-cyber-neon-green">
+                                  {t('runs.statsAdded', { count: st.added.length })}
+                                </p>
+                                {page(st.added).map((it) => (
+                                  <StatRow key={it.content_id} item={it} />
+                                ))}
+                                {st.added.length > STAT_ROW_LIMIT && (
+                                  <p className="text-[9px] font-mono text-cyber-text-muted">
+                                    …+{st.added.length - STAT_ROW_LIMIT}
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                            {st.updated.length > 0 && (
+                              <div>
+                                <p className="text-[9px] font-mono text-cyber-neon-cyan">
+                                  {t('runs.statsUpdated', { count: st.updated.length })}
+                                </p>
+                                {page(st.updated).map((it) => (
+                                  <StatRow key={it.content_id} item={it} />
+                                ))}
+                                {st.updated.length > STAT_ROW_LIMIT && (
+                                  <p className="text-[9px] font-mono text-cyber-text-muted">
+                                    …+{st.updated.length - STAT_ROW_LIMIT}
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )
+                  })()}
                   {open && (run.log_tail || []).length > 0 && (
                     <pre className="mt-1.5 max-h-40 overflow-auto rounded bg-cyber-bg-primary/60 p-2 text-[9px] leading-4 font-mono text-cyber-text-muted whitespace-pre-wrap">
                       {(run.log_tail || []).join('\n')}

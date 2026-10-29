@@ -187,3 +187,7 @@ database/*.db
 # 临时调试脚本 / Agent 工作记忆
 _t_*.py
 .workbuddy/
+# 临时产物：截图、日志、一次性恢复备份目录（都是验证过程产生的中间文件）
+_t_*.png
+_t_*.log
+_t_recovery/

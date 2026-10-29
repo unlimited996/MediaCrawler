@@ -95,7 +95,9 @@ def test_api_start_crawler_with_limits():
     client = TestClient(app)
 
     with patch("api.routers.crawler.crawler_manager.start", new_callable=AsyncMock) as mock_start:
-        mock_start.return_value = True
+        # crawler_manager.start() 现在返回结构化结果（mode/queued/added），
+        # 不再是 True/False；这里保持一致
+        mock_start.return_value = {"mode": "started"}
 
         # Test case 1: with limits
         response = client.post("/api/crawler/start", json={
@@ -120,7 +122,7 @@ def test_api_start_crawler_without_limits():
     client = TestClient(app)
 
     with patch("api.routers.crawler.crawler_manager.start", new_callable=AsyncMock) as mock_start:
-        mock_start.return_value = True
+        mock_start.return_value = {"mode": "started"}
 
         # Test case 2: without limits
         response = client.post("/api/crawler/start", json={

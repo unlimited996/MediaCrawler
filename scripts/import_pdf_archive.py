@@ -37,6 +37,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tools.user_hash import build_profile_url  # 现算用户主页 URL，保证导入作者也可被重抓对上
+
 # --------------------------------------------------------------------------- #
 # PDF 解析
 # --------------------------------------------------------------------------- #
@@ -248,10 +250,16 @@ def _parse_comment_blocks(text: str, ref_now: Optional[datetime],
             "create_time": create_ms,
             "like_count": like_count,
             "sub_comment_count": 0,
+            # 注意：PDF 留档通常不内嵌「评论者头像」与「评论图片」，
+            # 这里只能置空；头像/图片需改用实时抓取（见 scripts/backfill_comment_avatars.py）
+            # 重新拉取评论，store 层 pick_avatar + pictures 才会带出真实数据。
             "pictures": [],
             "user_info": {"user_id": _clean_str(user_id),
                           "nickname": _clean_str(nickname),
                           "image": "", "region": _clean_str(region)},
+            # 用提取到的 user_id 现算主页链接：让导入作者也带 profile_url，
+            # 后续「重新拉取」按 profile_url 就能对上并自动补回头像/图片。
+            "author_url": build_profile_url("xhs", {"user_id": _clean_str(user_id)}),
             "target_comment": {"id": parent_id} if is_reply else {"id": ""},
         }
         out.append(item)

@@ -19,6 +19,19 @@ type TimeRange = 'all' | 'today' | 'week' | 'month'
 type ViewMode = 'list' | 'grid'
 const VIEW_MODE_KEY = 'mc_data_view_mode'
 
+const PAGE_SIZE_KEY = 'mc_data_page_size'
+// 后端 /stories 的 page_size 上限是 100（le=100），选项不要超过它否则 422
+const PAGE_SIZE_OPTIONS = [20, 50, 100]
+
+function loadPageSize(): number {
+  try {
+    const v = Number(localStorage.getItem(PAGE_SIZE_KEY))
+    return PAGE_SIZE_OPTIONS.includes(v) ? v : 20
+  } catch {
+    return 20
+  }
+}
+
 function loadViewMode(): ViewMode {
   try {
     return (localStorage.getItem(VIEW_MODE_KEY) as ViewMode) === 'grid' ? 'grid' : 'list'
@@ -209,14 +222,37 @@ export function DataManagementView({
     try { localStorage.setItem(VIEW_MODE_KEY, viewMode) } catch { /* 隐私模式忽略 */ }
   }, [viewMode])
 
-  const pageSize = 20
+  /** 每页条数可选（20/50/100/200），选择持久化到 localStorage */
+  const [pageSize, setPageSize] = useState<number>(loadPageSize)
+  useEffect(() => {
+    try { localStorage.setItem(PAGE_SIZE_KEY, String(pageSize)) } catch { /* 忽略 */ }
+  }, [pageSize])
 
   // 说明：平台下拉已移除，平台列表 query 随之不再需要；
   // 若以后要恢复页内切换，复用抓取页的 usePlatforms() 即可（key 必须一致）。
+
+  // 标签候选：支持关键词搜索 + 分段加载（标签可能成百上千，不做全量一次性拉取）
+  const TAG_STEP = 50
+  const [tagOpen, setTagOpen] = useState(false)
+  const [tagKw, setTagKw] = useState('')
+  const [tagKwDebounced, setTagKwDebounced] = useState('')
+  const [tagLimit, setTagLimit] = useState(TAG_STEP)
+  useEffect(() => {
+    const id = setTimeout(() => {
+      setTagKwDebounced(tagKw)
+      setTagLimit(TAG_STEP)          // 换关键词后从头加载
+    }, 300)
+    return () => clearTimeout(id)
+  }, [tagKw])
   const tagsQ = useQuery({
-    queryKey: ['storyTags'],
-    queryFn: async () => (await storyApi.tags(30)).data.items,
+    queryKey: ['storyTags', tagKwDebounced, tagLimit],
+    queryFn: async () => (await storyApi.tags({
+      limit: tagLimit, q: tagKwDebounced || undefined,
+    })).data,
   })
+  const tagItems = tagsQ.data?.items || []
+  const tagTotal = tagsQ.data?.total ?? tagItems.length
+  const tagHasMore = tagItems.length < tagTotal
 
   // 发帖人候选：跟着平台走，作者表几千行，靠关键词/平台收敛（下拉不做全量）
   const [authorOpen, setAuthorOpen] = useState(false)
@@ -372,17 +408,71 @@ export function DataManagementView({
           <option value="month">{t('manage.timeMonth')}</option>
         </select>
 
-        {/* 标签 */}
-        <select
-          value={tag}
-          onChange={(e) => { setTag(e.target.value); setPage(1) }}
-          className="h-8 px-2 rounded-md text-xs font-mono bg-cyber-bg-tertiary border border-cyber-border-subtle text-cyber-text-primary"
+        {/* 标签：可搜索 + 分段懒加载（标签可能成百上千） */}
+        <div
+          className="relative"
+          tabIndex={0}
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node)) setTagOpen(false)
+          }}
         >
-          <option value="">{t('manage.allTags')}</option>
-          {(tagsQ.data || []).map((x) => (
-            <option key={x.name} value={x.name}>{x.name}（{x.count}）</option>
-          ))}
-        </select>
+          <button
+            type="button"
+            onClick={() => setTagOpen((v) => !v)}
+            className={`flex h-8 items-center gap-1 rounded-md border px-2 text-xs font-mono transition-all ${
+              tag
+                ? 'border-cyber-neon-cyan/60 bg-cyber-neon-cyan/10 text-cyber-neon-cyan'
+                : 'border-cyber-border-subtle bg-cyber-bg-tertiary text-cyber-text-primary hover:border-cyber-neon-cyan/40'
+            }`}
+          >
+            {tag || t('manage.allTags')}
+          </button>
+          {tagOpen && (
+            <div className="absolute z-30 mt-1 w-56 rounded-md border border-cyber-border-subtle bg-cyber-bg-panel p-2 shadow-lg">
+              <input
+                autoFocus
+                value={tagKw}
+                onChange={(e) => setTagKw(e.target.value)}
+                placeholder="搜索标签"
+                className="mb-1 h-7 w-full rounded border border-cyber-border-subtle bg-cyber-bg-tertiary px-2 text-xs font-mono text-cyber-text-primary outline-none"
+              />
+              <div className="max-h-56 overflow-y-auto">
+                <button
+                  type="button"
+                  onClick={() => { setTag(''); setPage(1); setTagOpen(false) }}
+                  className="w-full rounded px-2 py-1 text-left text-xs font-mono text-cyber-text-secondary hover:bg-cyber-bg-tertiary"
+                >
+                  {t('manage.allTags')}
+                </button>
+                {tagItems.map((x) => (
+                  <button
+                    key={x.name}
+                    type="button"
+                    onClick={() => { setTag(x.name); setPage(1); setTagOpen(false) }}
+                    className={`w-full rounded px-2 py-1 text-left text-xs font-mono hover:bg-cyber-bg-tertiary ${
+                      x.name === tag ? 'text-cyber-neon-cyan' : 'text-cyber-text-secondary'
+                    }`}
+                  >
+                    <span className="block truncate">{x.name}</span>
+                    <span className="text-[10px] text-cyber-text-muted">{x.count}</span>
+                  </button>
+                ))}
+                {tagItems.length === 0 && (
+                  <p className="px-2 py-1 text-[11px] font-mono text-cyber-text-muted">无匹配标签</p>
+                )}
+                {tagHasMore && (
+                  <button
+                    type="button"
+                    onClick={() => setTagLimit((n) => n + TAG_STEP)}
+                    className="w-full rounded px-2 py-1 text-center text-[11px] font-mono text-cyber-neon-cyan hover:bg-cyber-bg-tertiary"
+                  >
+                    加载更多（{tagItems.length}/{tagTotal}）
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* 发帖人筛选（多选）：勾选后只展示这些用户的帖子，清空即恢复全部 */}
         <div className="relative" ref={authorBoxRef}>
@@ -673,8 +763,18 @@ export function DataManagementView({
       </div>
 
       {/* 分页 */}
-      {total > pageSize && (
+      {total > 0 && (
         <div className="flex items-center justify-center gap-2 pt-1">
+          {/* 每页条数：选择持久化，改动后回到第 1 页 */}
+          <select
+            value={pageSize}
+            onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1) }}
+            className="h-7 rounded-md border border-cyber-border-subtle bg-cyber-bg-tertiary px-1.5 text-xs font-mono text-cyber-text-primary"
+          >
+            {PAGE_SIZE_OPTIONS.map((n) => (
+              <option key={n} value={n}>{n} 条/页</option>
+            ))}
+          </select>
           <Button
             variant="outline" size="sm" className="h-7 font-mono"
             disabled={page <= 1}

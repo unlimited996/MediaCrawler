@@ -19,12 +19,15 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 FORBIDDEN_KEYS = {
     "user_id", "sec_uid", "short_user_id", "user_unique_id", "user_signature",
     "avatar", "user_avatar", "face", "sign", "profile_url", "user_link",
-    "url_token", "user_url_token", "ip_location", "ip_address", "gender", "sex",
+    "url_token", "user_url_token", "ip_address", "gender", "sex",
     "up_id", "fan_id", "up_name", "fan_name", "up_avatar", "fan_avatar",
     "up_sign", "fan_sign", "mid",
 }
 # 说明：author_avatar 是"平台原始头像 URL"的承载键（经 normalize_avatar 规范化），
 # 不属于上面的禁用键集合，测试扫描按整键精确匹配，不会误伤。
+# ip_location 也已从禁用清单移出：评论「IP 属地」是 2026-10-27 明确上线的
+# 展示功能（v2 comment.ip_location / store 层从评论原始 JSON 提取），
+# 精确 IP 地址（ip_address）仍然禁用。
 AVATAR_ALLOWED_KEYS = {"author_avatar"}
 NICK_KEYS = {"nickname", "user_nickname", "screen_name", "name", "user_name"}
 

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 router = APIRouter(prefix="/data", tags=["data"])
 
@@ -280,6 +280,11 @@ async def serve_local_media(platform: str, content_id: str, filename: str):
 
     存在的意义：小红书/B站等 CDN 有防盗链，浏览器 <img> 直连原始 URL
     会吃 403。爬虫下载到本地的文件通过这个路由吐出，详情页就能正常显示。
+
+    访问链（与 tools/media_backup.py 头部约定保持一致）：本地优先；
+    本地文件缺失时回退到 S3 备份（第三级）。覆盖的场景：DB 里 local_path
+    与磁盘对不上（如图片被转成 webp 但库里仍记 jpg，而 S3 在转格式前已
+    上传原图），此时本地 404、S3 仍能取到。
     """
     # 防目录穿越：只允许纯文件名
     if "/" in filename or "\\" in filename or filename.startswith("."):
@@ -295,14 +300,88 @@ async def serve_local_media(platform: str, content_id: str, filename: str):
     except (ValueError, OSError):
         raise HTTPException(status_code=400, detail="非法路径")
 
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="文件不存在")
+    if file_path.is_file():
+        # 媒体文件不可变（按内容ID+序号命名），允许长缓存
+        return FileResponse(
+            file_path,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
-    # 媒体文件不可变（按内容ID+序号命名），允许长缓存
-    return FileResponse(
-        file_path,
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+    # 本地缺失 → 第三级：S3 备份兜底
+    s3_resp = await _serve_backup_fallback(platform, content_id, filename)
+    if s3_resp is not None:
+        return s3_resp
+
+    raise HTTPException(status_code=404, detail="文件不存在")
+
+
+async def _serve_backup_fallback(platform: str, content_id: str,
+                                filename: str) -> Optional[Response]:
+    """本地文件没了，按 platform+content_id+filename 在 media_backup 找对象键，
+    命中则从 S3 流式代理；无配置 / 无匹配记录 / 取失败都返回 None，交给上层 404。
+
+    对象键形如 ``{platform}/{media_type}/{content_id}/{filename}``，media_type
+    这一段路由路径里没有，所以用 content_id + 文件名后缀匹配，容忍类型差异。
+    """
+    from sqlalchemy import select
+
+    from .story import _session
+    from database.models_v2 import MediaBackup
+    from tools.media_backup import active_settings
+    from tools.s3_client import call
+
+    engine, session = await _session()
+    if session is None:
+        return None
+    try:
+        cfg = await active_settings(session)
+        if cfg is None:
+            return None
+        settings = cfg["settings"]
+        rows = (await session.execute(
+            select(MediaBackup.object_key).where(
+                MediaBackup.platform == platform,
+                MediaBackup.content_id == content_id,
+            )
+        )).scalars().all()
+        suffix = f"/{content_id}/{filename}"
+        for key in rows:
+            if not key or not key.endswith(suffix):
+                continue
+            try:
+                resp = await call(settings, "get_object",
+                                  Bucket=settings.bucket, Key=key)
+            except Exception:
+                continue
+            body = resp.get("Body")
+            if body is None:
+                continue
+            ctype = resp.get("ContentType") or "application/octet-stream"
+
+            def _iter():
+                try:
+                    while True:
+                        chunk = body.read(256 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    try:
+                        body.close()
+                    except Exception:
+                        pass
+
+            return StreamingResponse(
+                _iter(), media_type=ctype,
+                headers={"Cache-Control": "public, max-age=86400",
+                         "X-Backup-Source": "s3"},
+            )
+        return None
+    except Exception:
+        return None
+    finally:
+        await session.close()
+        await engine.dispose()
 
 
 @router.get("/raw/{file_path:path}")

@@ -566,10 +566,28 @@ export function CommentReplies({
                 className="mt-[3px]"
               />
               <div className="min-w-0 flex-1">
+                {/* 说话人 + 对话目标。顺序与原站一致：「<作者> 回复 @<被回复者>：内容」，
+                    作者名必须在前。子评论之间也会互相回复，reply_to 由后端按 parent_id
+                    映射得出，准确指向被回复的那条评论作者，而非一律指向主评论作者。 */}
                 <span className={mutedClassName}>
-                  {replyToPrefix ? `${replyToPrefix} ` : ''}{r.author || '-'}：
+                  {/* 微博等平台历史上用 replyToPrefix 表「回复 @」；已有精确
+                      reply_to 时不再叠加，避免「回复 @ 甲 回复 @乙」重复 */}
+                  {!r.reply_to && replyToPrefix ? `${replyToPrefix} ` : ''}{r.author || '-'}
                 </span>
+                {r.reply_to ? (
+                  <>
+                    <span className={mutedClassName}> 回复 </span>
+                    <span className="font-normal" style={{ color: accent }}>@{r.reply_to}</span>
+                  </>
+                ) : null}
+                <span className={mutedClassName}>：</span>
                 <span className={textClassName}>{r.content}</span>
+                <CommentImages pictures={r.pictures} />
+                {/* 每条子评论都像原站一样展示 IP 属地 + 时间 */}
+                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-cyber-text-muted">
+                  {r.ip_location ? <span>IP属地：{r.ip_location}</span> : null}
+                  <span>{fmtTs(r.publish_ts)}</span>
+                </div>
               </div>
             </div>
           ))}
@@ -584,6 +602,46 @@ export function CommentReplies({
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * 评论配图（表情包 / 图片评论）。
+ *
+ * 后端已把每条评论的配图解析成 [{url, local_url, backup_url, source}]，
+ * url 按「本地 → S3 → 平台远程」兜底。这里只负责网格渲染：单图大一点、
+ * 多图走三列，点击新标签打开原图。此前前端从未渲染评论 pictures，导致表情包看不到。
+ */
+export function CommentImages({
+  pictures, className = '',
+}: {
+  pictures?: any[] | null
+  className?: string
+}) {
+  if (!pictures || pictures.length === 0) return null
+  const single = pictures.length === 1
+  return (
+    <div
+      className={`mt-1.5 grid gap-1.5 ${single ? 'max-w-[220px] grid-cols-1' : 'max-w-[340px] grid-cols-3'} ${className}`}
+    >
+      {pictures.map((p: any, i: number) => (
+        <a
+          key={i}
+          href={p.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="block"
+        >
+          <img
+            src={p.url}
+            alt=""
+            loading="lazy"
+            className="w-full rounded-lg border border-cyber-border-subtle object-cover"
+            style={{ maxHeight: single ? 220 : 120 }}
+          />
+        </a>
+      ))}
     </div>
   )
 }
