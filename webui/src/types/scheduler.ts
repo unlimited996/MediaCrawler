@@ -27,6 +27,9 @@ export interface TaskOptions {
   account_name?: string | null
   /** 账号维度：本次每个行为最多抓多少条新帖（不填用爬虫默认 100） */
   max_notes?: number | null
+  /** 忽略风控冷却：撞验证码/限流熔断后默认会冷却一段时间，
+   *  勾选后本次强制执行（若仍撞验证码会弹浏览器等人工过验证） */
+  ignore_risk_cooldown?: boolean
 }
 
 export interface ScheduledTask {

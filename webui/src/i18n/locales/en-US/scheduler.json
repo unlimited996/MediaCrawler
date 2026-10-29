@@ -59,6 +59,7 @@
     "enableSubComments": "Sub-comments",
     "enableMedia": "Media",
     "headless": "Headless",
+    "ignoreRiskCooldown": "Ignore risk cooldown",
     "cookies": "Cookies (empty = account pool)",
     "enabled": "Enabled"
   },

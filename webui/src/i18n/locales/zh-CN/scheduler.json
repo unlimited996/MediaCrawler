@@ -59,6 +59,7 @@
     "enableSubComments": "抓取子评论",
     "enableMedia": "下载媒体",
     "headless": "无头模式",
+    "ignoreRiskCooldown": "忽略风控冷却",
     "cookies": "Cookie（留空则用账号池）",
     "enabled": "启用"
   },

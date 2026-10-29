@@ -90,6 +90,7 @@ const EMPTY_FORM: ScheduledTaskPayload = {
     account_id: null,
     account_name: null,
     max_notes: null,
+    ignore_risk_cooldown: false,
   },
   enabled: true,
 }
@@ -535,6 +536,15 @@ export function ScheduledTasksView() {
                 <label className="flex items-center gap-1.5 text-[11px] font-mono text-cyber-text-secondary cursor-pointer">
                   <Checkbox checked={form.options.enable_media} onCheckedChange={(v) => setOpt('enable_media', !!v)} />
                   {t('field.enableMedia')}
+                </label>
+              </div>
+              <div className="flex items-end gap-3 pb-1">
+                <label
+                  className="flex items-center gap-1.5 text-[11px] font-mono text-cyber-text-secondary cursor-pointer"
+                  title="撞验证码/限流熔断后，同账号默认冷却一段时间不再发起。勾选后本次强制执行（仍撞验证码会弹出浏览器等你过验证）。用完记得取消。"
+                >
+                  <Checkbox checked={!!form.options.ignore_risk_cooldown} onCheckedChange={(v) => setOpt('ignore_risk_cooldown', !!v)} />
+                  {t('field.ignoreRiskCooldown')}
                 </label>
               </div>
               <div className="flex items-end gap-3 pb-1">

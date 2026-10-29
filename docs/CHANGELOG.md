@@ -5,6 +5,33 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-29] 修复 风控冷却豁免开关实际未生效（ignore_risk_cooldown）
+
+### 问题
+上一版冷却闸口的提示写着「确需立刻跑，在任务选项里设 `ignore_risk_cooldown=true`」，
+但**代码里从来没读过这个开关**（全仓库只有那行日志文案提到它），
+用户在配置页也找不到 —— 它本来就不是全局配置项，而是任务级选项。
+
+另外 `_normalize_options` 是固定白名单，未知键会被静默丢弃，
+所以即便前端传了这个字段也存不住（和当年 `max_notes` 被吃掉是同一个坑）。
+
+### 变更
+- `api/routers/scheduler.py::_normalize_options` 显式保留 `ignore_risk_cooldown`；
+- `api/services/task_scheduler.py` 冷却判断前真正读取该选项：为真则
+  `cooldown_left = 0` 放行，并在任务日志里写明「原本还需 X 小时，本次强制执行」，
+  用户能清楚知道自己在绕过什么；
+- `POST /api/scheduler/tasks/{id}/run` 新增 `force` 查询参数：
+  手动「立即运行」属于明确人工意图，`?force=true` 一次性豁免冷却，
+  **只影响本次触发、不落库改任务配置**（`trigger(force=)` → `_execute(force_ignore_cooldown=)`）；
+- 前端「定时任务 → 抓取选项」新增**「忽略风控冷却」勾选框**（中英文案齐全），
+  悬停提示说明了风险和「用完记得取消」。
+
+### 验证
+- `_normalize_options({'ignore_risk_cooldown': True, 'max_notes': 50})` →
+  两个字段都被保留；不传时默认 `False`。
+- `GET /openapi.json` 确认 `/api/scheduler/tasks/{task_id}/run` 参数含 `force`。
+- 后端已重启（8081，HTTP 200），前端已重新构建进 `api/webui/`。
+
 ## [2026-10-29] 新增 撞验证码时主动弹出浏览器让人工过验证
 
 ### 问题

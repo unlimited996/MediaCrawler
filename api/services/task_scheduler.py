@@ -597,7 +597,7 @@ class TaskScheduler:
 
     # ---------- 执行 ----------
 
-    async def trigger(self, task_id: int) -> Dict[str, Any]:
+    async def trigger(self, task_id: int, force: bool = False) -> Dict[str, Any]:
         """手动触发一次（API 用）。**立即返回，不等执行结束**。
 
         一次抓取动辄几十分钟，若在这里同步 await 整轮执行，HTTP 请求会一直
@@ -605,6 +605,9 @@ class TaskScheduler:
         还在后台跑得好好的，用户白白以为失败了（2026-10-29 修）。
         改成和 tick 到点触发一致：后台 create_task，立刻给回执；
         进度与结果看执行记录 / 日志面板。
+
+        force=True：本次忽略风控冷却（只影响这一次触发，不改任务配置）。
+        手动点「立即运行」本身就是明确的人工意图，冷却闸口拦它反而碍事。
         """
         state = self._states.get(task_id)
         if state is None:
@@ -613,14 +616,16 @@ class TaskScheduler:
         if state.lock.locked():
             return {"status": "skipped", "reason": "already_running",
                     "message": "该任务正在执行中，已跳过本次触发（幂等保护）"}
-        task = asyncio.create_task(self._execute(task_id, trigger="manual"))
+        task = asyncio.create_task(
+            self._execute(task_id, trigger="manual", force_ignore_cooldown=force))
         # 保留强引用：asyncio 不会自动持有，裸 create_task 可能被 GC
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
         return {"status": "started",
                 "message": "已在后台开始执行，可在下方执行记录查看进度与结果"}
 
-    async def _execute(self, task_id: int, trigger: str = "manual") -> Dict[str, Any]:
+    async def _execute(self, task_id: int, trigger: str = "manual",
+                       force_ignore_cooldown: bool = False) -> Dict[str, Any]:
         from .profile_crawler import execute_task
 
         state = self._states.get(task_id)
@@ -652,6 +657,11 @@ class TaskScheduler:
                     await session.commit()
                     run_id = run.id
                     task_dict = self._task_dict(row)
+                    if force_ignore_cooldown:
+                        # 手动「立即运行」：本次豁免风控冷却，但不落库改配置
+                        _opts0 = dict(task_dict.get("options") or {})
+                        _opts0["ignore_risk_cooldown"] = True
+                        task_dict["options"] = _opts0
 
                 # 并发闸口：多个任务同时到点时按 SCHEDULER_MAX_CONCURRENCY 放行
                 assert self._sem is not None
@@ -717,6 +727,16 @@ class TaskScheduler:
                     # 硬跑只会把账号越推越死（2026-10-29：#27 在熔断 32 分钟后又跑，
                     # 43 篇就被二次拦住，随后整轮报废）。
                     cooldown_left = await self._risk_cooldown_remaining_sec(task_dict)
+                    if (task_dict.get("options") or {}).get("ignore_risk_cooldown"):
+                        # 任务选项显式豁免（勾了「忽略风控冷却」）：用户自己承担
+                        # 又被 461 拦一次的风险，但至少要知道自己在绕过什么。
+                        if cooldown_left > 0:
+                            _on_log(
+                                f"已按任务选项忽略风控冷却（原本还需约 "
+                                f"{cooldown_left / 3600:.1f} 小时），本次强制执行；"
+                                f"若仍撞验证码，会弹出浏览器等你人工过验证",
+                                "warning")
+                        cooldown_left = 0
                     if cooldown_left > 0:
                         from .profile_crawler import CrawlExecutionResult
 

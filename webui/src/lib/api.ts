@@ -423,10 +423,10 @@ export const schedulerApi = {
     api.delete<{ status: string; deleted: number }>(`/scheduler/tasks/${id}`),
   toggleTask: (id: number, enabled: boolean) =>
     api.post<ScheduledTask>(`/scheduler/tasks/${id}/toggle`, { enabled }),
-  runTask: (id: number) =>
+  runTask: (id: number, force = false) =>
     api.post<{ status: string; reason?: string; message?: string; new_count?: number;
                 updated_count?: number; run_id?: number; error?: string }>(
-      `/scheduler/tasks/${id}/run`),
+      `/scheduler/tasks/${id}/run${force ? '?force=true' : ''}`),
   listRuns: (taskId?: number, limit = 50) =>
     api.get<ScheduledTaskRun[]>('/scheduler/runs', {
       params: { task_id: taskId, limit },
