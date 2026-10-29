@@ -5,6 +5,34 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-29] 修复 任务选项保存不生效：入参模型白名单吞字段
+
+### 问题
+用户在「定时任务 → 抓取选项」勾选「忽略风控冷却」后点保存，**界面刷新后仍是未勾选**。
+
+排查确认：`api/schemas/scheduler.py::TaskOptions` 是**入参侧的第一道白名单**，
+pydantic 默认 `extra="ignore"`，模型里没声明的字段在请求进入路由**之前**就被丢弃，
+`_normalize_options` 再改也无济于事。
+
+连带发现更严重的问题：**`max_notes` 同样被丢弃**。也就是说之前那轮
+「`_normalize_options` 白名单补上 max_notes」的修复**实际从未生效** ——
+用户在「本次抓取上限」里填 100，存进库的永远是 `null`，任务一直按配置默认值跑。
+这正是「设了上限却只更新 20 篇」的真正根因。
+
+### 变更
+- `TaskOptions` 显式声明 `max_notes` / `mode` / `ignore_risk_cooldown`，
+  并设 `model_config = ConfigDict(extra="allow")`，杜绝以后再静默吞掉新选项。
+- `_normalize_options` 末尾把未识别的键原样透传（schema → 归一化 → 落库三层，
+  任何一层吞字段，表现都是「前端改了保存没变化」且完全无报错）。
+- 新增 `tests/test_scheduler_options.py`（6 条），覆盖：已知字段穿透、未知字段透传、
+  默认值语义（`False` / `None`）、create/update 两个入口、以及模拟前端 PUT 的全链路。
+
+### 验证
+- `TaskOptions(ignore_risk_cooldown=True, max_notes=50)` → 两字段均保留（修复前均为丢失）。
+- 端到端：`PUT /api/scheduler/tasks/27` 保存 `ignore_risk_cooldown=true` → 返回 `True`，
+  重新 `GET` 仍为 `True`（存档为 `False` 时即用户遇到的现象）。
+- 相关回归 25 passed；后端已重启。
+
 ## [2026-10-29] 修复 风控冷却豁免开关实际未生效（ignore_risk_cooldown）
 
 ### 问题

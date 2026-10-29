@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """定时拉取任务的 API 数据模型。"""
 
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .crawler import LoginTypeEnum, PlatformEnum, SaveDataOptionEnum
 
@@ -18,7 +18,19 @@ BehaviorLiteral = Literal["likes", "collects"]
 
 
 class TaskOptions(BaseModel):
-    """任务的抓取选项（与手动抓取配置保持一致）。"""
+    """任务的抓取选项（与手动抓取配置保持一致）。
+
+    ⚠️ 这是**入参模型的第二个白名单**：pydantic 默认 `extra="ignore"`，
+    模型里没声明的字段会被**静默丢弃**，根本到不了 `_normalize_options`。
+    2026-10-29 就因此连续踩了两次：
+      - `max_notes`（本次抓取上限）丢弃 → 用户填了 100 仍按默认跑，
+        「设了上限却只更新 20 篇」的真因（当时只改了 _normalize_options，
+        其实请求在 schema 层就被吃掉了，改动等于没生效）；
+      - `ignore_risk_cooldown` 同理 → 勾了保存也不生效。
+    现在显式声明 + `extra="allow"` 兜底，避免以后再静默吞掉新选项。
+    """
+    model_config = ConfigDict(extra="allow")
+
     login_type: LoginTypeEnum = LoginTypeEnum.COOKIE
     enable_comments: bool = True
     enable_sub_comments: bool = False
@@ -32,6 +44,13 @@ class TaskOptions(BaseModel):
     #: 账号维度专属：账号池账号 ID（人读名一并存，便于列表展示）
     account_id: Optional[int] = None
     account_name: Optional[str] = None
+    #: 本次每个行为最多抓多少条新帖（None=用爬虫默认，配置项 xhs_behavior_max_notes）
+    max_notes: Optional[int] = Field(default=None, ge=1, le=10000)
+    #: 抓取模式（顶层 mode 列才是主来源，这里仅兼容存进 options 的情况）
+    mode: Optional[str] = None
+    #: 风控冷却豁免：撞验证码/限流熔断后，同账号在 risk_cooldown_hours 内
+    #: 默认不再发起任务；勾上则允许本次强制执行（会优先弹浏览器让人工过验证）
+    ignore_risk_cooldown: bool = False
 
 
 class ScheduledTaskCreate(BaseModel):

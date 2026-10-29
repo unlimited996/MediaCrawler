@@ -19,7 +19,7 @@ def _normalize_options(opts: Dict[str, Any]) -> Dict[str, Any]:
     behaviors = [str(b) for b in behaviors if str(b) in ("likes", "collects")]
     if not behaviors:
         behaviors = ["likes", "collects"]
-    return {
+    normalized = {
         "login_type": getattr(opts.get("login_type"), "value", opts.get("login_type")),
         "enable_comments": bool(opts.get("enable_comments", True)),
         "enable_sub_comments": bool(opts.get("enable_sub_comments", False)),
@@ -43,6 +43,12 @@ def _normalize_options(opts: Dict[str, Any]) -> Dict[str, Any]:
         # 同样必须显式保留 —— 白名单会静默丢弃未知键，用户勾了也存不住。
         "ignore_risk_cooldown": bool(opts.get("ignore_risk_cooldown", False)),
     }
+    # 未知键原样透传。这里是「schema → 归一化 → 落库」的第三道白名单，
+    # 任何一层把字段吞掉，表现都是「前端填了/勾了，保存后毫无变化」，
+    # 而且完全静默、没有任何报错。宁可多存一个用不上的键，也别再丢字段。
+    for k, v in opts.items():
+        normalized.setdefault(k, v)
+    return normalized
 
 
 @router.get("/status", response_model=SchedulerStatusOut)
