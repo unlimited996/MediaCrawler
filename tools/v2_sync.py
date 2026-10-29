@@ -795,6 +795,54 @@ async def get_declared_comment_counts(platform_code: str,
         return {}
 
 
+async def get_comment_progress(platform_code: str,
+                               content_ids: Optional[List[str]] = None
+                               ) -> Dict[str, tuple]:
+    """批量取 (已抓评论数, 原帖显示评论量)，供抓取前**排序**用。
+
+    为什么需要：抓取被风控打断时，如果按「列表原始顺序」一篇篇抓，
+    结果就是每篇都只抓了个开头（0%→40%、0%→1%），一轮下来一篇都没收口。
+    改成「快完成的先抓」，一轮能真正抓完若干篇，剩余缺口也不会被摊薄
+    （2026-10-29 用户反馈「每篇抓一点，应该先排序再集中抓一篇」）。
+
+    返回 {source_content_id: (fetched, declared)}；查不到的按 (0, 0) 处理。
+    """
+    out: Dict[str, tuple] = {}
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return out
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return out
+            stmt = select(StoryChapter.source_content_id,
+                          StoryChapter.declared_comment_count,
+                          StoryChapter.comment_count,
+                          Story.comment_count,
+                          func.count(Comment.id)).join(
+                Story, Story.id == StoryChapter.story_id, isouter=True
+            ).outerjoin(
+                Comment, Comment.story_id == Story.id
+            ).where(StoryChapter.source_site_id == site_id).group_by(
+                StoryChapter.source_content_id,
+                StoryChapter.declared_comment_count,
+                StoryChapter.comment_count,
+                Story.comment_count)
+            if content_ids:
+                stmt = stmt.where(StoryChapter.source_content_id.in_(
+                    [str(i) for i in content_ids]))
+            for content_id, declared_c, chapter_c, story_c, fetched in (
+                    await session.execute(stmt)).all():
+                if not content_id:
+                    continue
+                declared = int(declared_c or chapter_c or story_c or 0)
+                out[str(content_id)] = (int(fetched or 0), declared)
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 读取评论抓取进度失败 {platform_code}: {e}")
+    return out
+
+
 async def refresh_comment_completeness(platform_code: str,
                                        content_ids: Optional[List[str]] = None
                                        ) -> int:

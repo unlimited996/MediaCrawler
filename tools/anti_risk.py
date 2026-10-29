@@ -161,11 +161,44 @@ def focus_browser_window() -> bool:
         return False
 
 
+async def _show_banner(page, text: str, color: str = "#e11d48") -> None:
+    """在页面上盖一条醒目的固定横幅，告诉用户「现在需要你做什么」。
+
+    为什么必须这么做：461/471 是**接口层**返回的，浏览器页面本身可能完全
+    正常（没有验证码、没有报错），用户盯着窗口根本不知道发生了什么，
+    只会觉得「窗口弹出来又关掉了」。有了这条横幅，至少能看懂要干嘛。
+    """
+    js = """
+    (args) => {
+      const id = '__mc_risk_banner__';
+      let el = document.getElementById(id);
+      if (!el) {
+        el = document.createElement('div');
+        el.id = id;
+        el.style.cssText = [
+          'position:fixed', 'z-index:2147483647', 'left:0', 'right:0', 'top:0',
+          'padding:12px 18px', 'font:600 15px/1.6 -apple-system,BlinkMacSystemFont,',
+          '"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif',
+          'color:#fff', 'text-align:center', 'box-shadow:0 2px 12px rgba(0,0,0,.35)',
+          'letter-spacing:.3px'
+        ].join(';');
+        document.documentElement.appendChild(el);
+      }
+      el.style.background = args.color;
+      el.textContent = args.text;
+    }
+    """
+    try:
+        await page.evaluate(js, {"text": text, "color": color})
+    except Exception:
+        pass  # 页面可能正在导航，打不上横幅不影响等待本身
+
+
 async def wait_for_human_verify(page, timeout_sec: int = 300,
                                 poll_sec: float = 5.0,
                                 url: Optional[str] = None,
                                 grace_sec: float = 8.0,
-                                manual_window_sec: float = 45.0) -> bool:
+                                manual_window_sec: Optional[float] = None) -> bool:
     """验证码人工介入：把浏览器窗口弹到最前，等用户手动完成验证后继续。
 
     流程：窗口置前 →（可选）导航到触发风控的 URL → 等验证页真正渲染出来 →
@@ -185,6 +218,8 @@ async def wait_for_human_verify(page, timeout_sec: int = 300,
     page 为 None 时无法人工操作，直接返回 False（调用方应先尝试拉起浏览器）。
     """
     timeout_sec = int(timeout_sec or 300)
+    # 轮询间隔必须 > 0：传 0 会让 waited 永远不增，循环卡死（测试里踩过）
+    poll = max(0.05, float(poll_sec or 0))
     if page is None:
         utils.logger.warning(
             "[anti_risk] 触发验证码但没有可用浏览器页面，无法人工介入")
@@ -222,31 +257,49 @@ async def wait_for_human_verify(page, timeout_sec: int = 300,
     if not saw_captcha:
         # 浏览器能正常打开 → 账号本身没被限，问题多半是 httpx 侧的 Cookie/签名
         # 没同步（或需要重新登录）。给用户一个可操作窗口，然后同步 Cookie 重试一次。
+        # 注意：这里**不能**只等几十秒就走 —— 用户可能在扫码登录/手动过滑块，
+        # 窗口一闪就关会让他完全来不及（2026-10-29 用户反馈「弹出来直接关闭了」）。
+        window = float(timeout_sec if manual_window_sec is None
+                       else manual_window_sec)
+        window = max(0.0, min(window, max(0.0, timeout_sec - waited)))
+        await _show_banner(
+            page,
+            f"⚠️ 检测到接口风控（页面可能没有验证码）：如未登录请在此窗口重新登录，"
+            f"程序会等你 {int(window)} 秒后自动同步 Cookie 并重试")
         utils.logger.warning(
             "[anti_risk] 页面上没有出现验证码 —— 浏览器侧访问正常，"
             "问题多半在 httpx 的 Cookie/签名。"
             f"\n            如需重新登录 / 手动处理，请现在就在这个窗口里操作；"
-            f"\n            {int(manual_window_sec)}s 后程序会同步最新 Cookie 并重试一次 ...")
+            f"\n            {int(window)}s 后程序会同步最新 Cookie 并重试一次 ...")
         waited = 0.0
-        window = min(manual_window_sec, max(0, timeout_sec - waited))
         while waited < window:
-            await asyncio.sleep(poll_sec)
-            waited += poll_sec
+            await asyncio.sleep(poll)
+            waited += poll
             if await page_has_captcha(page):
                 utils.logger.warning(
                     "[anti_risk] 检测到验证页，转为等待你完成验证 ...")
                 saw_captcha = True
                 break
+            if int(waited) % 60 == 0:
+                # 每分钟提醒一次：让用户知道程序还在等，不是卡死了
+                utils.logger.warning(
+                    f"[anti_risk] 仍在等待你操作（已等 {int(waited)}s / "
+                    f"共 {int(window)}s），完成后会自动继续")
+                await _show_banner(
+                    page,
+                    f"⚠️ 仍在等你操作：{int(window - waited)} 秒后自动同步 Cookie 并重试"
+                    f"（若未登录，请现在扫码登录）")
         if not saw_captcha:
             utils.logger.info(
                 "[anti_risk] 手动窗口结束，按「浏览器侧正常」处理："
                 "同步 Cookie 后重试一次")
             return True
     utils.logger.warning("[anti_risk] 已检测到验证页，等待你完成验证 ...")
+    await _show_banner(page, "⚠️ 请在此窗口完成安全验证，完成后程序会自动继续")
 
     while waited < timeout_sec:
-        await asyncio.sleep(poll_sec)
-        waited += poll_sec
+        await asyncio.sleep(poll)
+        waited += poll
         if not await page_has_captcha(page):
             utils.logger.info(
                 f"[anti_risk] 人工验证已完成（等了 {int(waited)}s），继续抓取")

@@ -21,7 +21,7 @@ import asyncio
 import os
 import random
 from asyncio import Task
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from urllib.parse import quote
 
 from tenacity import RetryError
@@ -76,6 +76,33 @@ def _xhs_captcha_wait_sec() -> int:
     return int(getattr(config, "XHS_CAPTCHA_WAIT_SEC", 300) or 300)
 
 
+def comment_fetch_order(progress: Dict[str, tuple],
+                        declared_map: Dict[str, int]) -> Callable[[str], tuple]:
+    """评论抓取排序键：**快抓完的先抓**，让一轮能真正收口若干篇。
+
+    背景（2026-10-29 用户反馈）：原先按列表原始顺序串行抓，被风控打断时
+    结果是「每篇都抓了一点」（0%→40%、0%→1%、其余全 0%），一轮下来
+    没有任何一篇是完整的，下一轮还得从头摊一遍。
+    改成按完成度降序后：接近完成的先抓完落库，风控打断时也已经有一批
+    帖子是完整的；未完成的靠断点续抓继续，不会被摊薄。
+
+    返回的 key 元组依次为：
+      0) 有已抓进度的排最前，其次有声明数但还没开抓的，最后是声明数缺失的；
+      1) 完成度（取负 → 越大越靠前，即「缺口越小越优先」）；
+      2) 声明数（同完成度时，评论区小、更容易收口的先抓）。
+    """
+    def _key(content_id: str) -> tuple:
+        fetched, declared = progress.get(str(content_id), (0, 0))
+        declared = int(declared or declared_map.get(str(content_id), 0) or 0)
+        if declared <= 0:
+            # 没有声明数（= 没有评论需求 / 数据缺失）：排最后
+            return (2, 0.0, 0)
+        ratio = min(1.0, fetched / float(declared))
+        return (0 if fetched > 0 else 1, -ratio, declared)
+
+    return _key
+
+
 def _comment_max_count(declared: int) -> int:
     """单篇笔记抓多少条一级评论（0 = 不限制，翻到 has_more=False）。
 
@@ -112,6 +139,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
     _comment_done_count: int = 0
     # 人工过验证：每轮只弹一次浏览器，避免连着几篇 461 反复弹窗打断用户
     _human_verify_tried: bool = False
+    # 浏览器**实际**是否无头（启动时记录）。不能只看配置推断：
+    # CDP 模式常配 XHS_CDP_HEADLESS=False，但 CDP 连不上时会回退到标准模式，
+    # 那里 headless 可能仍是 True —— 结果是「以为窗口可见、其实什么都没有」，
+    # 撞验证码时用户看不到任何窗口（2026-10-29 踩过）。
+    _browser_headless_actual: Optional[bool] = None
     # 无浏览器模式下临时拉起的 playwright 句柄（用完要 stop，否则泄漏 driver 进程）
     _verify_playwright = None
 
@@ -129,6 +161,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self._comment_fail_streak: int = 0
         self._comment_done_count: int = 0
         self._human_verify_tried: bool = False
+        self._browser_headless_actual = None
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -196,6 +229,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     auto_close=bool(getattr(config, "XHS_AUTO_CLOSE_BROWSER",
                                            config.AUTO_CLOSE_BROWSER)),
                 )
+                self._browser_headless_actual = bool(
+                    getattr(config, "XHS_CDP_HEADLESS", config.CDP_HEADLESS))
             else:
                 utils.logger.info("[XiaoHongShuCrawler] Launching browser using standard mode")
                 # Launch a browser context.
@@ -206,6 +241,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     self.user_agent,
                     headless=config.HEADLESS,
                 )
+                # 标准模式（CDP 连不上时的回退路径）实际 headless 由 config.HEADLESS
+                # 决定。必须记下来：CDP 配置里的 XHS_CDP_HEADLESS=False 在这条路径上
+                # 根本不生效，只按配置推断会以为窗口可见，实际是无头的（看不见）。
+                self._browser_headless_actual = bool(config.HEADLESS)
                 # stealth.min.js is a js script to prevent the website from detecting the crawler.
                 await self.browser_context.add_init_script(path="libs/stealth.min.js")
 
@@ -1248,20 +1287,41 @@ class XiaoHongShuCrawler(AbstractCrawler):
         # 单篇评论上限按「原帖显示评论量」推算（不再统一吃全局的 30）：
         # 声明 800 条的帖子就该抓 800 条，否则增量判定会把它当已归档。
         declared_map: Dict[str, int] = {}
+        progress_map: Dict[str, tuple] = {}
         try:
-            from tools.v2_sync import get_declared_comment_counts
+            from tools.v2_sync import (get_comment_progress,
+                                       get_declared_comment_counts)
 
             declared_map = await get_declared_comment_counts("xhs", note_list)
+            progress_map = await get_comment_progress("xhs", note_list)
         except Exception as e:
             utils.logger.warning(
                 f"[XiaoHongShuCrawler.batch_get_note_comments] 读取声明评论数失败，"
                 f"按不限制处理: {type(e).__name__}: {e}")
 
+        # ---- 抓取顺序：先排序，再一篇一篇抓到底（2026-10-29）----
+        # 原先按列表原始顺序串行：一旦中途被风控打断，结果就是「每篇都抓了
+        # 一点」（0%→40%、0%→1%、其余 0%），一轮下来没有任何一篇真正收口。
+        # 现在按「完成度从高到低」排（见 comment_fetch_order）。
+        order_key = comment_fetch_order(progress_map, declared_map)
+        order = sorted(range(len(note_list)),
+                       key=lambda i: order_key(note_list[i]))
+        ordered_notes = [note_list[i] for i in order]
+        ordered_tokens = [xsec_tokens[i] for i in order]
+        if order and order[:5] != list(range(min(5, len(order)))):
+            preview = []
+            for i in order[:5]:
+                f, d = progress_map.get(str(note_list[i]), (0, 0))
+                preview.append(f"{note_list[i]} {f}/{d or '?'}")
+            utils.logger.info(
+                "[XiaoHongShuCrawler.batch_get_note_comments] 按完成度排序后优先抓："
+                + "；".join(preview))
+
         semaphore = asyncio.Semaphore(_xhs_concurrency())
         task_list: List[Task] = []
-        for index, note_id in enumerate(note_list):
+        for index, note_id in enumerate(ordered_notes):
             task = asyncio.create_task(
-                self.get_comments(note_id=note_id, xsec_token=xsec_tokens[index],
+                self.get_comments(note_id=note_id, xsec_token=ordered_tokens[index],
                                   semaphore=semaphore,
                                   declared=int(declared_map.get(str(note_id), 0) or 0)),
                 name=note_id,
@@ -1399,9 +1459,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         utils.logger.info(
                             f"[XiaoHongShuCrawler.get_comments] 人工验证后评论重试成功: {note_id}")
                     except Exception as retry_err:
+                        # 重试仍被拦：必须**重新**熔断。此前这里只记日志，
+                        # 而 _human_verify 成功时已经清空了 _risk_abort_reason，
+                        # 于是下一篇会毫无防备地再撞一次 461
+                        # （2026-10-29：6acca231 就是这样多撞了一篇、只抓到 1%）。
+                        self._abort(
+                            f"人工验证后仍触发风控：{type(retry_err).__name__}",
+                            type(retry_err))
                         utils.logger.warning(
                             f"[XiaoHongShuCrawler.get_comments] 人工验证后评论重试失败 "
-                            f"{note_id}: {type(retry_err).__name__}")
+                            f"{note_id}: {type(retry_err).__name__}（已重新熔断，不再连撞）")
                 return
             except (IPBlockError, PlatformAccessError) as e:
                 self._abort(f"评论接口触发风控：{type(e).__name__}", type(e))
@@ -1493,7 +1560,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 f"&xsec_source={xsec_source or 'pc_search'}")
 
     def _is_headless_now(self) -> bool:
-        """当前主流程是否在无头模式跑（无头时用户看不到主窗口，需要另开可见窗口）。"""
+        """当前主流程是否在无头模式跑（无头时用户看不到主窗口，需要另开可见窗口）。
+
+        优先用 `_browser_headless_actual`（启动时记录的实际值）。只按配置推断
+        会在「CDP 配了有头、实际回退到标准无头模式」时判错，于是撞验证码时
+        既不置前也另开窗口，用户什么都看不到（2026-10-29 踩过）。
+        """
+        actual = getattr(self, "_browser_headless_actual", None)
+        if actual is not None:
+            return bool(actual)
         try:
             use_cdp = bool(getattr(config, "XHS_ENABLE_CDP_MODE",
                                    config.ENABLE_CDP_MODE))
@@ -1524,14 +1599,37 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 "[XiaoHongShuCrawler] 本轮已尝试过一次人工验证，不再重复弹窗"
                 "（避免连续 461 反复打断你）")
             return False
-        self._human_verify_tried = True
+
+        utils.logger.warning(
+            f"[XiaoHongShuCrawler] 命中验证码 → 准备弹出浏览器（"
+            f"主页面{'有' if self.context_page is not None else '无'} / "
+            f"无头模式={self._is_headless_now()}）。"
+            f"若窗口没出现，请检查是否被其它窗口盖住或被移到别的桌面。")
 
         page = self.context_page
         temp_ctx = None
-        if page is None or self._is_headless_now():
+        need_spawn = page is None or self._is_headless_now()
+        if not need_spawn:
+            # 主浏览器本身可见，但可能被最小化 / 被别的窗口压住 / 不在当前桌面。
+            # 先尝试 OS 级置前；连窗口都找不到，就说明"可见"是假的（例如 CDP
+            # 连的其实是个离屏实例），退回到专用可见窗口。
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            focused = anti_risk.focus_browser_window()
+            if not focused:
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler] 主浏览器窗口无法置前（找不到窗口句柄），"
+                    "改为打开专用可见窗口供你操作")
+                need_spawn = True
+            else:
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler] 已把浏览器窗口置前，请在其中完成验证/登录")
+        if need_spawn:
             # 两种情况用户都“看不见窗口”，必须另开一个可见的：
             # 1) 无浏览器模式（enable_browser=false），压根没有页面；
-            # 2) 主流程跑在无头模式，窗口存在但不可见。
+            # 2) 主流程跑在无头模式（或窗口无法置前）。
             # 临时浏览器专供人工过验证，用完即关，不影响主流程。
             page, temp_ctx = await self._spawn_verify_browser()
             if page is None:
@@ -1539,7 +1637,18 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     "[XiaoHongShuCrawler] 没有可用浏览器，无法弹出验证窗口；"
                     "如需人工过验证，请检查本机 Chrome/Chromium 是否可用")
                 return False
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            anti_risk.focus_browser_window()
 
+        # 只有「真的有一个可操作窗口」才开始计一次弹窗配额。
+        # 之前一进函数就置 True：若这次弹窗根本没成功（起浏览器失败/流程异常），
+        # 后面整轮都不会再试，用户永远等不到窗口（2026-10-29）。
+        self._human_verify_tried = True
+
+        verified = False
         try:
             verified = await anti_risk.wait_for_human_verify(
                 page,
@@ -1565,6 +1674,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 except Exception as e:
                     utils.logger.warning(
                         f"[XiaoHongShuCrawler] 验证后同步账号池失败：{e}")
+        except Exception as e:
+            # 兜底：弹窗流程自身出错时按「未通过」处理，但**必须留痕**。
+            # 曾出现「日志里只有重试失败、没有任何弹窗记录」的静默失效，
+            # 排查时完全没法定位（2026-10-29）。
+            utils.logger.error(
+                f"[XiaoHongShuCrawler] 人工验证流程异常（按未通过处理）："
+                f"{type(e).__name__}: {e}")
+            verified = False
         finally:
             if temp_ctx is not None:
                 try:
