@@ -1064,6 +1064,12 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     break
                 pages += 1
                 raw_this += len(notes)
+                # 本页排进「详情+评论」抓取的目标数，必须每页重置：
+                # 若只在 `if fresh:` 里初始化，某页去重后为空（点赞/收藏
+                # 交叉重复）时会沿用上一页的值，导致该睡不睡 / 不该睡却睡。
+                # 默认 0（本页没新帖 = 没有任何抓取目标）；
+                # None = 旧式回调（排队数未知，保守按需要休眠）。
+                queued_this = 0
                 fresh = []
                 for n in notes:
                     nid = str(n.get("note_id") or n.get("id") or "")
@@ -1076,8 +1082,6 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     f"{len(notes)} 条，去重后新增 {len(fresh)} 条（累计扫描 {raw_this} 条）")
                 if fresh:
                     stop = False
-                    queued_this = None  # 本页排进「详情+评论」抓取的目标数；
-                                        # None=旧式回调（未知，保守按需要休眠）
                     if callback:
                         try:
                             ret = await callback(fresh, behavior_key)
@@ -1091,7 +1095,9 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                             stop = bool(ret.get("stop", False))
                             queued_this = int(ret.get("queued", 0))
                         else:
+                            # 旧式回调只回 bool，排队数未知 → 保守（照旧休眠）
                             stop = (ret is False)
+                            queued_this = None
                     result.extend(fresh)
                     got_this += len(fresh)
                     if stop:
@@ -1111,8 +1117,15 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 # 随机休眠只在本页确实有「要抓详情+评论」的帖子时才做：
                 # 增量模式下绝大部分页是已归档帖（queued=0），白睡毫无意义——
                 # 既不会触发重的评论请求，也不需要为真人节奏铺垫。
-                if queued_this is None or queued_this > 0:
-                    await anti_risk.interval_sleep(crawl_interval, f"{label}列表翻页间隔")
+                # 另外「末页不休眠」：本页回来时已经 has_more=False（或额度已满、
+                # 不会再翻），循环下一轮必然退出，这时再睡 5-15s 纯属白等
+                # （实测第 50 页回来后又睡了 12.81s 才收工）。
+                more_pages = has_more and got_this < max_notes
+                if more_pages and (queued_this is None or queued_this > 0):
+                    reason = f"{label}列表翻页间隔"
+                    if queued_this is not None:
+                        reason += f"（本页待抓 {queued_this} 篇）"
+                    await anti_risk.interval_sleep(crawl_interval, reason)
 
             utils.logger.info(
                 f"[XiaoHongShuClient.get_all_behavior_notes] {label}抓取结束："

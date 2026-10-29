@@ -172,3 +172,92 @@ async def test_dict_callback_contract_queued_is_zero_does_not_stop():
 
     assert len(queued) == budget
     assert queued[0] == "L460", "应跳过前 460 条已归档的帖子继续翻页"
+
+
+# ---------------------------------------------------------------------------
+# 翻页随机休眠的取舍（2026-10-29）
+#   背景：account 备份任务翻 50 页点赞，绝大部分页是视频帖/已归档帖，
+#   每页都睡 5-15s 纯属白等；而末页回来时 has_more 已经是 False，
+#   再睡一轮（实测 12.81s）后才收工，完全是浪费。
+# ---------------------------------------------------------------------------
+
+def _patch_sleep(monkeypatch):
+    """拦截真实休眠，记录被调用的次数与原因。"""
+    import media_platform.xhs.client as client_mod
+
+    calls = []
+
+    async def _no_sleep(spec, reason=""):
+        calls.append(reason)
+        return 0.0
+
+    monkeypatch.setattr(client_mod.anti_risk, "interval_sleep", _no_sleep)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_no_sleep_on_last_page(monkeypatch):
+    """末页（has_more=False）不再做翻页休眠：3 页只该睡 2 次。"""
+    sleeps = _patch_sleep(monkeypatch)
+    client = _client()
+    client.get_user_liked_notes = _fake_fetcher(30, "L")  # 3 页
+
+    async def cb(batch, label="likes"):
+        return {"stop": False, "queued": len(batch)}
+
+    await client.get_all_behavior_notes(
+        "uid", behaviors=["likes"], crawl_interval=0, callback=cb)
+
+    assert len(sleeps) == 2, f"3 页最多睡 2 次（末页不睡），实际 {sleeps}"
+
+
+@pytest.mark.asyncio
+async def test_no_sleep_when_page_has_no_targets(monkeypatch):
+    """整页都是视频帖/已归档帖（queued=0）时，翻页不应休眠。"""
+    sleeps = _patch_sleep(monkeypatch)
+    client = _client()
+    client.get_user_liked_notes = _fake_fetcher(30, "L")
+
+    async def cb(batch, label="likes"):
+        return {"stop": False, "queued": 0}
+
+    await client.get_all_behavior_notes(
+        "uid", behaviors=["likes"], crawl_interval=0, callback=cb)
+
+    assert sleeps == [], f"没有抓取目标就不该休眠，实际 {sleeps}"
+
+
+@pytest.mark.asyncio
+async def test_empty_fresh_page_does_not_inherit_previous_queued(monkeypatch):
+    """中间某页去重后为空时，不能沿用上一页的 queued 值去休眠。"""
+    sleeps = _patch_sleep(monkeypatch)
+    client = _client()
+    page = {"n": 0}
+
+    async def _fetch(user_id, cursor="", page_size=30):
+        page["n"] += 1
+        n = page["n"]
+        if n == 1:
+            ids, has_more = range(0, PAGE), True        # 新帖 L0..L9
+        elif n == 2:
+            ids, has_more = range(0, PAGE), True        # 全与第一页重复
+        else:
+            ids, has_more = range(PAGE, PAGE * 2), False
+        return {
+            "notes": [{"note_id": f"L{i}", "type": "normal"} for i in ids],
+            "has_more": has_more,
+            "cursor": str(n),
+        }
+
+    client.get_user_liked_notes = _fetch
+
+    async def cb(batch, label="likes"):
+        return {"stop": False, "queued": len(batch)}
+
+    await client.get_all_behavior_notes(
+        "uid", behaviors=["likes"], crawl_interval=0, callback=cb)
+
+    # 第 1 页 queued=10 睡一次；第 2 页 fresh=0（不该沿用 10 去睡）；
+    # 第 3 页是末页（不睡）
+    assert len(sleeps) == 1, f"只应在第 1 页睡 1 次，实际 {sleeps}"
+

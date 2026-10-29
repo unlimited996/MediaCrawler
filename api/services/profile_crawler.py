@@ -530,6 +530,15 @@ async def execute_task(task: Dict[str, Any], busy_wait_sec: int = 300,
             break
         if result.status == "skipped":
             break  # 通道被占不是任务的错，重试没有意义
+        # 风控熔断不重试：被平台验证码/限流整批拦下后 60s 就再打一轮，
+        # 只会把账号越推越死（熔断的意义本来就是踩刹车）。等下一轮排期，
+        # 留出冷却/人工过验证码的时间。
+        if result.status == "failed" and "触发平台风控" in (result.error or ""):
+            if on_log:
+                on_log(
+                    "本轮触发平台风控，已熔断：不自动重试，等下次排期"
+                    "（建议先冷却或人工过验证码）", "warning")
+            break
         if attempt < total_attempts:
             if on_log:
                 on_log(f"第 {attempt}/{total_attempts} 次执行失败，{delay}s 后重试", "warning")
