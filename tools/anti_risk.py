@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 from typing import Optional, Tuple
 
@@ -115,37 +116,141 @@ async def page_has_captcha(page) -> bool:
     return looks_like_captcha_text(body)
 
 
+def focus_browser_window() -> bool:
+    """把浏览器窗口拉到最前（Windows）。
+
+    验证码必须在**看得见的窗口**里点，否则用户根本不知道要去操作：
+    Playwright 的 `bring_to_front()` 只激活标签页，窗口最小化/被其它窗口
+    盖住时仍然看不见，所以这里再补一次 OS 级 restore + 置前。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        handles = []
+
+        def _cb(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                title = buf.value or ""
+            except Exception:
+                return True
+            if any(k in title for k in
+                   ("Chromium", "Chrome", "Microsoft Edge", "小红书", "Xiaohongshu")):
+                handles.append(hwnd)
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        if not handles:
+            return False
+        hwnd = handles[0]
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
 async def wait_for_human_verify(page, timeout_sec: int = 300,
-                                poll_sec: float = 5.0) -> bool:
-    """验证码人工介入：等用户在真实浏览器里手动完成验证后继续。
+                                poll_sec: float = 5.0,
+                                url: Optional[str] = None,
+                                grace_sec: float = 8.0,
+                                manual_window_sec: float = 45.0) -> bool:
+    """验证码人工介入：把浏览器窗口弹到最前，等用户手动完成验证后继续。
 
-    流程：打印醒目指引 → 轮询页面验证码是否消失 → 消失即放行；
-    超时返回 False（调用方决定重试或中止）。
+    流程：窗口置前 →（可选）导航到触发风控的 URL → 等验证页真正渲染出来 →
+    轮询验证码是否消失 → 消失即放行。
 
-    page 为 None 时无法人工操作，直接返回 False（不再空等 30s：
-    没人能在这台机器上点验证码，等下去只是拖慢整批任务）。
+    返回 True 的两种情况：
+    1. 页面上出现过验证码，且已被用户处理掉；
+    2. 页面全程没有验证码（浏览器能正常访问）——给 `manual_window_sec` 的
+       可操作窗口后按「Cookie 不同步」处理，让调用方同步 Cookie 再重试一次。
+
+    与旧版的区别（2026-10-29）：
+    - **主动前置窗口**并导航到出事的页面，用户一眼能看到要操作什么；
+    - 先等 `grace_sec` 让页面渲染完再判断，避免"页面还没出来 → 误判已完成"
+      导致立刻返回 True、下一发请求又撞 461；
+    - 全程没见过验证页时不再直接放弃，而是留出人工窗口（用户可能要重新登录）。
+
+    page 为 None 时无法人工操作，直接返回 False（调用方应先尝试拉起浏览器）。
     """
     timeout_sec = int(timeout_sec or 300)
     if page is None:
         utils.logger.warning(
-            "[anti_risk] 触发验证码但当前是无浏览器模式，无法人工介入，"
-            "直接跳过该目标")
+            "[anti_risk] 触发验证码但没有可用浏览器页面，无法人工介入")
         return False
+
+    # 1) 窗口前置 + 导航到出事的页面（让验证页/登录墙真的显现出来）
+    try:
+        await page.bring_to_front()
+    except Exception:
+        pass
+    focus_browser_window()
+
+    if url:
+        try:
+            await page.goto(url, wait_until="domcontentloaded",
+                            timeout=min(30, max(10, timeout_sec)) * 1000)
+        except Exception as e:
+            utils.logger.warning(f"[anti_risk] 打开验证页失败（不影响人工操作）：{e}")
 
     utils.logger.warning(
         "\n" + "=" * 64 +
-        "\n[anti_risk] 触发小红书安全验证！请在已连接的浏览器窗口中"
-        "\n           手动完成验证（滑块/二维码），完成后程序会自动继续。"
-        f"\n           最长等待 {timeout_sec}s ..." +
+        "\n[anti_risk] 触发小红书安全验证！浏览器窗口已置前，请在该窗口中"
+        "\n           手动完成验证（滑块 / 扫码 / 点按），完成后程序会自动继续。"
+        f"\n           最长等待 {timeout_sec}s（页面：{(url or '当前页')[:80]}）" +
         "\n" + "=" * 64)
 
+    # 2) 先给页面渲染的宽限期，避免"验证页还没出来"被误判成"已完成"
     waited = 0.0
-    while waited < timeout_sec:
-        if not await page_has_captcha(page):
-            utils.logger.info("[anti_risk] 人工验证已完成，继续抓取")
+    while waited < min(grace_sec, timeout_sec):
+        await asyncio.sleep(1.0)
+        waited += 1.0
+
+    # 3) 轮询：必须有「见过验证页 → 又消失」的过程才算通过
+    saw_captcha = await page_has_captcha(page)
+    if not saw_captcha:
+        # 浏览器能正常打开 → 账号本身没被限，问题多半是 httpx 侧的 Cookie/签名
+        # 没同步（或需要重新登录）。给用户一个可操作窗口，然后同步 Cookie 重试一次。
+        utils.logger.warning(
+            "[anti_risk] 页面上没有出现验证码 —— 浏览器侧访问正常，"
+            "问题多半在 httpx 的 Cookie/签名。"
+            f"\n            如需重新登录 / 手动处理，请现在就在这个窗口里操作；"
+            f"\n            {int(manual_window_sec)}s 后程序会同步最新 Cookie 并重试一次 ...")
+        waited = 0.0
+        window = min(manual_window_sec, max(0, timeout_sec - waited))
+        while waited < window:
+            await asyncio.sleep(poll_sec)
+            waited += poll_sec
+            if await page_has_captcha(page):
+                utils.logger.warning(
+                    "[anti_risk] 检测到验证页，转为等待你完成验证 ...")
+                saw_captcha = True
+                break
+        if not saw_captcha:
+            utils.logger.info(
+                "[anti_risk] 手动窗口结束，按「浏览器侧正常」处理："
+                "同步 Cookie 后重试一次")
             return True
+    utils.logger.warning("[anti_risk] 已检测到验证页，等待你完成验证 ...")
+
+    while waited < timeout_sec:
         await asyncio.sleep(poll_sec)
         waited += poll_sec
+        if not await page_has_captcha(page):
+            utils.logger.info(
+                f"[anti_risk] 人工验证已完成（等了 {int(waited)}s），继续抓取")
+            return True
         if int(waited) % 60 == 0:
             utils.logger.info(
                 f"[anti_risk] 仍在等待人工验证 ...（已等 {int(waited)}s）")

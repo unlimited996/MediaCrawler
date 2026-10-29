@@ -5,6 +5,47 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-29] 新增 撞验证码时主动弹出浏览器让人工过验证
+
+### 问题
+撞 461/471 后虽然写了「等用户人工验证」，但实际从来没弹出过窗口：
+- `get_note_detail_async_task` 的内层 `except` 先把 `CaptchaError` 吃掉
+  （`_abort` + `return None`），外层那段 `wait_for_human_verify` 是**死代码**；
+- 即便走到了，`wait_for_human_verify` 也是拿停在首页的 `context_page` 直接判断
+  「页面有没有验证码」——页面本来就没有验证页（461 是接口层返回的），
+  于是判定通过/放弃，用户完全不知道发生过什么；
+- 无头模式、无浏览器模式下 `context_page is None`，直接返回 False。
+
+### 变更
+- `tools/anti_risk.py::wait_for_human_verify` 重写为「真的把窗口摆到用户面前」：
+  - **OS 级窗口置前**（新增 `focus_browser_window()`，`ShowWindow(SW_RESTORE)`
+    + `SetForegroundWindow`，因为 `bring_to_front()` 只激活标签页，
+    窗口最小化/被覆盖时用户仍然看不见）；
+  - 支持 `url` 参数：主动导航到**出事的那一篇笔记**，让验证页/登录墙真的显现；
+  - 先给 `grace_sec`（默认 8s）渲染宽限，避免「页面还没出来」被误判成已完成；
+  - 页面全程无验证码时不再直接放弃：留出 `manual_window_sec`（默认 45s）
+    人工窗口，然后按「浏览器正常、httpx Cookie 不同步」返回 True；
+- `media_platform/xhs/core.py` 新增 `_human_verify(url)` 统一入口：
+  - **每轮只弹一次**（`_human_verify_tried`），不会连着几篇 461 反复打断；
+  - 无浏览器模式**或主流程无头**时，临时拉起一个可见浏览器
+    （`_spawn_verify_browser`）专供人工操作，用完关闭并 `playwright.stop()`；
+  - 验证后**回灌 Cookie**：浏览器 → httpx（`update_cookies`）+ 账号池
+    （`sync_login_to_pool`）。用户过验证/重新登录的结果只存在于浏览器里，
+    不同步的话 httpx 还拿旧 Cookie 继续撞 461；
+  - 验证通过 → 解除熔断、当场重试当前那篇笔记/评论；再次 461 则真熔断。
+- 三处失效的调用点（详情内层、评论 CaptchaError/IPBlock、搜索/作者页）全部
+  改走 `_human_verify`。
+
+### 验证
+- 新增 `tests/test_anti_risk_verify.py`（6 条）：无页面直接 False、验证页必须
+  消失才通过、无验证页走人工窗口后返回 True、必须导航到出事 URL、超时返回
+  False、窗口置前在任意平台不抛异常。
+- 连同 `test_xhs_risk_abort.py` / `test_xhs_behavior_paging.py` 共 **19 passed**。
+- 实测：`_spawn_verify_browser()` 能拉起可见窗口，`focus_browser_window()`
+  返回 True，首页标题正常 `小红书 - 你的生活兴趣社区`，`page_has_captcha=False`
+  ——说明当前账号在**浏览器侧**是好的，461 只出现在 httpx 接口层，
+  这正是「同步 Cookie 再重试一次」要解决的问题。
+
 ## [2026-10-29] 修复 风控反复触发：461 被吞 + 无跨轮冷却
 
 ### 现象

@@ -110,6 +110,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
     _risk_abort_reason: str = ""
     _comment_fail_streak: int = 0
     _comment_done_count: int = 0
+    # 人工过验证：每轮只弹一次浏览器，避免连着几篇 461 反复弹窗打断用户
+    _human_verify_tried: bool = False
+    # 无浏览器模式下临时拉起的 playwright 句柄（用完要 stop，否则泄漏 driver 进程）
+    _verify_playwright = None
 
     def __init__(self) -> None:
         self.index_url = "https://www.rednote.com" if config.XHS_INTERNATIONAL else "https://www.xiaohongshu.com"
@@ -124,6 +128,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         self._risk_abort_reason: str = ""
         self._comment_fail_streak: int = 0
         self._comment_done_count: int = 0
+        self._human_verify_tried: bool = False
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -343,12 +348,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 )
                 if attempt > 1:
                     utils.logger.info(f"[XiaoHongShuCrawler] 第 {attempt} 次尝试打开首页成功")
-                # 风控页拦截：标题/正文带验证关键字时等用户人工过验证（CDP 真实浏览器）
+                # 风控页拦截：标题/正文带验证关键字时把窗口置前，等用户人工过验证
                 if await anti_risk.page_has_captcha(self.context_page):
                     utils.logger.warning(
                         "[XiaoHongShuCrawler] 首页命中安全验证，等待人工处理 ...")
-                    await anti_risk.wait_for_human_verify(
-                        self.context_page, timeout_sec=_xhs_captcha_wait_sec())
+                    await self._human_verify(self.index_url)
                 return
             except Exception as e:
                 last_err = e
@@ -502,11 +506,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             self.task_id, "search_page", keyword, page, "DataFetchError")
                     break
                 except (IPBlockError, PlatformAccessError) as ex:
-                    # 验证码 / 安全限制：等用户在真实浏览器里人工过验证后重试当前页，
+                    # 验证码 / 安全限制：弹出浏览器让用户人工过验证后重试当前页，
                     # 超时或仍失败才中断本轮（不无限重试）
                     if anti_risk.is_captcha_error(ex):
-                        verified = await anti_risk.wait_for_human_verify(
-                            self.context_page, timeout_sec=_xhs_captcha_wait_sec())
+                        verified = await self._human_verify(self.index_url)
                         if verified:
                             utils.logger.info(
                                 "[XiaoHongShuCrawler.search] 人工验证完成，重试当前页")
@@ -541,8 +544,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 # Access restricted on the creator homepage, skip this creator instead of crashing the run.
                 # 先等人工过验证再重试一次（CDP 连的是真实浏览器，用户直接在窗口里操作）
                 if anti_risk.is_captcha_error(e):
-                    verified = await anti_risk.wait_for_human_verify(
-                        self.context_page, timeout_sec=_xhs_captcha_wait_sec())
+                    verified = await self._human_verify(self.index_url)
                     if verified:
                         try:
                             createor_info = await self.xhs_client.get_creator_info(
@@ -1092,6 +1094,28 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     utils.logger.error(
                         f"[get_note_detail_async_task] 详情请求被平台拦截，跳过 "
                         f"{note_id}: {type(e).__name__}: {str(e)[:120]}")
+                    # 风控类：弹出浏览器让用户人工过验证，通过后当场重试本篇。
+                    # 这是唯一一次机会（_human_verify 内部限一次），
+                    # 用户不在场/验证失败就按熔断处理，等冷却后再补。
+                    if (anti_risk.is_captcha_error(e)
+                            and await self._human_verify(
+                                self._note_web_url(note_id, xsec_source, xsec_token))):
+                        try:
+                            retried = await self.xhs_client.get_note_by_id(
+                                note_id, xsec_source, xsec_token)
+                        except Exception as retry_err:
+                            utils.logger.warning(
+                                f"[get_note_detail_async_task] 人工验证后重试异常 "
+                                f"{note_id}: {type(retry_err).__name__}")
+                            retried = None
+                        if retried:
+                            retried.update({"xsec_token": xsec_token,
+                                            "xsec_source": xsec_source})
+                            utils.logger.info(
+                                f"[get_note_detail_async_task] 人工验证后重试成功: {note_id}")
+                            await anti_risk.xhs_sleep(
+                                f"note {note_id} 人工验证后重试间隔")
+                            return retried
                     return None
                 except RetryError:
                     note_detail = None
@@ -1169,8 +1193,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 )
                 # 验证码/安全限制：等用户在真实浏览器里人工完成验证后重试一次
                 if anti_risk.is_captcha_error(ex):
-                    verified = await anti_risk.wait_for_human_verify(
-                        self.context_page, timeout_sec=_xhs_captcha_wait_sec())
+                    verified = await self._human_verify(
+                        self._note_web_url(note_id, xsec_source, xsec_token))
                     if verified:
                         try:
                             retried = await self.xhs_client.get_note_by_id(
@@ -1355,12 +1379,38 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 self._abort(f"评论接口触发风控：{type(e).__name__}", type(e))
                 utils.logger.error(
                     f"[XiaoHongShuCrawler.get_comments] 触发验证码，跳过 {note_id}: {e}")
+                # 弹出浏览器让用户人工过验证（每轮一次），通过后当场重试本篇评论
+                if await self._human_verify(
+                        self._note_web_url(note_id, "pc_search", xsec_token)):
+                    try:
+                        await self.xhs_client.get_note_all_comments(
+                            note_id=note_id,
+                            xsec_token=xsec_token,
+                            crawl_interval=crawl_interval,
+                            callback=xhs_store.batch_update_xhs_note_comments,
+                            max_count=max_count,
+                            start_cursor=start_cursor,
+                            top_count_in=top_count_in,
+                            sub_cursors=sub_cursors_in,
+                            progress_callback=_on_progress,
+                        )
+                        self._comment_fail_streak = 0
+                        self._comment_done_count += 1
+                        utils.logger.info(
+                            f"[XiaoHongShuCrawler.get_comments] 人工验证后评论重试成功: {note_id}")
+                    except Exception as retry_err:
+                        utils.logger.warning(
+                            f"[XiaoHongShuCrawler.get_comments] 人工验证后评论重试失败 "
+                            f"{note_id}: {type(retry_err).__name__}")
                 return
             except (IPBlockError, PlatformAccessError) as e:
                 self._abort(f"评论接口触发风控：{type(e).__name__}", type(e))
                 utils.logger.error(
                     f"[XiaoHongShuCrawler.get_comments] 被平台限制，跳过 {note_id}: "
                     f"{type(e).__name__}: {str(e)[:160]}")
+                if anti_risk.is_captcha_error(e):
+                    await self._human_verify(
+                        self._note_web_url(note_id, "pc_search", xsec_token))
                 return
             except RetryError as e:
                 self._comment_fail_streak += 1
@@ -1433,6 +1483,163 @@ class XiaoHongShuCrawler(AbstractCrawler):
             f"[XiaoHongShuCrawler] 已连续 {self._comment_fail_streak} 篇评论抓取失败"
             f"（{reason}），熔断后续评论抓取 —— 本轮只入库正文/媒体，"
             f"评论留到冷却后再补。")
+
+    def _note_web_url(self, note_id: str, xsec_source: str,
+                      xsec_token: str) -> str:
+        """笔记的网页地址：撞风控时把浏览器导到这个页面，用户才看得到验证页。"""
+        domain = getattr(self.xhs_client, "_domain", None) or "https://www.xiaohongshu.com"
+        token = quote(str(xsec_token or ""), safe="")
+        return (f"{domain}/explore/{note_id}?xsec_token={token}"
+                f"&xsec_source={xsec_source or 'pc_search'}")
+
+    def _is_headless_now(self) -> bool:
+        """当前主流程是否在无头模式跑（无头时用户看不到主窗口，需要另开可见窗口）。"""
+        try:
+            use_cdp = bool(getattr(config, "XHS_ENABLE_CDP_MODE",
+                                   config.ENABLE_CDP_MODE))
+            if use_cdp:
+                return bool(getattr(config, "XHS_CDP_HEADLESS",
+                                    config.CDP_HEADLESS))
+            return bool(getattr(config, "HEADLESS", True))
+        except Exception:
+            return False
+
+    async def _human_verify(self, url: Optional[str] = None) -> bool:
+        """撞风控后**弹出浏览器**让用户人工过验证（每轮最多一次）。
+
+        为什么必须弹窗口：461/471 是接口层返回的，浏览器页面本身停在首页、
+        看不出任何异常，用户根本不知道该去点什么。所以这里主动
+        「窗口置前 + 导航到出事的那个页面」，让验证页/登录墙真的显现出来。
+
+        验证结束后无论成败都做一次 Cookie 回灌（浏览器 → httpx + 账号池）：
+        用户在窗口里做的任何操作都体现在 Cookie 上，不同步的话 httpx 还是
+        拿旧 Cookie 继续撞 461，等于白点。
+
+        Returns:
+            True = 验证通过且熔断已解除，调用方可继续本轮抓取；
+            False = 无窗口/没出现验证页/超时（调用方按熔断处理，等冷却）。
+        """
+        if self._human_verify_tried:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] 本轮已尝试过一次人工验证，不再重复弹窗"
+                "（避免连续 461 反复打断你）")
+            return False
+        self._human_verify_tried = True
+
+        page = self.context_page
+        temp_ctx = None
+        if page is None or self._is_headless_now():
+            # 两种情况用户都“看不见窗口”，必须另开一个可见的：
+            # 1) 无浏览器模式（enable_browser=false），压根没有页面；
+            # 2) 主流程跑在无头模式，窗口存在但不可见。
+            # 临时浏览器专供人工过验证，用完即关，不影响主流程。
+            page, temp_ctx = await self._spawn_verify_browser()
+            if page is None:
+                utils.logger.warning(
+                    "[XiaoHongShuCrawler] 没有可用浏览器，无法弹出验证窗口；"
+                    "如需人工过验证，请检查本机 Chrome/Chromium 是否可用")
+                return False
+
+        try:
+            verified = await anti_risk.wait_for_human_verify(
+                page,
+                timeout_sec=_xhs_captcha_wait_sec(),
+                url=url or self.index_url,
+            )
+
+            # Cookie 回灌：验证/登录动作的结果只存在于浏览器里
+            ctx = temp_ctx or self.browser_context
+            if ctx is not None:
+                try:
+                    if self.xhs_client is not None:
+                        await self.xhs_client.update_cookies(ctx, self.cookie_urls)
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[XiaoHongShuCrawler] 验证后刷新 httpx Cookie 失败：{e}")
+                try:
+                    from tools.cookie_sync import sync_login_to_pool
+
+                    await sync_login_to_pool("xhs", ctx, self.cookie_urls)
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler] 已把浏览器最新登录态同步到账号池")
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[XiaoHongShuCrawler] 验证后同步账号池失败：{e}")
+        finally:
+            if temp_ctx is not None:
+                try:
+                    await temp_ctx.close()
+                except Exception:
+                    pass
+                # 临时浏览器的 playwright driver 必须显式 stop，否则
+                # 每弹一次窗就留一个 driver 进程（验证码场景会反复出现）
+                pw = getattr(self, "_verify_playwright", None)
+                if pw is not None:
+                    try:
+                        await pw.stop()
+                    except Exception:
+                        pass
+                    self._verify_playwright = None
+
+        if verified:
+            # 验证通过 → 解除熔断，让本轮继续。只有这一次机会：
+            # 若再次 461 就按真正的熔断处理，绝不无限弹窗重试。
+            self._risk_abort_reason = ""
+            self._comment_fail_streak = 0
+            utils.logger.info(
+                "[XiaoHongShuCrawler] 人工验证通过，已解除风控熔断，继续本轮抓取")
+        return verified
+
+    async def _spawn_verify_browser(self):
+        """临时起一个**有头**浏览器，专门给用户过验证用。
+
+        只在没有 context_page（无浏览器模式）时调用；返回
+        (page, browser_context)，失败返回 (None, None)。
+        """
+        try:
+            from playwright.async_api import async_playwright
+
+            playwright = await async_playwright().start()
+            self._verify_playwright = playwright
+            kwargs = chromium_launch_kwargs(playwright.chromium)
+            browser = await playwright.chromium.launch(headless=False, **kwargs)
+            context = await browser.new_context(
+                viewport={"width": 1440, "height": 900}, user_agent=self.user_agent)
+            page = await context.new_page()
+
+            # 尽量带上已有登录态，否则打开就是未登录页，验证/扫码都费劲
+            cookie_str = ""
+            try:
+                raw = getattr(config, "COOKIES", "") or ""
+                cookie_str = raw if isinstance(raw, str) else ""
+            except Exception:
+                cookie_str = ""
+            if cookie_str:
+                try:
+                    from tools.crawler_util import convert_str_cookie_to_dict
+
+                    await context.add_cookies([
+                        {"name": k, "value": v, "url": self.index_url}
+                        for k, v in convert_str_cookie_to_dict(cookie_str).items()
+                    ])
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[XiaoHongShuCrawler] 临时浏览器注入 Cookie 失败：{e}")
+
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] 已临时打开浏览器窗口用于人工过验证")
+            return page, context
+        except Exception as e:
+            utils.logger.error(
+                f"[XiaoHongShuCrawler] 临时浏览器启动失败：{type(e).__name__}: {e}")
+            pw = getattr(self, "_verify_playwright", None)
+            if pw is not None:
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
+                self._verify_playwright = None
+            return None, None
 
     async def create_xhs_client(self, httpx_proxy: Optional[str]) -> XiaoHongShuClient:
         """Create Xiaohongshu client"""
