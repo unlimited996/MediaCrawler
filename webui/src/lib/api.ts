@@ -345,6 +345,57 @@ export const configApi = {
     }>('/config/options'),
 }
 
+// ---- 配置管理（运行时配置，DB 纳管 + 前端可编辑）----
+export interface ConfigEnumOption {
+  value: string
+  label: string
+}
+export interface ConfigItem {
+  key: string
+  label: string
+  description: string
+  value_type: 'bool' | 'int' | 'decimal' | 'enum' | 'string' | 'json' | 'list'
+  value: unknown
+  default_value: unknown
+  enum_options?: ConfigEnumOption[]
+  min_value: string | null
+  max_value: string | null
+  regex_rule: string | null
+  unit: string | null
+  apply_timing: 'immediate' | 'next_task' | 'restart' | string
+  is_advanced: boolean
+  masked: boolean
+  sort_weight: number
+  version: number
+}
+export interface ConfigGroup {
+  code: string
+  name: string
+  description: string
+  icon: string
+  items: ConfigItem[]
+}
+export interface ConfigGroupsResp {
+  config_version: number
+  groups: ConfigGroup[]
+}
+export const configAdminApi = {
+  getGroups: (includeAdvanced = false) =>
+    api
+      .get<{ code: number; message: string; data: ConfigGroupsResp }>(
+        '/config/groups',
+        { params: { include_advanced: includeAdvanced } },
+      )
+      .then((r) => r.data.data),
+  updateItem: (key: string, value: unknown, version: number) =>
+    api
+      .put<{ code: number; message: string; data: any }>(
+        `/config/items/${encodeURIComponent(key)}`,
+        { value, version },
+      )
+      .then((r) => r.data.data),
+}
+
 export interface EnvCheckResult {
   success: boolean
   message: string

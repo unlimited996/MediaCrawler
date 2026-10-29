@@ -1011,9 +1011,13 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
 
         behaviors: 子集 ["likes", "collects"]，默认两个都拉。
         callback: 每拉到一批（去重后）笔记后回调。签名为
-            `callback(batch)` 或 `callback(batch, label)`；返回 False 表示
-            「够了，别再翻页了」（调用方按自己的额度判断，比如增量模式下
-            已经凑够本批要抓的新帖）。
+            `callback(batch)` 或 `callback(batch, label)`；返回一个值表示是否
+            继续翻页：
+              - 返回 False 表示「够了，别再翻页了」（调用方按自己的额度判断，
+                比如增量模式下已经凑够本批要抓的新帖）；
+              - 返回 dict `{"stop": bool, "queued": int}` 时，stop 同 False 语义，
+                queued 为本页真正排进抓取队列（详情+评论）的帖子数——为 0 时
+                列表翻页不再随机休眠（没有评论抓取就不需要节流）。
         max_notes: 每个行为的硬上限（条，仅防跑飞），默认 10000 ≈ 翻到底。
 
         重要（2026-10-28 修两个 bug）：
@@ -1072,13 +1076,22 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     f"{len(notes)} 条，去重后新增 {len(fresh)} 条（累计扫描 {raw_this} 条）")
                 if fresh:
                     stop = False
+                    queued_this = None  # 本页排进「详情+评论」抓取的目标数；
+                                        # None=旧式回调（未知，保守按需要休眠）
                     if callback:
                         try:
                             ret = await callback(fresh, behavior_key)
                         except TypeError:
                             # 兼容只接受一个参数的旧回调
                             ret = await callback(fresh)
-                        stop = ret is False
+                        if isinstance(ret, dict):
+                            # 新契约：{"stop": bool, "queued": int}
+                            # queued 为 0 说明本页全是已跳过（视频/已归档）的帖，
+                            # 没有评论抓取目标，没必要随机休眠。
+                            stop = bool(ret.get("stop", False))
+                            queued_this = int(ret.get("queued", 0))
+                        else:
+                            stop = (ret is False)
                     result.extend(fresh)
                     got_this += len(fresh)
                     if stop:
@@ -1095,7 +1108,11 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                         f"[XiaoHongShuClient.get_all_behavior_notes] {label}游标未前进"
                         f"（{cursor}），停止翻页防死循环")
                     break
-                await anti_risk.interval_sleep(crawl_interval, f"{label}列表翻页间隔")
+                # 随机休眠只在本页确实有「要抓详情+评论」的帖子时才做：
+                # 增量模式下绝大部分页是已归档帖（queued=0），白睡毫无意义——
+                # 既不会触发重的评论请求，也不需要为真人节奏铺垫。
+                if queued_this is None or queued_this > 0:
+                    await anti_risk.interval_sleep(crawl_interval, f"{label}列表翻页间隔")
 
             utils.logger.info(
                 f"[XiaoHongShuClient.get_all_behavior_notes] {label}抓取结束："

@@ -5,6 +5,88 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-29] 修复 定时任务「目标失效自动停用」误杀 account 备份任务
+
+### 修复：自动停用逻辑误判 + 误停整个备份任务
+- 现象：定时任务 #27（account 点赞备份）日志报「风控熔断 CaptchaError」，
+  但定时任务页显示「内容已设为私密（已自动停止该定时任务）」，并整任务被停用。
+- 根因：`api/services/task_scheduler.py::_finalize` 对所有失败任务扫描**整段
+  200 行日志尾**做子串匹配，命中了某篇公开笔记正文里的「私密马赛克」玩梗文案
+  （`私密` 二字），误判为「目标已私密」→ 自动停用任务，并把真实错误覆盖成「私密」。
+- 修复：
+  1. 自动停用只对**单目标关注**类任务生效（`task_type` 为 `note` / `profile`）；
+     `account` 一次爬几十上百篇，单条被删/私密是常态，绝不再因此停用整任务。
+  2. 保留对 `note`/`profile` 的原有判定（不回归），仅排除多条目维度。
+- 数据修正：把被误停的 #27 恢复 `enabled=True`，清除 `auto_stopped` 标记，
+  并把被覆盖的 `last_error` 改回真实原因（风控 CaptchaError 熔断）。
+- 验证：`py_compile` 通过；重启 8081 后 API 确认 #27 已启用、`auto_stopped=None`。
+
+## [2026-10-29] 配置管理页：把 XHS 备份参数纳管进前端可编辑的配置项
+
+### 新增：补齐「配置管理」前端页，暴露此前不可见的运行时配置
+- 背景：此前新增的小红书账号备份参数（`XHS_BEHAVIOR_MAX_NOTES`、
+  `XHS_COMMENT_BACKFILL_MAX_COMMENTS`、`XHS_BEHAVIOR_INCREMENTAL`、
+  `XHS_COMMENT_MAX_PER_NOTE`、`XHS_COMMENT_COUNT_MARGIN`）只写在
+  `config/xhs_config.py` 里、走 env/常量，既没进 `CrawlConfigItem` 表、也没被前端展示，
+  改了还得动 .env 重启。而 `api/routers/config_admin.py` 这套「DB 纳管 + 版本化编辑」后端
+  早已存在却**从未接前端 UI**（连原有的 35 项也看不到）。
+- 做法：
+  - 后端：`database/init_v2.py` 新增分组 `xhs_backup`（小红书账号备份）并注册上述 5 项
+    （带 label/描述/默认值/范围/生效时机）；`config/runtime_config.py::LEGACY_FALLBACK`
+    补 5 条 key→常量映射，保证老库未播种时行为不变；
+    `media_platform/xhs/core.py` 改从 `runtime_config` 读取这 5 个参数
+    （默认回退到模块常量，行为不变，但前端改完下次任务即生效）。
+  - 前端：新增 `webui/src/views/ConfigAdminView.tsx`，消费 `/api/config/groups` 并按分组
+    渲染 int/decimal/bool/enum/string 内联编辑（带范围/正则校验、乐观锁版本冲突提示、
+    高级项开关、生效时机徽标）；`api.ts` 加 `configAdminApi`；`Sidebar`/`App`/`useHashRoute`
+    接入 `config` 视图（导航「配置」按钮，`nav.config` 文案早已存在）。
+- 验证：`init_v2 postgres` 播种 1 分组 + 5 项；`/api/config/groups` 含 `xhs_backup`；
+  PUT 编辑接口改值/回退正常；`runtime_config.load()` 能读到 DB 值。
+
+### 修复：配置页打开后显示「暂无配置项」（拿不到数据）
+- 根因：本项目 `axios` 拦截器**不拆包**，`response.data` 是信封
+  `{code,message,data,request_id}`，业务数据在信封的 `data` 里（其它正常页如
+  `HotTimelineView.tsx` 都是 `.data.data` 取值）。但 `configAdminApi` 的 `getGroups`
+  只返回了一层 `response.data`（信封），页面再 `.groups` 落到 `envelope.groups`
+  （不存在）→ 渲染成「暂无配置项」。
+- 做法：`configAdminApi.getGroups/updateItem` 改为 `.then((r) => r.data.data)` 直接返回
+  信封内的业务数据；`ConfigAdminView` 的 `queryFn` 去掉多余的 `.data`。
+
+## [2026-10-29] 修复 account 备份任务「只拉 9 个帖子」
+
+### 修复：点赞/收藏备份每轮只重抓 ~8~9 篇，其余 160+ 篇被「假装已归档」永久跳过
+- 现象：任务 #27（account / 备份点赞贴）增量运行，每轮新增 0、更新 8~9 篇，
+  长期卡在「只拉 9 个」；库内 xhs 246 篇笔记里 **151 篇评论数为 0（评论完全没备份到）**，
+  未达标 168 篇、待补评论总量 68 万条。
+- 根因：`media_platform/xhs/core.py::get_account_behavior_notes` 调
+  `get_archived_content_ids` 时，把评论「条数」预算写成死值
+  `XHS_COMMENT_BACKFILL_MAX_COMMENTS=3000`。`plan_backfill` 按评论缺口升序选帖，
+  3000 条缺口预算只够挑 ~8 篇；其余未达标帖被「顺延」加进 `known_ids` 当已归档跳过，
+  于是每轮只重抓 8~9 篇，其余永远轮不到。
+- 做法：评论条数预算改为 **随「本次抓取上限」(XHS_BEHAVIOR_MAX_NOTES) 联动** =
+  本次抓取上限 × `XHS_COMMENT_BACKFILL_MAX_COMMENTS`（重定义为「每篇预留评论额度」，
+  默认 4000），使每轮选中的待补批次 ≈ 本次抓取上限（默认 100）。死值 3000 不再卡死批次。
+- 说明：笔记正文早已全部入库（246 篇），缺的是评论；该预算只决定「本轮挑哪些帖重抓」，
+  真正抓几条评论仍由 `XHS_COMMENT_MAX_PER_NOTE` 管。任务 #27 超时本就是 86400s（24h），
+  一个批次能跑完一大批，无需为本次调整超时（仅把同样常超时的 #25 profile 任务提到 7200s）。
+
+## [2026-10-29] 优化：点赞/收藏列表翻页随机休眠改为「有评论抓取才睡」
+
+### 变更：列表翻页仅在「本页有要抓详情+评论的帖子」时才随机休眠
+- 背景：account 备份任务在 `get_all_behavior_notes` 的列表翻页循环里**每一页**都调
+  `anti_risk.interval_sleep`（默认 5-15s 随机）。增量模式下绝大部分页是已归档帖
+  （视频帖/`known_ids` 命中），本页没有任何「详情+评论」抓取目标，却照样每页白睡
+  5-15s（如 28 页约 4~5 分钟纯等待），纯属浪费。
+- 做法：
+  - 回调契约升级：`core.py::_on_batch` 返回值由 `bool` 改为
+    `dict {"stop": bool, "queued": int}`，`queued` 为本页真正排进抓取队列的帖子数
+    （视频帖/已归档帖不计）。旧式返回 `True/False` 的回调仍兼容（保守按需要休眠）。
+  - `client.py::get_all_behavior_notes` 仅在 `queued > 0`（本页确有评论抓取目标）时才
+    做随机休眠；`queued=0`（整页已跳过）直接跳过。无抓取目标就不为节流白白等待。
+- 验证：`tests/test_xhs_behavior_paging.py` 6 项全过（含新增 dict 契约回归：
+  `queued=0` 的已归档页不停止翻页、仍能翻过老帖继续往后走）。
+- 注意：纯后端逻辑改动，**需重启爬虫/调度进程才生效**（运行中的进程加载的是旧代码）。
+
 ## [2026-10-29] 统一「本次抓取上限」：补抓与新帖共用一个上限
 
 ### 变更：删除冗余的 XHS_COMMENT_BACKFILL_MAX_NOTES，补抓篇数上限并入「本次抓取上限」

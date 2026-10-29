@@ -55,6 +55,12 @@ LEGACY_FALLBACK: Dict[str, str] = {
     "font_path": "FONT_PATH",
     "user_data_dir": "USER_DATA_DIR",
     "disable_ssl_verify": "DISABLE_SSL_VERIFY",
+    # 小红书账号备份参数（2026-10-29 纳管，原仅在 config/xhs_config.py 以常量存在）
+    "xhs_behavior_max_notes": "XHS_BEHAVIOR_MAX_NOTES",
+    "xhs_behavior_incremental": "XHS_BEHAVIOR_INCREMENTAL",
+    "xhs_comment_backfill_max_comments": "XHS_COMMENT_BACKFILL_MAX_COMMENTS",
+    "xhs_comment_max_per_note": "XHS_COMMENT_MAX_PER_NOTE",
+    "xhs_comment_count_margin": "XHS_COMMENT_COUNT_MARGIN",
 }
 
 

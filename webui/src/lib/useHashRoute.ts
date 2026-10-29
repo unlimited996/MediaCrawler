@@ -18,7 +18,7 @@ export interface RouteState {
 }
 
 const VIEWS = [
-  'crawl', 'discover', 'data', 'browser', 'tasks', 'stance', 'backup', 'guest',
+  'crawl', 'discover', 'data', 'browser', 'tasks', 'stance', 'backup', 'config', 'guest',
 ]
 
 function parseHash(): RouteState {

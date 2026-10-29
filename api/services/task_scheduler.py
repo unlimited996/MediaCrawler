@@ -799,9 +799,12 @@ class TaskScheduler:
                     task.status = "error" if (mark_task_error or
                                               summary.get("status") == "failed") else "idle"
 
-                    # 目标没了（帖子被删 / 作者注销 / 无权限）：再拉也只是重复失败，
-                    # 直接停用任务并把原因落到 options，前端据此关开关 + 提示用户
-                    if summary.get("status") == "failed":
+                    # 目标失效自动停用：仅对「单目标关注」类任务（关注此贴 note /
+                    # 关注此人 profile）生效——它们盯的是同一个对象，对象没了再拉是
+                    # 纯浪费。account 一次爬很多条目，单条被删/私密是常态，绝不可
+                    # 因此停用整个备份任务（否则一次误判就把整任务关掉，且会把真实
+                    # 错误覆盖成「私密」，与日志对不上）。
+                    if summary.get("status") == "failed" and task.task_type in ("note", "profile"):
                         reason = detect_fatal_target_error(
                             summary.get("error") or "",
                             "\n".join(str(x) for x in (log_tail or [])))

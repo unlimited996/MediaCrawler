@@ -35,6 +35,7 @@ else:
     BrowserContext = BrowserType = Page = Playwright = object  # 运行时占位
 
 import config
+from config.runtime_config import runtime_config
 from base.base_crawler import AbstractCrawler
 from media_downloader import MediaDownloader
 from model.m_xiaohongshu import NoteUrlInfo, CreatorUrlInfo
@@ -86,8 +87,8 @@ def _comment_max_count(declared: int) -> int:
       - declared == 0（详情没拿到统计）：不限制，交给 has_more
       - XHS_COMMENT_MAX_PER_NOTE > 0：再压一道硬顶，控制单篇耗时
     """
-    margin = int(getattr(config, "XHS_COMMENT_COUNT_MARGIN", 30) or 0)
-    hard_cap = int(getattr(config, "XHS_COMMENT_MAX_PER_NOTE", 0) or 0)
+    margin = runtime_config.get_int("xhs_comment_count_margin", config.XHS_COMMENT_COUNT_MARGIN)
+    hard_cap = runtime_config.get_int("xhs_comment_max_per_note", config.XHS_COMMENT_MAX_PER_NOTE)
     limit = (declared + margin) if declared > 0 else 0
     if hard_cap > 0:
         limit = min(limit, hard_cap) if limit > 0 else hard_cap
@@ -927,30 +928,36 @@ class XiaoHongShuCrawler(AbstractCrawler):
         # 本次「新帖」抓取额度，按行为独立计数。列表本身会一直翻到
         # has_more=False（跨过的老帖不算消耗额度），否则增量模式下永远
         # 只会扫到最前面几页的已归档帖子。
-        budget = int(getattr(config, "XHS_BEHAVIOR_MAX_NOTES", 100) or 100)
+        budget = runtime_config.get_int("xhs_behavior_max_notes", config.XHS_BEHAVIOR_MAX_NOTES)
         queued_by_behavior: Dict[str, int] = {}
 
         # 增量：已归档的帖子不再重抓详情+评论。
         # 点赞动辄几百条（实测本号 495 条），全量重抓评论要跑几小时，
         # 日常备份任务只需要补新增的；想强制刷新老帖时把
         # XHS_BEHAVIOR_INCREMENTAL 设成 0。
-        incremental = bool(getattr(config, "XHS_BEHAVIOR_INCREMENTAL", True))
+        incremental = runtime_config.get_bool("xhs_behavior_incremental", config.XHS_BEHAVIOR_INCREMENTAL)
         known_ids: set = set()
         if incremental:
             try:
                 from tools.v2_sync import get_archived_content_ids
 
                 # 跳过判据 = 评论完整率（已抓 / 原帖显示）>= 90%。
-                # backfill_limit 只是每轮的补抓工作量上限，不是重试次数：
-                # 未达标的帖子会一直留在待补池，每轮挑最接近达标的先补。
-                # 篇数上限与「本次抓取上限」(XHS_BEHAVIOR_MAX_NOTES) 统一，
-                # 不再用独立的 XHS_COMMENT_BACKFILL_MAX_NOTES（已删除）。
+                # backfill_limit（篇数上限）与「本次抓取上限」(XHS_BEHAVIOR_MAX_NOTES)
+                # 统一；backfill_max_comments（评论条数预算）= 本次抓取上限 ×
+                # XHS_COMMENT_BACKFILL_MAX_COMMENTS（每篇预留额度），使每轮选中的
+                # 待补批次 ≈ 本次抓取上限。旧实现把评论条数预算写成死值 3000，导致
+                # 168 篇待补帖每轮只挑得出 ~8 篇、其余被「顺延=假装已归档」永久跳过，
+                # 点赞备份永远停在 9 篇。本预算只决定「本轮挑哪些帖重抓」，真正抓
+                # 几条评论由 XHS_COMMENT_MAX_PER_NOTE 管。
+                backfill_limit = runtime_config.get_int(
+                    "xhs_behavior_max_notes", config.XHS_BEHAVIOR_MAX_NOTES)
+                per_post = runtime_config.get_int(
+                    "xhs_comment_backfill_max_comments", config.XHS_COMMENT_BACKFILL_MAX_COMMENTS)
+                backfill_max_comments = max(1, budget) * max(1, per_post)
                 known_ids = await get_archived_content_ids(
                     "xhs",
-                    backfill_limit=int(getattr(
-                        config, "XHS_BEHAVIOR_MAX_NOTES", 100) or 0),
-                    backfill_max_comments=int(getattr(
-                        config, "XHS_COMMENT_BACKFILL_MAX_COMMENTS", 3000) or 0))
+                    backfill_limit=backfill_limit,
+                    backfill_max_comments=backfill_max_comments)
                 utils.logger.info(
                     f"[get_account_behavior_notes] 增量模式：库内已归档 "
                     f"{len(known_ids)} 条帖子，本次跳过它们（额度按新帖算：{budget}）")
@@ -962,12 +969,20 @@ class XiaoHongShuCrawler(AbstractCrawler):
         # 整批详情请求共用同一个并发闸门（见下方调用处的注释）
         detail_semaphore = asyncio.Semaphore(_xhs_concurrency())
 
-        async def _on_batch(notes: List[Dict], behavior: str = "likes") -> bool:
-            """返回 False 表示该行为的额度已用满，调用方应停止翻页。"""
+        async def _on_batch(notes: List[Dict], behavior: str = "likes") -> Dict:
+            """回调：把本批笔记里「要抓详情+评论」的排进队列。
+
+            返回 dict `{"stop": bool, "queued": int}`：
+              - stop=True 表示该行为额度已用满，调用方应停止翻页；
+              - queued 为本页真正排进抓取队列的帖子数（视频帖/已归档帖不计入）。
+                queued=0 时 client 端列表翻页不再随机休眠——没有评论抓取
+                就不需要为节流白白等待。
+            """
             nonlocal skipped_video, skipped_archived
+            queued = 0
             for note in notes:
                 if queued_by_behavior.get(behavior, 0) >= budget:
-                    return False
+                    return {"stop": True, "queued": queued}
                 note_id = str(note.get("note_id") or note.get("id") or "")
                 if not note_id:
                     continue
@@ -989,7 +1004,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     semaphore=detail_semaphore,
                 ))
                 queued_by_behavior[behavior] = queued_by_behavior.get(behavior, 0) + 1
-            return queued_by_behavior.get(behavior, 0) < budget
+                queued += 1
+            return {"stop": queued_by_behavior.get(behavior, 0) >= budget,
+                    "queued": queued}
 
         try:
             await self.xhs_client.get_all_behavior_notes(

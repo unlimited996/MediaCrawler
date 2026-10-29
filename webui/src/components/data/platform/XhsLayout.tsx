@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { ReactNode } from 'react'
 import {
-  Heart, Star, MessageSquare, ExternalLink, Repeat2, Plus,
+  Heart, Star, MessageSquare, Repeat2, Plus,
 } from 'lucide-react'
 import type { PlatformTheme } from './platformTheme'
 import { storyApi } from '@/lib/api'
@@ -25,8 +25,9 @@ interface XhsLayoutProps extends LayoutProps {
  * 白底圆角笔记卡 → 作者行 → 标题 → 正文 → 图片网格 → 话题标签 → 互动栏
  * → 独立评论卡片（评论输入框 → 评论列表）
  *
- * 排版量值取自真实小红书桌面端详情页对拍：正文 15px / 行高 1.8，
- * 评论正文 14px / 行高 1.6，楼中楼缩进 36px，主色 #FF2442，三级灰 #333/#666/#999。
+ * 排版量值取自真实小红书桌面端详情页样式：正文 16px / 行高 1.5（.desc），
+ * 作者昵称 16px、评论昵称三级灰（rgba(51,51,51,.6)）、评论正文 14px，
+ * 楼中楼缩进 36px，主色 #FF2442，边框 rgba(0,0,0,.08)，选中态 rgba(0,0,0,.03)。
  * 图片与文字为上下堆叠（不做左右分栏），窄屏自适应靠 padding 与网格列数切换。
  */
 export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: XhsLayoutProps) {
@@ -63,23 +64,29 @@ export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, them
   return (
     <div className="mx-auto w-full max-w-3xl space-y-4">
       {/* 笔记卡片 */}
-      <article className="rounded-2xl border border-black/5 bg-white p-5 shadow-sm sm:p-6">
+      <article className="rounded-2xl border border-black/[0.08] bg-white p-6">
         {/* 作者行 */}
         <header className="flex items-center gap-3">
           <AuthorLink url={d?.author_url} name={d?.author} avatar={d?.author_avatar} theme={theme} size={40} />
           <div className="min-w-0 flex-1">
-            <div className="truncate text-sm font-medium text-[#333]">
+            <div className="truncate text-base font-medium text-[#333]">
               {authorAnchor(d?.author_url, d?.author || t('manage.author'))}
             </div>
-            <div className="text-xs text-[#999]">{fmtTs(d?.publish_ts)}</div>
+            <div className="text-xs text-[#333]/60">{fmtTs(d?.publish_ts)}</div>
           </div>
-          {/* 关注按钮：小红书为描边胶囊 */}
-          <span
-            className="shrink-0 rounded-full border px-3.5 py-1 text-xs font-medium"
-            style={{ color: theme.accent, borderColor: theme.accent }}
-          >
-            {t('manage.follow') || '关注'}
-          </span>
+          {/* 右上角：查看原文（描边胶囊，跳转平台原帖） */}
+          {sourceUrl && (
+            <a
+              href={sourceUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={t('manage.originLink')}
+              className="shrink-0 rounded-full border px-3.5 py-1 text-xs font-medium transition-colors hover:opacity-80"
+              style={{ color: theme.accent, borderColor: theme.accent }}
+            >
+              {t('manage.originLink')}
+            </a>
+          )}
         </header>
 
         {/* 标题 */}
@@ -89,9 +96,9 @@ export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, them
           </h2>
         )}
 
-        {/* 正文：15px / 行高 1.8 */}
+        {/* 正文：16px / 行高 1.5（对齐小红书 .desc） */}
         {content && (
-          <div className="mt-2 whitespace-pre-wrap text-[15px] leading-8 text-[#333]">
+          <div className="mt-2 whitespace-pre-wrap break-words text-base leading-[1.5] text-[#333]">
             {content}
           </div>
         )}
@@ -156,8 +163,8 @@ export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, them
           )}
         </div>
 
-        {/* 互动栏：图标 18px + 13px 数字，与原站一致 */}
-        <footer className="mt-4 flex items-center gap-4 border-t border-black/5 pt-3 text-[13px] text-[#666]">
+        {/* 互动栏：图标 18px + 13px 数字，顶部细分隔线（对齐小红书 interactions） */}
+        <footer className="mt-4 flex items-center gap-4 border-t border-black/[0.08] pt-3 text-[13px] text-[#333]/80">
           <span className="flex items-center gap-1">
             <Heart className="h-[18px] w-[18px]" style={{ color: theme.accent }} />
             {fmtNum(d?.like_count)}
@@ -178,49 +185,38 @@ export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, them
               {fmtNum(d?.share_count)}
             </span>
           )}
-          {sourceUrl && (
-            <a
-              href={sourceUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="ml-auto flex items-center gap-1 text-xs text-[#999] hover:text-[#333]"
-            >
-              <ExternalLink className="h-3 w-3" />
-              {t('manage.originLink')}
-            </a>
-          )}
         </footer>
       </article>
 
-      {/* 评论区：独立白卡 */}
-      <section className="rounded-2xl border border-black/5 bg-white p-5 shadow-sm sm:p-6">
+      {/* 评论区：独立白卡（对齐小红书 comments-container padding:16px） */}
+      <section className="rounded-2xl border border-black/[0.08] bg-white p-4 sm:p-5">
         {/* 评论输入占位：原站为浅灰胶囊 */}
         <div className="rounded-full bg-[#F5F5F5] px-3.5 py-2 text-xs text-[#999]">
           {t('manage.saySomething') || '说点什么…'}
         </div>
 
-        <h3 className="mt-3 text-[13px] text-[#666]">
+        <h3 className="mt-3 text-[13px] text-[#333]/60">
           {t('manage.comments')}（{commentsTotal}）
         </h3>
         {commentsToolbar}
         {comments.length === 0 ? (
           <p className="mt-4 text-xs text-[#999]">{t('manage.noComments')}</p>
         ) : (
-          <ul className="mt-3 space-y-5">
+          <ul className="mt-3 space-y-3">
             {comments.map((c: any) => (
               <li key={c.id} className="flex gap-2.5">
-                <AuthorLink url={c.author_url} name={c.author} avatar={c.author_avatar} theme={theme} size={34} />
+                <AuthorLink url={c.author_url} name={c.author} avatar={c.author_avatar} theme={theme} size={24} />
                 <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-1.5 text-[13px] text-[#666]">
+                  <div className="flex flex-wrap items-center gap-1.5 text-[14px] text-[#333]/60">
                     {authorAnchor(c.author_url, c.author || '-')}
                     <StanceBadge stance={c.stance} t={t} tagCode={c.stance_tag_code} tagName={c.stance_tag_name} tagColor={c.stance_tag_color} comment={c} />
                   </div>
-                  {/* 评论正文 14px / 行高 1.6 */}
-                  <div className="mt-0.5 text-sm leading-relaxed text-[#333]">
+                  {/* 评论正文 14px / 行高 1.5（对齐小红书评论正文） */}
+                  <div className="mt-0.5 text-[14px] leading-[1.5] text-[#333]">
                     <RichText content={c.content} />
                   </div>
                   <CommentImages pictures={c.pictures} />
-                  <div className="mt-1 flex items-center gap-3 text-xs text-[#999]">
+                  <div className="mt-1 flex items-center gap-3 text-xs text-[#333]/60">
                     <span>{fmtTs(c.publish_ts)}</span>
                     {c.ip_location ? <span>· {c.ip_location}</span> : null}
                     <span className="flex items-center gap-1">

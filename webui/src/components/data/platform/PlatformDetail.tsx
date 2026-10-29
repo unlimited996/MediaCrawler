@@ -318,6 +318,8 @@ export function PlatformStoryDetail({
       stats={stanceStats}
       tagStats={tagStats}
       selectedTags={cmtTags}
+      // 小红书详情页评论卡为白底，工具条走浅色主题；其余平台深色卡保持 cyber 暗色
+      light={d?.platform === 'xhs'}
       sort={cmtSort}
       stance={cmtStance}
       hasReplies={cmtHasReplies}

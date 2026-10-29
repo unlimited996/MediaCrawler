@@ -42,6 +42,8 @@ CONFIG_GROUPS: List[Dict] = [
      "description": "数据落盘方式与附件下载"},
     {"code": "system", "name": "系统", "sort_weight": 50, "icon": "settings",
      "description": "进程级设置，部分需重启生效"},
+    {"code": "xhs_backup", "name": "小红书账号备份", "sort_weight": 60, "icon": "bookmark",
+     "description": "账号点赞/收藏备份任务的抓取与补抓策略"},
 ]
 
 # 全部来自 config/base_config.py 的硬编码常量（35 项）
@@ -173,6 +175,23 @@ CONFIG_ITEMS: List[Dict] = [
          default="INFO", timing="immediate", weight=20,
          enum=[("DEBUG", "DEBUG"), ("INFO", "INFO"), ("WARNING", "WARNING"), ("ERROR", "ERROR")],
          desc="立即生效"),
+    # ---------------- xhs_backup ----------------
+    dict(group="xhs_backup", key="xhs_behavior_max_notes", label="备份单次抓取上限", value_type="int",
+         default="100", min=1, max=5000, timing="next_task", weight=10, unit="篇",
+         desc="账号点赞/收藏备份任务每轮最多抓多少篇（新帖 + 待补抓）。调大可让每轮覆盖更多帖子，但更易触发风控"),
+    dict(group="xhs_backup", key="xhs_behavior_incremental", label="增量模式", value_type="bool",
+         default="true", timing="next_task", weight=15,
+         desc="开启后已归档（评论已完整）的帖子跳过详情与评论，只抓新帖与未完整的帖子"),
+    dict(group="xhs_backup", key="xhs_comment_backfill_max_comments", label="每篇预留评论额度", value_type="int",
+         default="4000", min=0, max=100000, timing="next_task", weight=20, unit="条",
+         desc="每轮补抓批次的总评论预算 = 单次抓取上限 × 本值；决定一轮能补多少篇未完成评论的帖子。"
+              "此前硬编码 3000 导致每轮只补约 8 篇"),
+    dict(group="xhs_backup", key="xhs_comment_max_per_note", label="单篇评论硬顶", value_type="int",
+         default="0", min=0, max=100000, timing="next_task", weight=25, unit="条",
+         desc="单篇最多抓多少条评论；0 = 不限制（翻到 has_more=false 或达到声明数）"),
+    dict(group="xhs_backup", key="xhs_comment_count_margin", label="评论数余量", value_type="int",
+         default="30", min=0, max=10000, timing="next_task", weight=30, unit="条",
+         desc="判定评论是否抓全时，允许比声明数少这么多条仍算完整，容忍平台计数延迟"),
 ]
 
 

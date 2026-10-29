@@ -144,3 +144,31 @@ async def test_empty_first_page_respected():
     notes = await client.get_all_behavior_notes(
         "uid", behaviors=["likes"], crawl_interval=0)
     assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_dict_callback_contract_queued_is_zero_does_not_stop():
+    """新契约：回调返回 {"stop","queued"}，queued=0（整页已归档）时
+    不应停止翻页，仍能翻过老帖继续往后走。"""
+    client = _client()
+    client.get_user_liked_notes = _fake_fetcher(495, "L")
+    known = {f"L{i}" for i in range(460)}  # 前 460 条已归档
+    budget = 30
+    queued = []
+
+    async def cb(batch, label="likes"):
+        appended = 0
+        for note in batch:
+            if len(queued) >= budget:
+                return {"stop": True, "queued": appended}
+            if note["note_id"] in known:
+                continue
+            queued.append(note["note_id"])
+            appended += 1
+        return {"stop": len(queued) >= budget, "queued": appended}
+
+    await client.get_all_behavior_notes(
+        "uid", behaviors=["likes"], crawl_interval=0, callback=cb)
+
+    assert len(queued) == budget
+    assert queued[0] == "L460", "应跳过前 460 条已归档的帖子继续翻页"
