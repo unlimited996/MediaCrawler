@@ -179,6 +179,9 @@
     "authorSearch": "Search authors",
     "authorEmpty": "No matching author",
     "authorSelected": "{{count}} authors",
+    "tagFilter": "Tags",
+    "tagMatchAny": "Match any",
+    "tagMatchAll": "Match all",
     "viewList": "List view",
     "viewGrid": "Grid view"
   }

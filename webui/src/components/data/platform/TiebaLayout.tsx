@@ -1,6 +1,6 @@
 import { MessageSquare, ThumbsUp, ExternalLink } from 'lucide-react'
 import type { PlatformTheme } from './platformTheme'
-import {buildContent, pickMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, StanceBadge} from './shared'
+import {buildContent, pickMedia, MediaImage, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, StanceBadge} from './shared'
 import type { LayoutProps } from './XhsLayout'
 
 interface TiebaLayoutProps extends LayoutProps {
@@ -63,12 +63,10 @@ export function TiebaLayout({ d, comments, commentsTotal, commentsToolbar, t, th
             <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
               {media.map((m, i) => (
                 <a key={i} href={m.url} target="_blank" rel="noopener noreferrer">
-                  <img
-                    src={m.url}
-                    alt=""
-                    loading="lazy"
-                    className="aspect-square w-full rounded border border-cyber-border-subtle object-cover"
-                  />
+                <MediaImage
+                  media={m}
+                  className="aspect-square w-full rounded border border-cyber-border-subtle object-cover"
+                />
                 </a>
               ))}
             </div>

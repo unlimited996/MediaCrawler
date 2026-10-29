@@ -1,6 +1,6 @@
 import { Heart, MessageSquare, Star, Share2, Play, Music } from 'lucide-react'
 import type { PlatformTheme } from './platformTheme'
-import {buildContent, pickMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, StanceBadge} from './shared'
+import {buildContent, pickMedia, MediaImage, pickCoverMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, StanceBadge} from './shared'
 import type { LayoutProps } from './XhsLayout'
 
 interface DouyinLayoutProps extends LayoutProps {
@@ -14,7 +14,8 @@ interface DouyinLayoutProps extends LayoutProps {
 export function DouyinLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: DouyinLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
-  const cover = d?.cover_url || media[0]?.url || ''
+  // 封面候选源：cover_local → cover_url → cover_backup(S3) → 首图，逐个回退
+  const cover = pickCoverMedia(d, media)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -42,12 +43,7 @@ export function DouyinLayout({ d, comments, commentsTotal, commentsToolbar, t, t
           {/* 竖版封面 */}
           <div className="relative w-44 flex-shrink-0 sm:w-52">
             {cover ? (
-              <img
-                src={cover}
-                alt=""
-                loading="lazy"
-                className="aspect-[3/4] w-full rounded-xl object-cover"
-              />
+              <MediaImage media={cover} className="aspect-[3/4] w-full rounded-xl object-cover" />
             ) : (
               <div className="flex aspect-[3/4] w-full items-center justify-center rounded-xl bg-white/5 text-white/30">
                 <Play className="h-8 w-8" />

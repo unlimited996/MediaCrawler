@@ -261,6 +261,8 @@ export const storyApi = {
     start_ts?: number; end_ts?: number; page?: number; page_size?: number
     /** 发帖人多选：命中任一即展示（后端 author_ids 重复参数） */
     author_ids?: number[]
+    /** 标签多选的匹配模式：any=命中任一（默认），all=同时含全部 */
+    tag_match?: 'any' | 'all'
   }) => api.get<{ items: StoryRow[]; total: number; page: number; page_size: number }>(
     '/stories', { params, paramsSerializer: { indexes: null } }),
   /** 发帖人候选（多选筛选用）：按发帖量倒序，支持平台与昵称关键词收敛 */

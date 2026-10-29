@@ -179,6 +179,9 @@
     "authorSearch": "搜索发帖人",
     "authorEmpty": "没有匹配的发帖人",
     "authorSelected": "发帖人 {{count}} 位",
+    "tagFilter": "标签",
+    "tagMatchAny": "任一标签",
+    "tagMatchAll": "同时满足",
     "viewList": "列表视图",
     "viewGrid": "网格视图"
   }

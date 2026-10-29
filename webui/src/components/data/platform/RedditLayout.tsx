@@ -1,7 +1,7 @@
 import { ArrowBigUp, ArrowBigDown, MessageSquare, Share, Bookmark, ExternalLink } from 'lucide-react'
 import type { PlatformTheme } from './platformTheme'
 import {
-  buildContent, pickMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink,
+  buildContent, pickMedia, MediaImage, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink,
   authorAnchor, TopicChips, CommentReplies, StanceBadge,
 } from './shared'
 import type { LayoutProps } from './XhsLayout'
@@ -76,7 +76,7 @@ export function RedditLayout({ d, comments, commentsTotal, commentsToolbar, t, t
             <div className="mt-2 overflow-hidden rounded-md border border-cyber-border-subtle bg-cyber-bg-tertiary/40">
               {media.slice(0, 4).map((m, i) => (
                 <a key={i} href={m.url} target="_blank" rel="noopener noreferrer" className="block">
-                  <img src={m.url} alt="" loading="lazy" className="max-h-[460px] w-full object-contain" />
+                  <MediaImage media={m} className="max-h-[460px] w-full object-contain" />
                 </a>
               ))}
             </div>

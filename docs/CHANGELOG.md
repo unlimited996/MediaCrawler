@@ -5,7 +5,51 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
-## [2026-10-29] 修复 评论「每篇抓一点不收口」+ 撞验证码弹窗不可见
+## [2026-10-30] 修复 图片显示不出来（多级回退）+ 标签多选 + 标签数排版
+
+### 问题
+1. **详情页/列表封面「图片显示不出来」**：
+   `INTJ社交指南——亲密关系篇`（story 215）等老笔记的媒体 `local_path` 为空、
+   只剩平台CDN外链，而小红书图床是**带时间签名的临时地址**，过期必 403
+   （实测 `sns-webpic-qc.xhscdn.com/202610281035/...` → **403**）。
+   前端 `pickMedia` 只取单一 `url`（= 这条已死的远程链接），失败就留一张破图，
+   **从来不会退回到已经备好的 S3 备份**（`/api/s3-backup/object/...` 实测 **200 /
+   image/webp / 17KB**）。列表卡片同理：`cover = cover_local_url || cover_url`，
+   `cover_backup_url` 明明有值却被完全忽略。
+2. **标签筛选只能单选**：下拉每一项点了即替换，无法叠加多标签。
+3. **标签数量换行**：`<span class="block truncate">名称</span>` 后接数量 span，
+   数量被挤到下一行，扫读时很别扭。
+
+### 变更
+- 新增 `components/data/platform/shared.tsx::MediaImage`：按**候选源链逐个重试**
+  （本地副本 → 平台远程 → S3 备份），全部失败才回调 `onFailed` 交给上层退化成
+  文字封面；配套的 `pickMedia` 现在返回 `candidates`，新增 `pickCoverMedia()`
+  统一处理 `cover_local_url → cover_url → cover_backup_url → 首图`。
+- 10 个平台布局（xhs/zhihu/weibo/bili/dy/ks/tieba/twitter/facebook/reddit）、
+  评论配图 `CommentImages`、列表/访客网格卡片、`Bili/Douyin/Kuaishou` 竖版封面
+  全部改用 `MediaImage`，不再有裸 `<img src={单源}>`。
+- 标签筛选改**多选**：`tag` state → `tags: string[]`，勾选即生效且弹层不关闭，
+  按钮显示「首个标签 +N」与数量徽标，支持一键清空；多标签时可切换
+  **任一（OR）/ 同时满足（AND）**。
+- 标签行排版修正：`Checkbox + 名称(flex-1 truncate) + 数量(右)` 单行 flex，
+  数量固定右对齐不再换行（与发帖人筛选下拉一致）。
+- 后端 `GET /api/stories` 支持多标签：`tag` 逗号分隔 + `tag_match=any|all`；
+  改用 **EXISTS 子查询**替代原来的 join（join 会让多标签命中同一帖时重复出行、
+  计数虚高）。单标签语义不变，向后兼容。
+- 前端兼容未重启的老后端：多标签先走服务端（`tag=a,b`），老后端返回空时自动
+  退化成「按标签分别取回 + 本地合并/排序/分页」（`queryStories`），
+  **无需重启也能用**；后端重启后自动走服务端那条路。
+
+### 验证
+- `npm run build`（tsc -b + vite build）通过。
+- 直连真实库校验新 SQL（`list_stories` 单测式脚本）：
+  单标签 INTJ=7、mbti=5；`INTJ,mbti` OR=11（=并集）、AND=1（=交集，story 215）；
+  不存在标签=0；分页两页无重叠。
+- 旧后端行为确认：`tag=INTJ,mbti` → total 0（触发前端兼容合并），`tag=INTJ` → 7。
+- 后端本次**未重启**（正在抓取）；前端产物由 StaticFiles 按请求读盘，
+  构建完刷新页面即生效。
+
+
 
 ### 问题
 用户反馈两点：

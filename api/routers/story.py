@@ -166,7 +166,10 @@ async def _load_comment_pictures(session, comment_ids: List[int]
 async def list_stories(
     platform: Optional[str] = None,
     category: Optional[str] = None,
-    tag: Optional[str] = None,
+    tag: Optional[str] = Query(
+        None, description="标签筛选：单个标签名，或逗号分隔多个（如 mbti,INTJ）"),
+    tag_match: str = Query(
+        "any", description="多标签匹配模式：any=命中任一（OR），all=同时含全部（AND）"),
     keyword: Optional[str] = None,
     sort: str = "heat",
     start_ts: Optional[int] = Query(None, description="起始发布时间（毫秒时间戳）"),
@@ -189,9 +192,22 @@ async def list_stories(
                 SourceSite.code == platform)
         if category:
             q = q.where(Story.category == category)
-        if tag:
-            q = q.join(StoryTag, StoryTag.story_id == Story.id).join(
-                Tag, Tag.id == StoryTag.tag_id).where(Tag.name == tag)
+        # 标签多选：逗号分隔多个标签名，any=命中任一 / all=同时含全部。
+        # 用 EXISTS 子查询而不是 join —— join 会让「多标签命中同一帖子」重复出
+        # 行（计数虚高 + 列表重复），EXISTS 天然去重。
+        tag_names = [x.strip() for x in (tag or "").split(",") if x.strip()]
+        if tag_match not in ("any", "all"):
+            tag_match = "any"
+        if tag_names:
+            conds = []
+            for name in tag_names:
+                conds.append(
+                    select(StoryTag.tag_id)
+                    .join(Tag, Tag.id == StoryTag.tag_id)
+                    .where(StoryTag.story_id == Story.id, Tag.name == name)
+                    .exists()
+                )
+            q = q.where(and_(*conds) if tag_match == "all" else or_(*conds))
         if keyword:
             like = f"%{keyword}%"
             q = q.where(or_(Story.title.ilike(like), Story.summary.ilike(like)))

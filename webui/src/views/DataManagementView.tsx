@@ -6,12 +6,13 @@ import {
   Heart, MessageSquare, Tag as TagIcon, Eye, Trash2, CheckCircle2,
 } from 'lucide-react'
 import { storyApi } from '@/lib/api'
+import type { StoryRow } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { toast } from 'sonner'
 import { PlatformStoryDetail } from '@/components/data/platform/PlatformDetail'
 import { getPlatformTheme } from '@/components/data/platform/platformTheme'
-import { splitTopics, PlatformAvatar, fmtNum } from '@/components/data/platform/shared'
+import { splitTopics, PlatformAvatar, fmtNum, pickCoverMedia, MediaImage } from '@/components/data/platform/shared'
 import { PlatformBrandMark, PlatformPageHeader } from '@/components/data/platform/PlatformBrand'
 
 type TimeRange = 'all' | 'today' | 'week' | 'month'
@@ -83,9 +84,10 @@ function StoryCard({
   const theme = getPlatformTheme(it.platform)
   const [broken, setBroken] = useState(false)
   const title = splitTopics(it.title).clean || it.title || ''
-  // 封面取帖子内部首张图片：本地副本优先（外链签名会过期），无本地副本用外链
-  const cover = it.cover_local_url || it.cover_url || ''
-  // 无图（或图挂了）时展示正文前 50 字
+  // 封面候选源：本地副本 → 平台远程 → S3 备份。
+  // 小红书图床是带时间签名的临时 CDN，过期必 403，所以这里逐个回退而不是一张破图。
+  const cover = pickCoverMedia(it)
+  // 无图（或所有候选源都挂了）时展示正文前 50 字
   const excerpt = (it.excerpt || it.summary || '').slice(0, 50)
   const showTextCover = !cover || broken
 
@@ -97,12 +99,10 @@ function StoryCard({
       {/* 封面：统一 3:4，object-cover 保证不变形 */}
       <div className="relative w-full flex-shrink-0 overflow-hidden bg-cyber-bg-tertiary aspect-[3/4]">
         {!showTextCover ? (
-          <img
-            src={cover}
-            alt=""
-            loading="lazy"
+          <MediaImage
+            media={cover}
             className="h-full w-full object-cover"
-            onError={() => setBroken(true)}
+            onFailed={() => setBroken(true)}
           />
         ) : excerpt ? (
           // 无图 / 图挂了：显示正文前 50 字
@@ -174,6 +174,97 @@ function StoryCard({
   )
 }
 
+/** 多标签兼容模式：单个标签最多翻几页（100 条/页）后合并 */
+const TAG_FALLBACK_PAGES = 5
+
+/** 客户端排序键：与后端 SORT_FIELDS 对齐（列表不下发 last_update_ts，「按时间」退化为发布时间） */
+const SORTERS: Record<string, (a: StoryRow, b: StoryRow) => number> = {
+  heat: (a, b) => (b.heat_score ?? 0) - (a.heat_score ?? 0) || (b.publish_ts ?? 0) - (a.publish_ts ?? 0),
+  time: (a, b) => (b.publish_ts ?? 0) - (a.publish_ts ?? 0),
+  publish: (a, b) => (b.publish_ts ?? 0) - (a.publish_ts ?? 0) || b.id - a.id,
+  like: (a, b) => (b.like_count ?? 0) - (a.like_count ?? 0),
+  comment: (a, b) => (b.comment_count ?? 0) - (a.comment_count ?? 0),
+}
+
+interface StoryQuery {
+  platform?: string
+  keyword?: string
+  /** 选中的标签名（多选） */
+  tags: string[]
+  /** any=命中任一；all=同时含全部 */
+  tagMatch: 'any' | 'all'
+  sort: string
+  page: number
+  pageSize: number
+  authorIds?: number[]
+  start_ts?: number
+  end_ts?: number
+}
+
+/**
+ * 列表查询（含多标签多选）。
+ *
+ * 单标签 / 无标签：直接走服务端分页。
+ * 多标签：新后端认逗号分隔标签（服务端 OR/AND + 分页）；老后端会把整串当成
+ * 一个标签名而返回空，此时退化成「按标签各自取回 + 本地合并」，保证多选
+ * 在任意后端版本下都可用（待后端重启后自动走服务端那条路）。
+ */
+async function queryStories(p: StoryQuery): Promise<{
+  items: StoryRow[]; total: number; page: number; page_size: number
+}> {
+  const common = {
+    platform: p.platform,
+    keyword: p.keyword,
+    sort: p.sort,
+    author_ids: p.authorIds,
+    start_ts: p.start_ts,
+    end_ts: p.end_ts,
+  }
+  if (p.tags.length <= 1) {
+    return (await storyApi.list({
+      ...common, tag: p.tags[0] || undefined, page: p.page, page_size: p.pageSize,
+    })).data
+  }
+
+  const server = (await storyApi.list({
+    ...common, tag: p.tags.join(','), tag_match: p.tagMatch,
+    page: p.page, page_size: p.pageSize,
+  })).data
+  if (server.total > 0) return server
+
+  const perTag = await Promise.all(p.tags.map(async (name) => {
+    const rows: StoryRow[] = []
+    for (let pg = 1; pg <= TAG_FALLBACK_PAGES; pg++) {
+      const res = (await storyApi.list({ ...common, tag: name, page: pg, page_size: 100 })).data
+      rows.push(...res.items)
+      if (res.items.length === 0 || rows.length >= res.total) break
+    }
+    return rows
+  }))
+
+  // all = 交集（同时含全部标签）；any = 并集（命中任一）
+  const raw = p.tagMatch === 'all'
+    ? perTag.reduce((acc: StoryRow[], cur) => {
+        const ids = new Set(cur.map((r) => r.id))
+        return acc.filter((r) => ids.has(r.id))
+      }, perTag[0] || [])
+    : perTag.flat()
+  const seen = new Set<number>()
+  const rows: StoryRow[] = []
+  for (const r of raw) {
+    if (seen.has(r.id)) continue
+    seen.add(r.id)
+    rows.push(r)
+  }
+  rows.sort(SORTERS[p.sort] || SORTERS.publish)
+  return {
+    items: rows.slice((p.page - 1) * p.pageSize, p.page * p.pageSize),
+    total: rows.length,
+    page: p.page,
+    page_size: p.pageSize,
+  }
+}
+
 /**
  * 数据管理页。
  *
@@ -198,7 +289,10 @@ export function DataManagementView({
   const platform = platformProp ?? ''
   const [keyword, setKeyword] = useState('')
   const [searchInput, setSearchInput] = useState('')
-  const [tag, setTag] = useState('')
+  /** 标签筛选：多选（空数组 = 不筛选） */
+  const [tags, setTags] = useState<string[]>([])
+  /** 多标签匹配模式：任一（OR，默认）/ 全部同时满足（AND） */
+  const [tagMatch, setTagMatch] = useState<'any' | 'all'>('any')
   const [range, setRange] = useState<TimeRange>('all')
   // 默认按发布时间倒序（最新在前）
   const [sort, setSort] = useState('publish')
@@ -290,6 +384,7 @@ export function DataManagementView({
     setPage(1)
     setSelected(new Set())
     setAuthorIds([])
+    setTags([])
   }, [platform])
 
   const tsRange = useMemo(() => {
@@ -302,16 +397,21 @@ export function DataManagementView({
 
   // 发帖人 id 排序后入 key，避免勾选顺序不同导致缓存不命中
   const authorKey = [...authorIds].sort((a, b) => a - b).join(',')
+  // 标签同理：勾选顺序不影响缓存
+  const tagKey = [...tags].sort().join(',')
   const listQ = useQuery({
-    queryKey: ['stories', platform, keyword, tag, range, sort, page, authorKey],
-    queryFn: async () => (await storyApi.list({
+    queryKey: ['stories', platform, keyword, tagKey, tagMatch, range, sort, page, authorKey],
+    queryFn: () => queryStories({
       platform: platform || undefined,
       keyword: keyword || undefined,
-      tag: tag || undefined,
-      sort, page, page_size: pageSize,
-      author_ids: authorIds.length ? authorIds : undefined,
+      tags,
+      tagMatch,
+      sort,
+      page,
+      pageSize,
+      authorIds: authorIds.length ? authorIds : undefined,
       ...tsRange,
-    })).data,
+    }),
   })
 
   const items = listQ.data?.items || []
@@ -408,7 +508,7 @@ export function DataManagementView({
           <option value="month">{t('manage.timeMonth')}</option>
         </select>
 
-        {/* 标签：可搜索 + 分段懒加载（标签可能成百上千） */}
+        {/* 标签：可搜索 + 分段懒加载 + 多选（标签可能成百上千） */}
         <div
           className="relative"
           tabIndex={0}
@@ -419,44 +519,112 @@ export function DataManagementView({
           <button
             type="button"
             onClick={() => setTagOpen((v) => !v)}
-            className={`flex h-8 items-center gap-1 rounded-md border px-2 text-xs font-mono transition-all ${
-              tag
+            className={`flex h-8 max-w-[14rem] items-center gap-1 rounded-md border px-2 text-xs font-mono transition-all ${
+              tags.length > 0
                 ? 'border-cyber-neon-cyan/60 bg-cyber-neon-cyan/10 text-cyber-neon-cyan'
                 : 'border-cyber-border-subtle bg-cyber-bg-tertiary text-cyber-text-primary hover:border-cyber-neon-cyan/40'
             }`}
           >
-            {tag || t('manage.allTags')}
+            <TagIcon className="h-3.5 w-3.5 flex-shrink-0" />
+            <span className="truncate">
+              {tags.length === 0
+                ? t('manage.allTags')
+                : tags.length === 1
+                  ? tags[0]
+                  : `${tags[0]} +${tags.length - 1}`}
+            </span>
+            {tags.length > 1 && (
+              <span className="flex-shrink-0 rounded-full bg-cyber-neon-cyan/20 px-1.5 text-[10px]">
+                {tags.length}
+              </span>
+            )}
           </button>
           {tagOpen && (
-            <div className="absolute z-30 mt-1 w-56 rounded-md border border-cyber-border-subtle bg-cyber-bg-panel p-2 shadow-lg">
-              <input
-                autoFocus
-                value={tagKw}
-                onChange={(e) => setTagKw(e.target.value)}
-                placeholder="搜索标签"
-                className="mb-1 h-7 w-full rounded border border-cyber-border-subtle bg-cyber-bg-tertiary px-2 text-xs font-mono text-cyber-text-primary outline-none"
-              />
-              <div className="max-h-56 overflow-y-auto">
-                <button
-                  type="button"
-                  onClick={() => { setTag(''); setPage(1); setTagOpen(false) }}
-                  className="w-full rounded px-2 py-1 text-left text-xs font-mono text-cyber-text-secondary hover:bg-cyber-bg-tertiary"
-                >
-                  {t('manage.allTags')}
-                </button>
-                {tagItems.map((x) => (
+            <div className="absolute z-30 mt-1 w-64 rounded-md border border-cyber-border-subtle bg-cyber-bg-panel p-2 shadow-lg">
+              <div className="flex items-center gap-1">
+                <input
+                  autoFocus
+                  value={tagKw}
+                  onChange={(e) => setTagKw(e.target.value)}
+                  placeholder="搜索标签"
+                  className="h-7 w-full min-w-0 flex-1 rounded border border-cyber-border-subtle bg-cyber-bg-tertiary px-2 text-xs font-mono text-cyber-text-primary outline-none"
+                />
+                {tags.length > 0 && (
                   <button
-                    key={x.name}
                     type="button"
-                    onClick={() => { setTag(x.name); setPage(1); setTagOpen(false) }}
-                    className={`w-full rounded px-2 py-1 text-left text-xs font-mono hover:bg-cyber-bg-tertiary ${
-                      x.name === tag ? 'text-cyber-neon-cyan' : 'text-cyber-text-secondary'
-                    }`}
+                    onClick={() => { setTags([]); setPage(1) }}
+                    title={t('manage.clear', { defaultValue: '清空选择' })}
+                    className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded border border-cyber-border-subtle text-cyber-text-muted hover:text-cyber-neon-pink"
                   >
-                    <span className="block truncate">{x.name}</span>
-                    <span className="text-[10px] text-cyber-text-muted">{x.count}</span>
+                    <X className="w-3 h-3" />
                   </button>
-                ))}
+                )}
+              </div>
+
+              {/* 多标签匹配模式：任一 / 同时满足 */}
+              {tags.length > 1 && (
+                <div className="mt-1 flex items-center gap-1 rounded border border-cyber-border-subtle p-0.5 text-[10px] font-mono">
+                  {([
+                    ['any', t('manage.tagMatchAny', { defaultValue: '任一标签' })],
+                    ['all', t('manage.tagMatchAll', { defaultValue: '同时满足' })],
+                  ] as const).map(([v, label]) => (
+                    <button
+                      key={v}
+                      type="button"
+                      onClick={() => { setTagMatch(v); setPage(1) }}
+                      className={`flex-1 rounded px-1.5 py-0.5 transition-colors ${
+                        tagMatch === v
+                          ? 'bg-cyber-neon-cyan/20 text-cyber-neon-cyan'
+                          : 'text-cyber-text-muted hover:text-cyber-text-primary'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-1 max-h-56 space-y-0.5 overflow-y-auto">
+                {tags.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => { setTags([]); setPage(1) }}
+                    className="w-full rounded px-2 py-1 text-left text-xs font-mono text-cyber-text-secondary hover:bg-cyber-bg-tertiary"
+                  >
+                    {t('manage.allTags')}
+                  </button>
+                )}
+                {tagItems.map((x) => {
+                  const checked = tags.includes(x.name)
+                  return (
+                    // 名称左、数量右：同一行 flex，不再换行堆到下一行
+                    <label
+                      key={x.name}
+                      className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 hover:bg-cyber-bg-tertiary"
+                    >
+                      <Checkbox
+                        checked={checked}
+                        onCheckedChange={() => {
+                          setTags((prev) => (prev.includes(x.name)
+                            ? prev.filter((n) => n !== x.name)
+                            : [...prev, x.name]))
+                          setPage(1)
+                        }}
+                      />
+                      <span
+                        className={`min-w-0 flex-1 truncate text-xs font-mono ${
+                          checked ? 'text-cyber-neon-cyan' : 'text-cyber-text-secondary'
+                        }`}
+                        title={x.name}
+                      >
+                        {x.name}
+                      </span>
+                      <span className="flex-shrink-0 text-[10px] font-mono text-cyber-text-muted">
+                        {x.count}
+                      </span>
+                    </label>
+                  )
+                })}
                 {tagItems.length === 0 && (
                   <p className="px-2 py-1 text-[11px] font-mono text-cyber-text-muted">无匹配标签</p>
                 )}
@@ -635,6 +803,14 @@ export function DataManagementView({
           {keyword && ` · ${t('manage.keyword')}：${keyword}`}
           {platform && ` · ${t('manage.platform')}：${platform}`}
           {authorIds.length > 0 && ` · ${t('manage.authorSelected', { count: authorIds.length, defaultValue: '发帖人 {{count}} 位' })}`}
+          {tags.length > 0 && (
+            ` · ${t('manage.tagFilter', { defaultValue: '标签' })}：${tags.join(' / ')}`
+            + (tags.length > 1
+              ? `（${tagMatch === 'all'
+                ? t('manage.tagMatchAll', { defaultValue: '同时满足' })
+                : t('manage.tagMatchAny', { defaultValue: '任一' })}）`
+              : '')
+          )}
           {range !== 'all' && ` · ${range}`}
         </span>
         <div className="ml-auto flex items-center gap-2">

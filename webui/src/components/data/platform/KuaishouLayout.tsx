@@ -1,6 +1,6 @@
 import { Heart, MessageSquare, Star, Share2, Play, ExternalLink } from 'lucide-react'
 import type { PlatformTheme } from './platformTheme'
-import {buildContent, pickMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, StanceBadge} from './shared'
+import {buildContent, pickMedia, MediaImage, pickCoverMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, StanceBadge} from './shared'
 import type { LayoutProps } from './XhsLayout'
 
 interface KuaishouLayoutProps extends LayoutProps {
@@ -14,7 +14,8 @@ interface KuaishouLayoutProps extends LayoutProps {
 export function KuaishouLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: KuaishouLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
-  const cover = d?.cover_url || media[0]?.url || ''
+  // 封面候选源：cover_local → cover_url → cover_backup(S3) → 首图，逐个回退
+  const cover = pickCoverMedia(d, media)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -31,12 +32,7 @@ export function KuaishouLayout({ d, comments, commentsTotal, commentsToolbar, t,
         {/* 竖版封面 */}
         <div className="relative mx-auto w-full max-w-[16rem]">
           {cover ? (
-            <img
-              src={cover}
-              alt=""
-              loading="lazy"
-              className="aspect-[3/4] w-full object-cover"
-            />
+            <MediaImage media={cover} className="aspect-[3/4] w-full object-cover" />
           ) : (
             <div className="flex aspect-[3/4] w-full items-center justify-center bg-cyber-bg-tertiary text-cyber-text-muted">
               <Play className="h-8 w-8" />

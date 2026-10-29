@@ -1,6 +1,6 @@
 import { Eye, MessageSquare, ThumbsUp, Coins, Star, Play, ExternalLink } from 'lucide-react'
 import type { PlatformTheme } from './platformTheme'
-import {buildContent, pickMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, StanceBadge} from './shared'
+import {buildContent, pickMedia, MediaImage, pickCoverMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, StanceBadge} from './shared'
 import type { LayoutProps } from './XhsLayout'
 
 interface BiliLayoutProps extends LayoutProps {
@@ -14,7 +14,8 @@ interface BiliLayoutProps extends LayoutProps {
 export function BiliLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: BiliLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
-  const cover = d?.cover_url || media[0]?.url || ''
+  // 封面候选源：cover_local → cover_url → cover_backup(S3) → 首图，逐个回退
+  const cover = pickCoverMedia(d, media)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -32,12 +33,7 @@ export function BiliLayout({ d, comments, commentsTotal, commentsToolbar, t, the
         {/* 封面 */}
         <div className="relative">
           {cover ? (
-            <img
-              src={cover}
-              alt=""
-              loading="lazy"
-              className="aspect-video w-full object-cover"
-            />
+            <MediaImage media={cover} className="aspect-video w-full object-cover" />
           ) : (
             <div className="flex aspect-video w-full items-center justify-center bg-cyber-bg-tertiary text-cyber-text-muted">
               <Play className="h-8 w-8" />
@@ -101,10 +97,8 @@ export function BiliLayout({ d, comments, commentsTotal, commentsToolbar, t, the
             <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
               {media.slice(1).map((m, i) => (
                 <a key={i} href={m.url} target="_blank" rel="noopener noreferrer">
-                  <img
-                    src={m.url}
-                    alt=""
-                    loading="lazy"
+                  <MediaImage
+                    media={m}
                     className="aspect-video w-full rounded border border-cyber-border-subtle object-cover"
                   />
                 </a>

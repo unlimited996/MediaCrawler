@@ -1,7 +1,7 @@
 import { Heart, MessageCircle, Repeat2, BarChart2, ExternalLink } from 'lucide-react'
 import type { PlatformTheme } from './platformTheme'
 import {
-  buildContent, pickMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink,
+  buildContent, pickMedia, MediaImage, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink,
   authorAnchor, TopicChips, CommentReplies, StanceBadge,
 } from './shared'
 import type { LayoutProps } from './XhsLayout'
@@ -70,10 +70,8 @@ export function TwitterLayout({ d, comments, commentsTotal, commentsToolbar, t, 
               >
                 {media.slice(0, 4).map((m, i) => (
                   <a key={i} href={m.url} target="_blank" rel="noopener noreferrer" className="block">
-                    <img
-                      src={m.url}
-                      alt=""
-                      loading="lazy"
+                    <MediaImage
+                      media={m}
                       className={`w-full border border-cyber-border-subtle object-cover ${
                         media.length === 1 ? 'max-h-96' : 'aspect-square'
                       }`}

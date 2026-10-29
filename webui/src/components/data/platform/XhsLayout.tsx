@@ -5,7 +5,7 @@ import {
 } from 'lucide-react'
 import type { PlatformTheme } from './platformTheme'
 import { storyApi } from '@/lib/api'
-import {buildContent, pickMedia, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, CommentImages, StanceBadge} from './shared'
+import {buildContent, pickMedia, MediaImage, pickSourceUrl, fmtTs, fmtNum, RichText, AuthorLink, authorAnchor, TopicChips, CommentReplies, CommentImages, StanceBadge} from './shared'
 
 export interface LayoutProps {
   d: any
@@ -112,10 +112,8 @@ export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, them
           >
             {media.map((m, i) => (
               <a key={i} href={m.url} target="_blank" rel="noopener noreferrer" className="block">
-                <img
-                  src={m.url}
-                  alt=""
-                  loading="lazy"
+                <MediaImage
+                  media={m}
                   className={`w-full rounded-lg object-cover ${
                     media.length === 1 ? 'max-h-[420px]' : 'aspect-square'
                   }`}

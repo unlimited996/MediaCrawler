@@ -20,7 +20,7 @@ import { LanguageSwitch } from '@/components/layout/LanguageSwitch'
 import { storyApi, StoryRow } from '@/lib/api'
 import { usePlatforms } from '@/hooks/useCrawler'
 import { getPlatformTheme } from '@/components/data/platform/platformTheme'
-import { PlatformAvatar } from '@/components/data/platform/shared'
+import { PlatformAvatar, pickCoverMedia, MediaImage } from '@/components/data/platform/shared'
 import { PlatformStoryDetail } from '@/components/data/platform/PlatformDetail'
 
 const PAGE_SIZE = 24
@@ -262,7 +262,8 @@ function GuestStoryCard({ it, onOpen }: { it: StoryRow; onOpen: () => void }) {
   const { t } = useTranslation('data')
   const theme = getPlatformTheme(it.platform)
   const [broken, setBroken] = useState(false)
-  const cover = it.cover_local_url || it.cover_url || ''
+  // 封面候选源：本地副本 → 平台远程 → S3 备份，过期/防盗链时自动切下一个
+  const cover = pickCoverMedia(it)
   const excerpt = (it.excerpt || it.summary || '').slice(0, 50)
   const showTextCover = !cover || broken
 
@@ -273,8 +274,11 @@ function GuestStoryCard({ it, onOpen }: { it: StoryRow; onOpen: () => void }) {
     >
       <div className="relative w-full flex-shrink-0 overflow-hidden bg-cyber-bg-tertiary aspect-[3/4]">
         {!showTextCover ? (
-          <img src={cover} alt="" loading="lazy"
-               className="h-full w-full object-cover" onError={() => setBroken(true)} />
+          <MediaImage
+            media={cover}
+            className="h-full w-full object-cover"
+            onFailed={() => setBroken(true)}
+          />
         ) : excerpt ? (
           <div className="flex h-full w-full items-start overflow-hidden p-2.5 text-[11px] leading-5 text-cyber-text-secondary"
                style={{ background: theme.accentSoft }}>

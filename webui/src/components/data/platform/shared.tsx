@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 import { ChevronDown, ChevronUp, Loader2, ThumbsUp, ThumbsDown, Minus } from 'lucide-react'
-import type { ComponentType } from 'react'
+import type { ComponentType, CSSProperties } from 'react'
 import { storyApi } from '@/lib/api'
 import type { PlatformTheme } from './platformTheme'
 
@@ -195,23 +195,103 @@ export function extractTopics(d: any): { d: any; topics: string[] } {
   }
 }
 
+export interface MediaItem {
+  /** 首选地址（= candidates[0]），保持旧调用方兼容 */
+  url: string
+  local?: boolean
+  source?: string
+  /** 候选源，按优先级去重试：本地 → 平台远程 → S3 备份 */
+  candidates: string[]
+}
+
+/** 单条媒体的候选源（去重去空，保持优先级顺序） */
+function mediaCandidates(m: any): string[] {
+  const raw = [m?.local_url, m?.url, m?.backup_url]
+  const out: string[] = []
+  for (const u of raw) {
+    if (typeof u === 'string' && u && !out.includes(u)) out.push(u)
+  }
+  return out
+}
+
 /** 媒体列表（过滤掉空项）。
  *
  * 访问链（P4，与后端约定）：本地缓存 → 平台远程 → S3 备份。
- * 小红书等 CDN 有防盗链，浏览器 <img> 直连原始 source_url 会吃 403 裂图；
- * 本地已下载的文件走 /api/data/media/... 路由；本地没有、外链过期后，
- * 退回 S3 备份地址 /api/s3-backup/object/...（帖子删除仍可访问）。
+ * 小红书等 CDN 的链接带时间戳签名，过期即 403（实测老笔记无一例外），
+ * 所以 candidates 给了完整候选链，由 MediaImage 逐个重试，避免留一张破图。
  */
-export function pickMedia(d: any): { url: string; local?: boolean; source?: string }[] {
+export function pickMedia(d: any): MediaItem[] {
   return ((d?.media || []) as any[])
     .filter((m) => m && (typeof m.local_url === 'string' ? m.local_url
                         : (typeof m.url === 'string' && m.url) || m.backup_url))
-    .map((m) => ({
-      url: (m.local_url as string) || (m.url as string) || (m.backup_url as string),
-      local: !!m.local_url,
-      // 实际取图来源：本地 / 平台外链 / S3 备份
-      source: (m.local_url ? 'local' : (m.url ? 'remote' : 's3')) as string,
-    }))
+    .map((m) => {
+      const candidates = mediaCandidates(m)
+      return {
+        url: candidates[0] || '',
+        candidates,
+        local: !!m.local_url,
+        // 实际取图来源：本地 / 平台外链 / S3 备份
+        source: (m.local_url ? 'local' : (m.url ? 'remote' : 's3')) as string,
+      }
+    })
+}
+
+/**
+ * 封面媒体：列表卡片 / 竖版封面用。
+ * 候选源顺序同样遵循 local → 远程 → S3，另外把首图的候选链接在后面兜底。
+ */
+export function pickCoverMedia(d: any, media?: MediaItem[]): MediaItem | null {
+  const candidates = mediaCandidates({
+    local_url: d?.cover_local_url,
+    url: d?.cover_url,
+    backup_url: d?.cover_backup_url,
+  })
+  for (const c of media?.[0]?.candidates || []) {
+    if (!candidates.includes(c)) candidates.push(c)
+  }
+  if (candidates.length === 0) return null
+  return { url: candidates[0], candidates, local: !!d?.cover_local_url, source: 'cover' }
+}
+
+/**
+ * 图片按候选源依次重试：本地副本 → 平台远程外链 → S3 备份。
+ *
+ * 背景：小红书图床是带时间签名的临时 CDN，浏览器直连老链接必 403；
+ * 之前前端只认单一 url，失败后就留一张破图（「图片显示不出来」的老问题）。
+ * 这里加载失败就换下一个候选源，全部失败才回调 onFailed 交给上层退化展示。
+ */
+export function MediaImage({
+  media, className = '', alt = '', style, onFailed,
+}: {
+  media: MediaItem | null | undefined
+  className?: string
+  alt?: string
+  style?: CSSProperties
+  /** 所有候选源都失败时回调一次（上层可切文字封面/占位） */
+  onFailed?: () => void
+}) {
+  const candidates = media?.candidates || []
+  const [idx, setIdx] = useState(0)
+  const key = candidates[0] || ''
+
+  // 换数据源（重开详情/刷新列表）时从第一个候选重新开始
+  useEffect(() => { setIdx(0) }, [key])
+
+  if (candidates.length === 0) return null
+  const current = candidates[Math.min(idx, candidates.length - 1)]
+  return (
+    <img
+      src={current}
+      alt={alt}
+      loading="lazy"
+      className={className}
+      style={style}
+      onError={() => {
+        setIdx((i) => (i + 1 < candidates.length ? i + 1 : i))
+        if (idx + 1 >= candidates.length) onFailed?.()
+      }}
+    />
+  )
 }
 
 /** 首个原文外链 */
@@ -628,15 +708,16 @@ export function CommentImages({
       {pictures.map((p: any, i: number) => (
         <a
           key={i}
-          href={p.url}
+          href={p.candidates?.[0] || p.url}
           target="_blank"
           rel="noopener noreferrer"
           className="block"
         >
-          <img
-            src={p.url}
-            alt=""
-            loading="lazy"
+          <MediaImage
+            media={{
+              url: p.url,
+              candidates: p.candidates?.length ? p.candidates : mediaCandidates(p),
+            }}
             className="w-full rounded-lg border border-cyber-border-subtle object-cover"
             style={{ maxHeight: single ? 220 : 120 }}
           />
