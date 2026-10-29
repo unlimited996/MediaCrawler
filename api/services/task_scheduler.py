@@ -24,7 +24,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import config
-from sqlalchemy import select, update
+from config.runtime_config import runtime_config
+from sqlalchemy import or_, select, update
 
 from database.models_v2 import ScheduledTask, ScheduledTaskRun
 from tools import anti_risk
@@ -711,10 +712,28 @@ class TaskScheduler:
                     # 那个任务跑完释放执行权后，排队的才会开跑（2026-10-29）。
                     queue_key = self._queue_key(task_dict)
 
-                    # 反风控：任务真正发起前随机抖动 1-5s。
-                    # 多个任务同时到点时错开起跑，固定节奏是风控识别特征
-                    if await self._acquire_slot(queue_key, on_log=_on_log):
+                    # 风控冷却闸口：同平台（同账号）最近一轮因验证码/限流熔断后，
+                    # 冷却期内不再发起新任务。平台对 461/471 的惩罚窗口以小时计，
+                    # 硬跑只会把账号越推越死（2026-10-29：#27 在熔断 32 分钟后又跑，
+                    # 43 篇就被二次拦住，随后整轮报废）。
+                    cooldown_left = await self._risk_cooldown_remaining_sec(task_dict)
+                    if cooldown_left > 0:
+                        from .profile_crawler import CrawlExecutionResult
+
+                        result = CrawlExecutionResult()
+                        result.status = "skipped"
+                        result.started_at = datetime.now()
+                        result.finished_at = datetime.now()
+                        result.error = (
+                            f"风控冷却中（还需约 {cooldown_left / 3600:.1f} 小时）："
+                            f"最近一轮因验证码/限流熔断，冷却期内不再发起，"
+                            f"避免把账号越推越死。可先在浏览器里人工过验证码；"
+                            f"确需立刻跑，在任务选项里设 ignore_risk_cooldown=true")
+                        _on_log(result.error, "warning")
+                    elif await self._acquire_slot(queue_key, on_log=_on_log):
                         try:
+                            # 反风控：任务真正发起前随机抖动 1-5s。
+                            # 多个任务同时到点时错开起跑，固定节奏是风控识别特征
                             await anti_risk.jitter_sleep(
                                 lo=float(getattr(config, "SCHEDULER_JITTER_MIN_SEC", 1) or 1),
                                 hi=float(getattr(config, "SCHEDULER_JITTER_MAX_SEC", 5) or 5),
@@ -860,6 +879,74 @@ class TaskScheduler:
                 (task.get("options") or {}).get("save_option", "postgres"))
         except Exception:
             return None
+
+    async def _risk_cooldown_remaining_sec(self, task: Dict[str, Any]) -> int:
+        """风控冷却剩余秒数（0 = 不在冷却期，可以跑）。
+
+        判据：同平台 + 同目标（account 任务的 target 就是账号池 ID）最近一轮
+        运行记录以「触发平台风控」收尾，且距今不足 risk_cooldown_hours。
+
+        为什么要这个闸口：平台对 461/471 的惩罚窗口以小时计，冷却期内硬跑
+        不会成功，只会把账号信誉越打越死（2026-10-29：#27 熔断 32 分钟后又
+        自动开跑，43 篇就被二次拦住，整轮报废）。
+        """
+        try:
+            hours = runtime_config.get_int(
+                "risk_cooldown_hours",
+                int(getattr(config, "RISK_COOLDOWN_HOURS", 6) or 6))
+        except Exception as e:
+            # 读配置失败不要静默按 0 处理（那样冷却会形同虚设），至少留痕
+            try:
+                from tools import utils as _utils
+
+                _utils.logger.warning(f"[scheduler] 读取风控冷却配置失败：{e}")
+            except Exception:
+                pass
+            hours = int(getattr(config, "RISK_COOLDOWN_HOURS", 6) or 0)
+        if hours <= 0:
+            return 0
+        platform = str(task.get("platform") or "").strip()
+        if not platform:
+            return 0
+        target = str(task.get("target") or "").strip()
+        task_id = task.get("id")
+        try:
+            async with _session() as session:
+                if session is None:
+                    return 0
+                conds = [
+                    ScheduledTask.platform == platform,
+                    ScheduledTaskRun.error_message.like("%触发平台风控%"),
+                    ScheduledTaskRun.finished_at.isnot(None),
+                ]
+                if target:
+                    conds.append(or_(ScheduledTaskRun.task_id == task_id,
+                                     ScheduledTask.target == target))
+                else:
+                    conds.append(ScheduledTaskRun.task_id == task_id)
+                stmt = (select(ScheduledTaskRun.finished_at)
+                        .join(ScheduledTask, ScheduledTask.id == ScheduledTaskRun.task_id)
+                        .where(*conds)
+                        .order_by(ScheduledTaskRun.finished_at.desc())
+                        .limit(1))
+                last_at = (await session.execute(stmt)).scalars().first()
+        except Exception as e:
+            # 冷却判断失败绝不能拦住正常调度，按「不冷却」放行
+            try:
+                from tools import utils as _utils
+
+                _utils.logger.warning(f"[scheduler] 风控冷却判断失败，放行：{e}")
+            except Exception:
+                pass
+            return 0
+        if not last_at:
+            return 0
+        try:
+            age = (cst_now() - to_cst(last_at)).total_seconds()
+        except Exception:
+            return 0
+        remain = int(hours * 3600 - max(0.0, age))
+        return max(0, remain)
 
     # ---------- 状态 ----------
 

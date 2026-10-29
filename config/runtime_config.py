@@ -37,6 +37,7 @@ LEGACY_FALLBACK: Dict[str, str] = {
     "ip_proxy_provider_name": "IP_PROXY_PROVIDER_NAME",
     "ip_proxy_pool_count": "IP_PROXY_POOL_COUNT",
     "static_proxy_url": "STATIC_PROXY_URL",
+    "risk_cooldown_hours": "RISK_COOLDOWN_HOURS",
     "headless": "HEADLESS",
     "save_login_state": "SAVE_LOGIN_STATE",
     "enable_cdp_mode": "ENABLE_CDP_MODE",

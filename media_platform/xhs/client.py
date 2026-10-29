@@ -630,6 +630,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     f"[XiaoHongShuClient._fetch_sub_pages] Failed to get "
                     f"sub-comments for root_comment_id: {root_comment_id}: {e}. "
                     f"留待续抓。")
+                # 失败必须退避再翻下一个根：零间隔连打是风控最明显的特征
+                await anti_risk.xhs_sleep(f"root {root_comment_id} 楼中楼失败退避")
                 return result, last_cursor  # 报错：未翻完，留待续抓
             if not isinstance(comments_res, dict):
                 utils.logger.info(
@@ -738,10 +740,21 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 result.extend(subs)
                 if still:
                     open_sub[root_comment_id] = still
+            except (CaptchaError, IPBlockError, PlatformAccessError):
+                # 风控异常绝不能在这里被吞掉！曾经用裸 `except Exception` 兜底，
+                # 461/471 被当成「单条评论处理失败」→ continue 到下一个根评论，
+                # 零间隔再打一发，一秒钟能连撞好几发 461，而且整批不熔断
+                # （2026-10-29：RUN 99 出现 45 条 461 却仍被判定 success，
+                # 账号实际早已在风控态，后续两轮全被带崩）。
+                # 这里的正确处理是往上抛，交给 core.get_comments 熔断整批。
+                raise
             except Exception as e:
                 utils.logger.error(
                     f"[XiaoHongShuClient.get_comments_all_sub_comments] Error processing comment: {comment.get('id', 'unknown')}, error: {e}. Continuing with next comment."
                 )
+                # 非风控失败也要退避：否则被限流时会以零间隔连打下一个根评论，
+                # 进一步坐实风控特征。
+                await anti_risk.xhs_sleep(f"root {root_comment_id} 楼中楼失败退避")
                 continue  # Continue to next comment
         return result, open_sub
 
@@ -895,6 +908,10 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         for uri in ("/api/sns/web/v2/user/me", "/api/sns/web/v1/user/me"):
             try:
                 res = await self.get(uri, {})
+            except (CaptchaError, IPBlockError, PlatformAccessError):
+                # 已经在风控态下就别再拿后面的接口试一遍了：
+                # 身份检查阶段撞验证码必须立刻往上抛，让 core 收手
+                raise
             except Exception as e:
                 utils.logger.warning(
                     f"[XiaoHongShuClient.get_self_user_id] {uri} 失败: {e}")

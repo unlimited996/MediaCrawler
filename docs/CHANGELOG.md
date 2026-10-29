@@ -5,6 +5,49 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-29] 修复 风控反复触发：461 被吞 + 无跨轮冷却
+
+### 现象
+定时任务 #27（account 点赞备份）一天内连续三轮撞 461 验证码：
+`RUN 99`（12:46，显示 success）→ `RUN 100`（16:39 熔断，95 篇评论未抓）
+→ `RUN 101`（17:29 又是 461，43 篇后整轮报废）。
+
+### 根因（两层，缺一不可）
+1. **461 被 `except Exception` 吞掉，根本没熔断**（真凶）
+   `media_platform/xhs/client.py::get_comments_all_sub_comments` 对每条根评论的
+   楼中楼抓取用裸 `except Exception` 兜底 → `CaptchaError` 被当成「单条评论处理失败」
+   → `continue` 到下一个根评论，**零间隔再打一发**。
+   日志实测 13:57:45 同一秒连撞 3 条 461；整批不熔断，
+   `_risk_abort_reason` 永远不置位 → RUN 99 出现 45 条 461 仍被判 **success**，
+   下一轮自然毫无防备地继续跑，把账号越推越死。
+2. **没有跨轮冷却**：RUN 100 熔断后仅 32 分钟又开跑（RUN 101），
+   平台惩罚窗口以小时计，43 篇就被二次拦住。
+
+### 修复
+- `client.py::get_comments_all_sub_comments`：
+  风控异常（`CaptchaError` / `IPBlockError` / `PlatformAccessError`）**一律 re-raise**，
+  交给 `core.get_comments` 熔断整批；普通异常才跳过该根评论，且**先退避再继续**。
+- `client.py::_fetch_sub_pages`：`DataFetchError` 分支补退避，避免零间隔连打。
+- `client.py::get_self_user_id`：身份探测阶段撞风控立即上抛，不再依次试
+  v1/v2 user/me → selfinfo → mentions（那等于 3-4 发无效请求）。
+- **风控冷却闸口**（新增）：命中验证码/限流熔断后，同平台 + 同目标
+  （account 任务的 target 即账号池 ID）在 `risk_cooldown_hours`（默认 6 小时）
+  内不再发起任务，直接记 `skipped` 并说明原因。
+  - 配置项 `risk_cooldown_hours` 落在「代理与风控」分组，前端可编辑；
+    `0` = 关闭冷却；任务选项 `ignore_risk_cooldown=true` 可强制本次执行。
+  - 实现：`task_scheduler._risk_cooldown_remaining_sec()`，读
+    `scheduled_task_run` 最近一条含「触发平台风控」的记录算剩余时间；
+    判断失败按「不冷却」放行（绝不因冷却逻辑拦住正常调度）。
+
+### 验证
+- 新增 `tests/test_xhs_risk_abort.py`（4 条）：风控异常必须穿透（Captcha/IPBlock）、
+  部分成功后撞风控仍整批上抛、普通异常跳过但每次失败都退避；连同分页回归共 **13 passed**。
+- 冷却闸口直调：`#27 → 5.86h`，#27 同平台不同 target → `0`，其它平台 → `0`。
+- 端到端：手动触发 #27 实际落 `RUN 102 = skipped`（「风控冷却中（还需约 5.8 小时）」），
+  **没有起爬虫**；重启 8081 后 `/api/config/groups` 可见 `risk_cooldown_hours = 6 小时`。
+- 数据修正：`RUN 100/101` 的 `error_message` 由「内容已设为私密」「服务重启中断」
+  改回真实原因（触发平台风控 / 461 熔断），冷却判定与历史复盘才有据可依。
+
 ## [2026-10-29] 优化 列表翻页休眠：末页不再白睡，风控熔断不再自动重试
 
 ### 修复：跳过视频帖/已归档帖后仍在随机休眠

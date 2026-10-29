@@ -110,6 +110,11 @@ CONFIG_ITEMS: List[Dict] = [
     dict(group="risk", key="static_proxy_url", label="静态代理地址", value_type="string",
          default="", regex=r"^https?://", timing="next_task", weight=25, advanced=True,
          desc="形如 http://user:password@host:port"),
+    dict(group="risk", key="risk_cooldown_hours", label="风控冷却时长", value_type="int",
+         default="6", min=0, max=168, timing="next_task", weight=30, unit="小时",
+         desc="一轮任务因验证码/限流（461/471）熔断后，同平台（同账号）在这段时间内"
+              "不再发起新任务。平台惩罚窗口以小时计，冷却期内继续跑只会越推越死；"
+              "0 = 不启用冷却"),
     # ---------------- browser ----------------
     dict(group="browser", key="enable_browser", label="启用浏览器", value_type="bool",
          default="true", timing="next_task", weight=5,

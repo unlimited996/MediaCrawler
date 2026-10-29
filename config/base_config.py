@@ -226,6 +226,11 @@ SCHEDULER_JITTER_MAX_SEC = _env_float("SCHEDULER_JITTER_MAX_SEC", 5)
 # 窗口外到点的任务推迟到窗口起点时，再叠加的随机分散上限（秒），
 # 防止开窗瞬间所有任务同时起跑
 SCHEDULER_WINDOW_SPREAD_SEC = _env_int("SCHEDULER_WINDOW_SPREAD_SEC", 300)
+# 风控冷却期（小时）：一轮任务因验证码/限流熔断后，同平台（同账号）在
+# 这段时间内不再自动发起新任务。平台对 461/471 的惩罚窗口通常以小时计，
+# 冷却期内继续跑只会把账号越推越死（2026-10-29：#27 熔断 32 分钟后又跑，
+# 43 篇就被二次拦住）。设 0 表示不启用冷却。
+RISK_COOLDOWN_HOURS = _env_int("RISK_COOLDOWN_HOURS", 6)
 
 # ---- S3 媒体备份联动删除 ----
 # 原贴被硬删除时，是否把该帖的 S3 备份对象一并删除（默认开）。
