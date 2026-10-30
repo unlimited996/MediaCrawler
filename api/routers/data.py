@@ -344,7 +344,9 @@ async def _serve_backup_fallback(platform: str, content_id: str,
                 MediaBackup.content_id == content_id,
             )
         )).scalars().all()
-        suffix = f"/{content_id}/{filename}"
+        # 按文件名后缀匹配：去重后对象键变成内容寻址的 ``dedup/{type}/{sha256}``，
+        # 不再含 content_id 段，所以只以 ``/{filename}`` 收尾来定位，避免回退 404。
+        suffix = f"/{filename}"
         for key in rows:
             if not key or not key.endswith(suffix):
                 continue

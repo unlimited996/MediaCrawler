@@ -16,7 +16,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import axios from 'axios'
 import {
-  CloudUpload, Crosshair, DatabaseBackup, HardDriveDownload, Play, Plus,
+  CloudUpload, Crosshair, DatabaseBackup, HardDriveDownload, Layers, Play, Plus,
   Power, RefreshCw, RotateCcw, Trash2, Wifi, X, Zap,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -93,6 +93,15 @@ export function S3BackupView() {
       })).data,
     refetchInterval: 15000,
   })
+  const dedupQ = useQuery({
+    queryKey: ['s3DedupReport'],
+    queryFn: async () => (await api.get<{
+      analyzed_rows: number; dup_groups: number; redundant_objects: number;
+      reclaimable_bytes: number; groups: any[]; last_run?: any
+    }>('/s3-backup/dedup/report')).data,
+    // 不自动轮询：全表扫描较重，仅在「分析报告」/「执行去重」后按需刷新
+  })
+  const [dedupOpen, setDedupOpen] = useState(false)
 
   const invalidateAll = () => {
     qc.invalidateQueries({ queryKey: ['s3Configs'] })
@@ -177,6 +186,21 @@ export function S3BackupView() {
     },
   })
 
+  const dedupAnalyzeM = useMutation({
+    mutationFn: async () => (await api.post('/s3-backup/dedup/run', { execute: false })).data,
+    onSuccess: () => {
+      dedupQ.refetch()
+      toast.success('去重分析完成')
+    },
+  })
+  const dedupRunM = useMutation({
+    mutationFn: async () => (await api.post('/s3-backup/dedup/run', { execute: true })).data,
+    onSuccess: (d: any) => {
+      toast.success(d?.started ? '去重合并已在后台启动，稍后查看报告' : (d?.note || '未启动'))
+    },
+    onError: (e: any) => toast.error(`启动失败：${e?.response?.data?.detail || e?.message}`),
+  })
+
   const stats = statsQ.data
   const items = itemsQ.data?.items || []
   const total = itemsQ.data?.total || 0
@@ -225,6 +249,89 @@ export function S3BackupView() {
       <div className="flex-1 grid min-h-0 gap-4 overflow-hidden lg:grid-cols-5">
         {/* 左列：统计 + 配置 */}
         <div className="flex min-h-0 flex-col gap-4 overflow-hidden lg:col-span-2">
+          {/* 存储去重 */}
+          <div className="glass-panel rounded-lg px-3 py-2.5">
+            <div className="flex items-center gap-2">
+              <Layers className="h-4 w-4 text-cyber-neon-cyan" />
+              <span className="font-mono text-xs font-bold text-cyber-text-primary">存储去重</span>
+              <span className="text-[11px] text-cyber-text-muted">
+                按图片内容（sha256）合并完全相同的备份，释放重复存储
+              </span>
+            </div>
+            <div className="mt-2 grid grid-cols-3 gap-2">
+              <StatCard label="重复组" value={dedupQ.data?.dup_groups ?? 0} tone="purple" />
+              <StatCard label="冗余对象" value={dedupQ.data?.redundant_objects ?? 0} tone="orange" />
+              <StatCard label="可收回" value={fmtBytes(dedupQ.data?.reclaimable_bytes ?? 0)} tone="cyan" />
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Button size="sm" variant="outline" className="font-mono text-xs"
+                      onClick={() => dedupAnalyzeM.mutate()} disabled={dedupAnalyzeM.isPending}>
+                <RefreshCw className="mr-1 h-3.5 w-3.5" />分析报告
+              </Button>
+              <Button size="sm" className="font-mono text-xs"
+                      disabled={dedupRunM.isPending
+                                || !(dedupQ.data?.redundant_objects)}
+                      onClick={() => {
+                        if (confirm(`确认执行去重合并？\n\n将把 ${dedupQ.data?.redundant_objects} 个冗余 S3 对象删除，` +
+                                    `释放 ${fmtBytes(dedupQ.data?.reclaimable_bytes ?? 0)} 存储空间。` +
+                                    `该操作不可撤销，建议先确认分析报告中无异常分组。`)) {
+                          dedupRunM.mutate()
+                        }
+                      }}>
+                <Trash2 className="mr-1 h-3.5 w-3.5" />执行去重
+              </Button>
+              {(dedupQ.data?.dup_groups ?? 0) > 0 && (
+                <Button size="sm" variant="ghost" className="font-mono text-xs"
+                        onClick={() => setDedupOpen((v) => !v)}>
+                  {dedupOpen ? '收起分组' : `查看分组(${dedupQ.data?.dup_groups})`}
+                </Button>
+              )}
+            </div>
+            {dedupQ.data?.last_run && (
+              <div className={`mt-2 rounded border px-2 py-1 text-[11px] font-mono ${
+                dedupQ.data.last_run.ok
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                  : 'border-rose-500/30 bg-rose-500/10 text-rose-300'}`}>
+                {dedupQ.data.last_run.ok
+                  ? `上次${dedupQ.data.last_run.execute ? '执行' : '分析'}：` +
+                    `合并 ${dedupQ.data.last_run.groups ?? 0} 组，` +
+                    `删 ${dedupQ.data.last_run.objects_deleted ?? 0} 对象，` +
+                    `释放 ${fmtBytes(dedupQ.data.last_run.bytes_reclaimed ?? 0)}`
+                  : `上次运行失败：${dedupQ.data.last_run.error || ''}`}
+                {dedupQ.data.last_run.errors?.length
+                  ? `（${dedupQ.data.last_run.errors.length} 组跳过）` : ''}
+              </div>
+            )}
+            {dedupOpen && dedupQ.data?.groups?.length ? (
+              <div className="mt-2 max-h-52 overflow-auto rounded border border-cyber-border-subtle">
+                <table className="w-full font-mono text-[10px]">
+                  <thead className="sticky top-0 bg-cyber-bg-panel text-cyber-text-muted">
+                    <tr className="border-b border-cyber-border-subtle">
+                      <th className="px-2 py-1 text-left">sha256(前12)</th>
+                      <th className="px-2 py-1 text-left">类型</th>
+                      <th className="px-2 py-1 text-left">重复数</th>
+                      <th className="px-2 py-1 text-left">可收回</th>
+                      <th className="px-2 py-1 text-left">规范键</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dedupQ.data.groups.slice(0, 50).map((g: any) => (
+                      <tr key={g.checksum} className="border-b border-cyber-border-subtle/50">
+                        <td className="px-2 py-1 text-cyber-text-secondary">{g.checksum.slice(0, 12)}</td>
+                        <td className="px-2 py-1 text-cyber-text-secondary">{g.media_type}</td>
+                        <td className="px-2 py-1 text-cyber-text-secondary">×{g.count}</td>
+                        <td className="px-2 py-1 text-cyber-text-secondary">{fmtBytes(g.reclaimable_bytes)}</td>
+                        <td className="max-w-[160px] truncate px-2 py-1 text-cyber-text-muted" title={g.canonical_key}>
+                          {g.canonical_already ? '已合并' : g.canonical_key}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+
           {/* 统计卡片 */}
           <div className="grid flex-shrink-0 grid-cols-3 gap-2">
             <StatCard label="待备份" value={stats?.pending ?? 0} tone="amber" />

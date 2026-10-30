@@ -211,6 +211,13 @@ async def delete_object(settings: S3Settings, key: str) -> bool:
     return True
 
 
+async def copy_object(settings: S3Settings, src_key: str, dest_key: str) -> bool:
+    """服务端拷贝对象（不下载字节）；Garage / MinIO / AWS 通用。"""
+    await call(settings, "copy_object", Bucket=settings.bucket, Key=dest_key,
+              CopySource={"Bucket": settings.bucket, "Key": src_key})
+    return True
+
+
 def _guess_type(key: str) -> str:
     import mimetypes
 

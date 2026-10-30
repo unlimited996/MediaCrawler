@@ -539,6 +539,86 @@ async def story_status(story_id: int):
 
 
 # ---------------------------------------------------------------------------
+# 存储去重（内容寻址合并重复图片）
+# ---------------------------------------------------------------------------
+
+#: 去重后台任务（同一时刻只跑一个）与最近一次运行结果
+_DEDUP_TASK: Optional[asyncio.Task] = None
+_DEDUP_LAST: Optional[Dict[str, Any]] = None
+
+
+@router.get("/dedup/report")
+async def dedup_report():
+    """去重分析报告（只读，随时可跑）：重复组数 / 冗余对象数 / 可收回体积，及分组明细。
+
+    附带上次执行结果（last_run），前端执行后可轮询此处查看进度与结果。
+    """
+    engine, session = await _session()
+    if session is None:
+        return {"error": "配置库不可用", "last_run": _DEDUP_LAST}
+    try:
+        from tools.media_dedup import analyze_duplicates
+
+        rep = await analyze_duplicates(session)
+        rep["last_run"] = _DEDUP_LAST
+        return rep
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.post("/dedup/run")
+async def dedup_run(payload: Dict[str, Any] = Body(default={})):
+    """执行去重合并。
+
+    :param execute: true 才真正改键 + 删除冗余 S3 对象；缺省/ false 仅返回
+                    与报告一致的处理量（dry-run），不改动任何数据。
+    删除 S3 对象有风险，故默认只读；前端「执行去重」按钮带 confirm 后传 execute=true。
+    """
+    global _DEDUP_TASK, _DEDUP_LAST
+    if _DEDUP_TASK is not None and not _DEDUP_TASK.done():
+        return {"started": False, "note": "已有去重任务在运行"}
+
+    execute = bool(payload.get("execute", False))
+
+    async def _bg():
+        global _DEDUP_LAST
+        from tools.media_dedup import dedup_backups
+
+        engine, session = await _session()
+        if session is None:
+            _DEDUP_LAST = {"ok": False, "execute": execute,
+                           "error": "配置库不可用"}
+            return
+        try:
+            cfg = await active_settings(session)
+            if cfg is None or not cfg["settings"].secret_access_key:
+                _DEDUP_LAST = {"ok": False, "execute": execute,
+                               "error": "未配置可用的 S3 存储"}
+                return
+            res = await dedup_backups(session, cfg["settings"],
+                                     dry_run=not execute)
+            _DEDUP_LAST = {"ok": True, "execute": execute, **res,
+                           "at": _now_iso()}
+        except Exception as e:
+            _DEDUP_LAST = {"ok": False, "execute": execute,
+                           "error": f"{type(e).__name__}: {e}"[:500]}
+        finally:
+            await session.close()
+            await engine.dispose()
+
+    _DEDUP_TASK = asyncio.create_task(_bg())
+    return {"started": True, "execute": execute,
+            "note": "去重任务已在后台启动" if execute else "仅分析（dry-run）"}
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
 # S3 对象代理（访问链第三级）
 # ---------------------------------------------------------------------------
 

@@ -5,6 +5,35 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-30] 新增 S3 备份去重（按内容合并重复图片）
+
+### 背景
+`media_backup` 的对象键是 `{platform}/{type}/{content_id}/{filename}`，同一张图只要
+出现在不同帖子/评论里就被存成 N 个内容一致、键不同的 S3 对象，白白占存储。
+
+### 变更
+- 新增 `tools/media_dedup.py`：
+  - `analyze_duplicates(session)`：只读，按 `media_backup.checksum`（上传时算的
+    sha256）分组，统计重复组数 / 冗余对象数 / 可收回体积，及每组明细。相同
+    checksum = 相同字节，物理去重 100% 安全。
+  - `dedup_backups(session, settings, dry_run)`：把每组冗余行 `object_key` 改指向
+    一个**规范键**（优先复用已有 `dedup/` 键，否则用组内首行现有键），删除其余
+    「行数-1」个冗余 S3 对象，保留 1 份，腾出空间。`dry_run=True` 只出报告不改动。
+  - 安全：只读 `uploaded` 且有 checksum 的行；删对象前确认无其它行引用；拷贝失败
+    的组整体跳过绝不删原对象；幂等（重跑已合并组为 no-op）。
+  - `tools/s3_client.py` 新增 `copy_object`（服务端拷贝，带下载重传兜底）。
+- `api/routers/s3_backup.py` 新增：`GET /s3-backup/dedup/report`（只读分析）、
+  `POST /s3-backup/dedup/run`（`execute:true` 才真改键+删对象，后台任务+记住上次结果）。
+- `api/routers/data.py`：`/api/data/media/...` 的 S3 回退匹配放宽成按文件名后缀
+  （`/{filename}`），去重后内容寻址键也能命中，不回退 404。
+- 前端 `S3BackupView` 新增「存储去重」面板：重复组/冗余对象/可收回体积三卡片 +
+  「分析报告」「执行去重」（带确认）按钮 + 分组明细。
+
+### 验证
+- `tests/test_s3_dedup.py`：4 例（分组统计 / dry-run 不动数据 / 合并改键+删冗余 /
+  幂等重跑），内存 SQLite + monkeypatch S3 客户端，全部通过。
+- 真实库只读分析：2472 已备份行 → 69 重复组、295 冗余对象、约 12.4MB 可收回。
+
 ## [2026-10-30] 修复 图片显示不出来（多级回退）+ 标签多选 + 标签数排版
 
 ### 问题
