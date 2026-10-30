@@ -5,6 +5,44 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-31] 变更 评论抓取改为两阶段「真人顺序」，降低行为画像风控
+
+### 背景
+抓取日志出现 `461`×16、验证码×6、`471`×3、`RISK_ABORT`×2。参考小红书留档 skill 的
+风控结论：**被判定为机器人的不是签名，而是请求的节奏与形态**。
+排查确认间隔本身已是 5-15s 随机（`_xhs_crawl_interval()` 返回区间），问题出在
+**接口顺序**：旧实现每翻一页主评论就立刻翻这一页的楼中楼，两个 endpoint 交替
+（`page → sub → page → sub…`），服务端看到的就是「顺 cursor 链走到底 + 两端点来回切」。
+
+### 变更（`media_platform/xhs/client.py`）
+- **`get_note_all_comments` 拆成两阶段**，贴合真人操作顺序：
+  - 阶段 1：只打 `comment/page`，把整篇一级评论翻到底（真人=把评论列表滚到底）
+  - 阶段 2：主评论翻完后才切 `sub/page`，逐条展开楼中楼（真人=逐条点「展开 N 条回复」）
+  - 请求序列从 `A B B A B B…` 变为 `A A … B B …`
+- **新增 `_drain_inline_subs`**：主评论响应内嵌的楼中楼预览零额外请求直接入库，
+  并登记 `seen_sub_ids`，阶段二翻页不重复写入。旧逻辑靠 `_fetch_sub_pages` 顺带处理
+  内嵌，两阶段后必须在阶段一先落库，否则会漏回复。
+- **新增 `_sub_needs_paging`**：阶段一只把「确实还有回复要翻」的主楼留到阶段二，
+  `sub_comment_count=0` 且无 `has_more` 的主楼整个跳过——省掉大量无效请求
+  （skill 里收益最大的一条）。
+- `get_comments_all_sub_comments` 新增 `seen_sub_ids` 参数（跨阶段共享去重集合）；
+  并支持 `start_sub_cursors` 里**空游标=从头翻**，已处理过的 root 用 `handled_roots`
+  去重，不重复请求。
+- **断点续抓兼容**：阶段一每页把累积的 `pending_roots` 以空游标写进 `sub_cursors`
+  （并保留上一轮遗留游标），阶段一被中断也不丢楼中楼。
+
+### 验证
+- 新增 `tests/test_xhs_comment_human_order.py`（3 项，全通过）：
+  请求序列两阶段严格分离 / 无回复主楼不发请求 / 内嵌预览不额外发请求。
+- 回归：`comment_resume` 5、`comment_completeness` 15、`comment_order` 8、
+  `behavior_paging` 13 —— 全部通过。
+- `test_xhs_risk_circuit.py` 2 项失败为**既有问题**：用 `git stash` 去掉本次改动后
+  重跑同样超时（exit=124），且该测试用 `FakeClient` 整段替换了 `get_note_all_comments`，
+  不受本次改动影响。
+
+### 备注
+本次只调整**形态（顺序）**，未改间隔（已是 5-15s 随机）。
+
 ## [2026-10-30] 修复 看图弹窗点空白处无法关闭 + 重复检测分组支持整行展开并排看图
 
 ### 背景

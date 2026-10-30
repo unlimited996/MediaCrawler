@@ -491,6 +491,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         """
         result = []
         seen_comment_ids: set = set()
+        # 跨阶段共享：阶段一登记内嵌预览后，阶段二翻页不会再重复入库
+        seen_sub_ids: set = set()
         comments_has_more = True
         comments_cursor = start_cursor or ""
         # max_count 约束的是「一级评论」条数：<=0 表示不限制，一直翻到
@@ -499,23 +501,15 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         top_count = int(top_count_in or 0)
         # 本轮回填 / 续抓后仍没翻完的根评论楼中楼游标（page 级累积，供续抓恢复）
         open_sub: Dict[str, str] = {}
+        # 阶段二待展开的主楼（阶段一只收集，不发 sub/page 请求）
+        pending_roots: List[Dict] = []
 
-        # 续抓恢复：先补齐上一轮中断、没翻完的根评论楼中楼。这些根评论的主评论
-        # 已在上一轮入库，不会在下面的主评论翻页里再次出现，所以必须在这里单独收尾。
-        if sub_cursors:
-            subs, still = await self.get_comments_all_sub_comments(
-                comments=[], xsec_token=xsec_token,
-                crawl_interval=crawl_interval, callback=callback,
-                note_id=note_id, start_sub_cursors=sub_cursors,
-            )
-            result.extend(subs)
-            open_sub.update(still)
-            if subs or still:
-                utils.logger.info(
-                    f"[XiaoHongShuClient.get_note_all_comments] 续抓恢复 note "
-                    f"{note_id}：补齐 {len(subs)} 条上一轮未翻完的楼中楼，"
-                    f"仍有 {len(still)} 个根未完成")
-
+        # -------- 阶段 1：先把整篇一级评论翻到底（真人=把评论列表滚到底）--------
+        # 这一阶段只打 comment/page 一个 endpoint，绝不穿插 sub/page。
+        # 旧实现是「翻一页主评论 → 立刻翻这页的楼中楼 → 再翻下一页」，
+        # 两个 endpoint 交替（A B B A B B…）是典型爬虫行为画像；真人形态
+        # 是先把评论列表滚到底（A A A…），再逐条点开回复（B B B…）。
+        # 参考小红书留档 skill 的风控结论：被判机器人的不是签名，是请求节奏与形态。
         while comments_has_more and (unlimited or top_count < max_count):
             comments_res = await self.get_note_comments(
                 note_id=note_id, xsec_token=xsec_token, cursor=comments_cursor
@@ -539,25 +533,46 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 await callback(note_id, comments)
             await anti_risk.interval_sleep(crawl_interval, "分页/翻页间隔")
             result.extend(comments)
+            # 内嵌楼中楼预览：随主评论一起返回，零额外请求，先落库
+            result.extend(await self._drain_inline_subs(
+                comments, note_id, callback, seen_sub_ids))
+            # 只把「确实还有回复要翻」的主楼留到阶段二（省掉大量无效请求）
+            pending_roots.extend(c for c in comments if self._sub_needs_paging(c))
+            # 每翻完一页就持久化续抓进度（page 级）。
+            # 阶段一若被中断，已抓主楼的回复还没翻：把它们以「空游标」记进
+            # sub_cursors，下次续抓会从头补翻（空游标=从头，见阶段二处理）。
+            if progress_callback:
+                pending_map: Dict[str, str] = {
+                    c.get("id"): "" for c in pending_roots if c.get("id")}
+                pending_map.update(dict(sub_cursors or {}))  # 保留上一轮遗留游标
+                await progress_callback(note_id, {
+                    "top_cursor": comments_cursor,
+                    "top_count": top_count,
+                    "sub_cursors": pending_map,
+                    "reached_end": (not comments_has_more),
+                }, finished=False)
+
+        # -------- 阶段 2：再逐条展开楼中楼（真人=逐条点「展开 N 条回复」）--------
+        # 主评论全部翻完后才切到 sub/page endpoint，并连续打完，不再与
+        # comment/page 交替。上一轮没翻完的根评论（sub_cursors）也在这里收尾。
+        if pending_roots or sub_cursors:
+            utils.logger.info(
+                f"[XiaoHongShuClient.get_note_all_comments] note {note_id} "
+                f"阶段2：展开 {len(pending_roots)} 个主楼的回复"
+                + (f"，并收尾上一轮 {len(sub_cursors or {})} 个未完成的楼中楼"
+                   if sub_cursors else ""))
             subs, page_open = await self.get_comments_all_sub_comments(
-                comments=comments,
+                comments=pending_roots,
                 xsec_token=xsec_token,
                 crawl_interval=crawl_interval,
                 callback=callback,
                 note_id=note_id,
+                start_sub_cursors=sub_cursors,
+                seen_sub_ids=seen_sub_ids,
             )
             result.extend(subs)
             open_sub.update(page_open)
-            # 每翻完一页就把续抓进度持久化（page 级）：中断后从本页之后继续，
-            # 不重头翻、不重复已抓评论。reached_end 标记是否真的翻到底。
-            if progress_callback:
-                await progress_callback(note_id, {
-                    "top_cursor": comments_cursor,
-                    "top_count": top_count,
-                    "sub_cursors": open_sub,
-                    "reached_end": (not comments_has_more),
-                }, finished=False)
-        # 主评论翻页结束：通知上层 reached_end（是否翻到 has_more=False）。
+        # 全部翻页结束：通知上层 reached_end（是否翻到 has_more=False）。
         if progress_callback:
             await progress_callback(note_id, {
                 "top_cursor": comments_cursor,
@@ -571,6 +586,48 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             + ("（不限制，翻到底）" if unlimited else f" / 上限 {max_count}")
             + f"，含子评论共 {len(result)} 条")
         return result
+
+    @staticmethod
+    def _sub_needs_paging(comment: Dict) -> bool:
+        """该主楼是否还需要「阶段二」去翻楼中楼。
+
+        与 _fetch_sub_pages 的翻页判据保持一致：
+        接口给了 has_more 就听它的；没给时用「内嵌预览数 < 声明回复数」兜底。
+        返回 False 的根评论在阶段二会被整个跳过——这是省请求量的关键
+        （大量主楼根本没有回复，逐条去问就是纯浪费，还会坐实机器人画像）。
+        """
+        sub_count = int(comment.get("sub_comment_count") or 0)
+        inline = comment.get("sub_comments") or []
+        if bool(comment.get("sub_comment_has_more")):
+            return True
+        return bool(sub_count and len(inline) < sub_count)
+
+    async def _drain_inline_subs(
+        self,
+        comments: List[Dict],
+        note_id: Optional[str],
+        callback: Optional[Callable],
+        seen_sub_ids: set,
+    ) -> List[Dict]:
+        """把主评论响应里内嵌的楼中楼预览先入库（零额外请求）。
+
+        主评论对象自带 sub_comments 预览，真人滑到这里这些回复已经可见。
+        不入库会漏掉大量回复；这里登记进 seen_sub_ids 后，阶段二翻页时
+        同一批数据不会被重复写入。
+        """
+        out: List[Dict] = []
+        for c in comments or []:
+            inline = c.get("sub_comments") or []
+            if not inline:
+                continue
+            cid = c.get("note_id") or note_id
+            fresh = [s for s in inline if s.get("id") and s.get("id") not in seen_sub_ids]
+            seen_sub_ids.update(s.get("id") for s in fresh if s.get("id"))
+            if fresh:
+                if callback:
+                    await callback(cid, fresh)
+                out.extend(fresh)
+        return out
 
     async def _fetch_sub_pages(
         self,
@@ -677,6 +734,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         callback: Optional[Callable] = None,
         note_id: Optional[str] = None,
         start_sub_cursors: Optional[Dict[str, str]] = None,
+        seen_sub_ids: Optional[set] = None,
     ) -> tuple:
         """
         Get all second-level comments under specified first-level comments.
@@ -692,6 +750,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             callback: 每批楼中楼入库回调
             note_id: 笔记 ID（续抓收尾时给没有主评论对象的根评论用）
             start_sub_cursors: 上一轮没翻完的根评论楼中楼游标（续抓收尾用）
+            seen_sub_ids: 外部传入的「已抓子评论 ID」集合（两阶段抓取时由
+                阶段一内嵌预览登记后共享进来，避免阶段二重复入库）
         """
         if not config.ENABLE_GET_SUB_COMMENTS:
             utils.logger.info(
@@ -702,20 +762,23 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         result: List[Dict] = []
         # 跨主评论共享：子评论 ID 全局唯一，同一子评论可能出现在内嵌预览和
         # 翻页结果里（也可能因分页重叠重复出现），必须去重后再入库。
-        seen_sub_ids: set = set()
+        seen_sub_ids = seen_sub_ids if seen_sub_ids is not None else set()
         open_sub: Dict[str, str] = {}
 
         # 0) 续抓收尾：先把上一轮中断、没翻完的根评论楼中楼补齐。这些根的主评论
         #    已在上一轮入库，不会在下面的主评论循环里出现，所以必须单独处理。
+        #    cursor 为空 = 该主楼还没翻过（阶段一被中断的遗留），从头翻即可。
+        handled_roots: set = set()
         for root_id, cursor in list(dict(start_sub_cursors or {}).items()):
-            if not cursor:
+            if not root_id:
                 continue
             subs, still = await self._fetch_sub_pages(
                 note_id=note_id, root_comment_id=root_id,
                 xsec_token=xsec_token, crawl_interval=crawl_interval,
                 callback=callback, seen_sub_ids=seen_sub_ids,
-                initial_has_more=True, initial_cursor=cursor,
+                initial_has_more=True, initial_cursor=cursor or "",
             )
+            handled_roots.add(root_id)
             result.extend(subs)
             if still:
                 open_sub[root_id] = still
@@ -725,6 +788,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             try:
                 cid = comment.get("note_id")
                 root_comment_id = comment.get("id")
+                if root_comment_id in handled_roots:
+                    continue  # 阶段二收尾时已翻过，不重复请求
                 sub_count = int(comment.get("sub_comment_count") or 0)
                 inline_subs = comment.get("sub_comments") or []
                 initial_has_more = bool(comment.get("sub_comment_has_more"))
