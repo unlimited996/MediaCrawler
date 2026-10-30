@@ -261,3 +261,74 @@ async def test_empty_fresh_page_does_not_inherit_previous_queued(monkeypatch):
     # 第 3 页是末页（不睡）
     assert len(sleeps) == 1, f"只应在第 1 页睡 1 次，实际 {sleeps}"
 
+
+# ---------------------------------------------------------------------------
+# 早停 + 「优先续抓未完成帖」（2026-10-30）
+#   用户要求：抓点赞/收藏时优先续抓之前没抓完的帖子，不要每次都从头把整份
+#   列表翻一遍。未完成帖改为按 note_id 直连续抓（get_backfill_candidates 查出
+#   待补池 + 已存 xsec_token），列表阶段只负责发现新增；连续若干页无新增即早停。
+# ---------------------------------------------------------------------------
+
+def test_update_idle_streak_counts_and_resets():
+    """连续空转页累计到阈值即停止；中间出现新帖则归零。"""
+    from media_platform.xhs.core import update_idle_streak
+
+    idle = {}
+    assert not update_idle_streak(idle, "likes", 0, 3)   # 空转 1
+    assert not update_idle_streak(idle, "likes", 0, 3)   # 空转 2
+    assert not update_idle_streak(idle, "likes", 5, 3)   # 有新帖 → 归零
+    assert idle["likes"] == 0
+    assert not update_idle_streak(idle, "likes", 0, 3)   # 空转 1
+    assert not update_idle_streak(idle, "likes", 0, 3)   # 空转 2
+    assert update_idle_streak(idle, "likes", 0, 3)       # 空转 3 → 停止
+
+
+def test_update_idle_streak_disabled():
+    """阈值 <= 0 时关闭早停，永远不喊停。"""
+    from media_platform.xhs.core import update_idle_streak
+
+    idle = {}
+    for _ in range(10):
+        assert not update_idle_streak(idle, "likes", 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_early_stop_does_not_scan_full_list(monkeypatch):
+    """连续 3 页无新增就停：495 条（50 页）列表不应被整份扫完。"""
+    _patch_sleep(monkeypatch)
+    from media_platform.xhs.core import update_idle_streak
+
+    client = _client()
+    base = _fake_fetcher(495, "L")
+    pages = {"n": 0}
+
+    async def _fetch(user_id, cursor="", page_size=30):
+        pages["n"] += 1
+        return await base(user_id, cursor, page_size)
+
+    client.get_user_liked_notes = _fetch
+    known = {f"L{i}" for i in range(20, 495)}  # 只有前 20 条是新增
+    idle, EARLY = {}, 3
+
+    async def cb(batch, label="likes"):
+        q = sum(1 for n in batch if n["note_id"] not in known)
+        return {"stop": update_idle_streak(idle, label, q, EARLY), "queued": q}
+
+    await client.get_all_behavior_notes(
+        "uid", behaviors=["likes"], crawl_interval=0, callback=cb)
+
+    # 前 2 页有新帖（L0-9 / L10-19），第 3/4/5 页空转后停止 → 共 5 页
+    assert pages["n"] == 5, f"应在前 2 页有新帖后再空转 3 页停止，实际 {pages['n']} 页"
+    assert pages["n"] < 50, "不应把 495 条（50 页）整份扫完"
+
+
+def test_extract_xsec_token():
+    """待补帖续抓依赖已存 token：ext 缺失时回退从 source_url 解析。"""
+    from tools.v2_sync import _extract_xsec_token
+
+    assert _extract_xsec_token({"xsec_token": "abc"}) == "abc"
+    assert _extract_xsec_token(
+        None, "https://www.xiaohongshu.com/explore/123?xsec_token=tok&x=1") == "tok"
+    assert _extract_xsec_token({}, "") == ""
+    assert _extract_xsec_token({"type": "normal"}, "https://x/123") == ""
+

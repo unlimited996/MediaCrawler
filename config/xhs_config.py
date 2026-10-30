@@ -126,6 +126,13 @@ XHS_BEHAVIOR_MAX_NOTES = _env_int("XHS_BEHAVIOR_MAX_NOTES", 100)
 # 想强制刷新老帖（补头像/补评论图等）时把它设成 0。
 XHS_BEHAVIOR_INCREMENTAL = _env_bool("XHS_BEHAVIOR_INCREMENTAL", True)
 
+# 列表翻页早停：连续 N 页都没有「新增待抓帖」（全是已归档/视频）就停止翻页。
+# 点赞/收藏列表按时间倒序（新帖在最前），一旦连续几页都是老的已处理内容，
+# 后面的只会更老 —— 提前收工，避免每次任务都把整份列表从头翻一遍。
+# 未完成的帖子不靠列表发现，而是由「按 note_id + 已存 xsec_token 直接续抓」
+# 优先处理（见 core.get_account_behavior_notes）。0 = 关闭早停。
+XHS_BEHAVIOR_EARLY_STOP_PAGES = _env_int("XHS_BEHAVIOR_EARLY_STOP_PAGES", 3)
+
 # ---- 评论抓取的「量」怎么定（2026-10-28 重做）----
 # 单篇评论抓取上限（一级评论条数）。0 = 不额外限制，按「原帖显示评论量」
 # 抓全（declared + 余量）；>0 时取 min(按声明数算出的量, 本值) 作为硬上限。

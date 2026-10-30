@@ -647,6 +647,99 @@ async def get_archived_content_ids(platform_code: str,
         return set()
 
 
+def _extract_xsec_token(ext: Any, source_url: str = "") -> str:
+    """从 story_chapter.ext['xsec_token'] 或 source_url 的查询串里取 xsec_token。"""
+    if isinstance(ext, dict):
+        tok = ext.get("xsec_token")
+        if tok:
+            return str(tok)
+    if source_url:
+        try:
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(source_url).query)
+            vals = qs.get("xsec_token")
+            if vals:
+                return vals[0]
+        except Exception:
+            pass
+    return ""
+
+
+async def get_backfill_candidates(platform_code: str,
+                                  target_ratio: float = 0.0,
+                                  limit: int = 0,
+                                  max_comments: int = 0) -> List[Dict[str, Any]]:
+    """返回本轮「优先续抓」的未完成帖子（含 content_id / xsec_token / 声明数）。
+
+    与 `get_archived_content_ids` 用同一套完整性判定与 `plan_backfill` 挑选规则，
+    区别是把选中的帖子连同已存的 `xsec_token` 一起返回 —— 抓取端可以**直接按
+    note_id 拉详情+评论**，不必先把整份点赞/收藏列表从头翻一遍才能遇到它们。
+
+    limit / max_comments 语义同 `plan_backfill`（0 = 不限）。查询失败返回空列表。
+    """
+    if target_ratio <= 0:
+        target_ratio = float(getattr(config, "COMMENT_COMPLETENESS_TARGET", 0.0) or 0.9)
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return []
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return []
+            rows = (await session.execute(
+                select(StoryChapter.source_content_id, StoryChapter.source_url,
+                       StoryChapter.ext, Story.status,
+                       StoryChapter.declared_comment_count,
+                       StoryChapter.comment_count, Story.comment_count,
+                       func.count(Comment.id))
+                .join(Story, Story.id == StoryChapter.story_id, isouter=True)
+                .outerjoin(Comment, Comment.story_id == Story.id)
+                .where(StoryChapter.source_site_id == site_id)
+                .group_by(StoryChapter.source_content_id, StoryChapter.source_url,
+                          StoryChapter.ext, Story.status,
+                          StoryChapter.declared_comment_count,
+                          StoryChapter.comment_count, Story.comment_count)
+            )).all()
+
+            incomplete: List[tuple] = []
+            meta: Dict[str, Dict[str, Any]] = {}
+            for (content_id, source_url, ext, status, declared_c, chapter_c,
+                 story_c, cmt_count) in rows:
+                if not content_id:
+                    continue
+                if (status or "") in ("deleted", "hidden"):
+                    continue
+                declared = int(declared_c or chapter_c or story_c or 0)
+                fetched = int(cmt_count or 0)
+                if is_comment_complete(fetched, declared, target_ratio):
+                    continue
+                cid = str(content_id)
+                incomplete.append((cid, fetched, declared,
+                                   comment_completeness(fetched, declared)))
+                meta[cid] = {
+                    "content_id": cid,
+                    "source_url": source_url or "",
+                    "xsec_token": _extract_xsec_token(ext, source_url or ""),
+                    "fetched": fetched,
+                    "declared": declared,
+                }
+
+            if not incomplete:
+                return []
+            selected, _deferred = plan_backfill(incomplete, limit, max_comments)
+            out: List[Dict[str, Any]] = []
+            for cid, fetched, declared, ratio in selected:
+                item = dict(meta.get(cid) or {"content_id": cid})
+                item.update({"fetched": fetched, "declared": declared,
+                             "ratio": round(ratio, 4)})
+                out.append(item)
+            return out
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 读取待补帖子失败 {platform_code}: {e}")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # 评论断点续抓：把每篇帖子的「评论分页游标」持久化到 story_chapter.ext，
 # 抓取中断后下一次执行从最后一个成功抓取的评论之后继续，不重头开始、不重复。
@@ -1663,6 +1756,15 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 _ip = item.get("ip_location") or ""
                 if _ip and not existing.ip_location:
                     existing.ip_location = str(_ip)
+
+                # 评论正文回写：重抓带回的是平台最新真实内容，必须覆盖。
+                # 早期抓取会剥离 [表情] 标记（如 [暗中观察R]）、或小红书改文案，
+                # 若不回写，正文会永久陈旧 / 缺表情（典型表现：楼中楼子评论
+                # 「用户发的表情」不显示——刷新前端也没用，因为数据源就没有）。
+                # 评论不可编辑，最新抓取即权威，故直接用新值覆盖；空值不覆盖以防丢失。
+                _new_content = str(item.get("content") or "").strip()
+                if _new_content:
+                    existing.content_text = _new_content
 
                 # 对话目标：重抓带回真实 target_comment 时刷新 ext，
                 # 由抓取结束后的 backfill_comment_links 重新对齐层级。

@@ -76,6 +76,25 @@ def _xhs_captcha_wait_sec() -> int:
     return int(getattr(config, "XHS_CAPTCHA_WAIT_SEC", 300) or 300)
 
 
+def update_idle_streak(idle_pages: Dict[str, int], behavior: str, queued: int,
+                       early_stop_pages: int) -> bool:
+    """更新「连续空转页」计数，返回是否应提前停止翻页。
+
+    account 模式的点赞/收藏列表按时间倒序（新帖在最前），一旦连续若干页
+    都没有「新增待抓帖」（全是已归档/视频），后面的只会更老 —— 提前收工，
+    避免每次任务都把整份列表从头翻一遍。未完成的帖子由「按 note_id 直连
+    续抓」兜底，不依赖列表发现，所以早停不会漏掉待补帖。
+
+    early_stop_pages <= 0 表示关闭早停（永远返回 False）。
+    """
+    if queued == 0:
+        idle_pages[behavior] = idle_pages.get(behavior, 0) + 1
+    else:
+        idle_pages[behavior] = 0
+    return (early_stop_pages > 0
+            and idle_pages.get(behavior, 0) >= early_stop_pages)
+
+
 def comment_fetch_order(progress: Dict[str, tuple],
                         declared_map: Dict[str, int]) -> Callable[[str], tuple]:
     """评论抓取排序键：**快抓完的先抓**，让一轮能真正收口若干篇。
@@ -1010,6 +1029,61 @@ class XiaoHongShuCrawler(AbstractCrawler):
         # 整批详情请求共用同一个并发闸门（见下方调用处的注释）
         detail_semaphore = asyncio.Semaphore(_xhs_concurrency())
 
+        # 3.1) 优先续抓「之前没抓完」的帖子：直接按 note_id + 已存 xsec_token
+        #      拉详情+评论，**不必先把整份点赞/收藏列表从头翻一遍**。
+        #      用户明确要求「先补未完成的，不要每次都从头读全部帖子」——
+        #      未完成帖子靠 DB 里的完整率筛出来（story_chapter.ext 存了 token），
+        #      列表阶段从此只负责发现「新增」。
+        backfill_queued = 0
+        if incremental:
+            try:
+                from tools.v2_sync import get_backfill_candidates
+                # 待补「篇数」上限 = 本次抓取上限 budget；评论条数预算沿用
+                # max(1,budget) × 每篇预留额度（与 get_archived_content_ids 保持一致）
+                _per_post = runtime_config.get_int(
+                    "xhs_comment_backfill_max_comments", config.XHS_COMMENT_BACKFILL_MAX_COMMENTS)
+                _bf_max_comments = max(1, budget) * max(1, _per_post)
+                candidates = await get_backfill_candidates(
+                    "xhs", limit=budget, max_comments=_bf_max_comments)
+            except Exception as e:
+                candidates = []
+                utils.logger.warning(
+                    f"[get_account_behavior_notes] 读取待补帖子失败："
+                    f"{type(e).__name__}: {e}")
+            # 未完成帖优先占用本轮额度，但给「新增帖」预留约 1/5 —— 否则待补池
+            # 长期清不空（个别帖一直失败）时，列表阶段额度恒为 0，新点赞永远进不来。
+            reserve_new = min(max(1, budget // 5), max(0, budget - 1)) if budget > 0 else 0
+            backfill_cap = max(0, budget - reserve_new) if budget > 0 else len(candidates)
+            take = candidates[:backfill_cap]
+            for cand in take:
+                cid = str(cand.get("content_id") or "")
+                if not cid:
+                    continue
+                # 竞态保护：两次查询之间若该帖已被判定完成/顺延，跳过不重复排队
+                if cid in known_ids:
+                    continue
+                known_ids.add(cid)   # 列表阶段不再重复排队
+                get_note_detail_task_list.append(self.get_note_detail_async_task(
+                    note_id=cid,
+                    xsec_source="pc_feed",
+                    xsec_token=cand.get("xsec_token") or "",
+                    semaphore=detail_semaphore,
+                ))
+                backfill_queued += 1
+            if backfill_queued:
+                utils.logger.info(
+                    f"[get_account_behavior_notes] 优先续抓未完成帖子 "
+                    f"{backfill_queued} 篇（按 note_id 直连，不翻列表；"
+                    f"待补池共 {len(candidates)} 篇）")
+
+        # 列表阶段额度 = 总额度 - 已用于续抓的篇数（优先补完再发现新增）
+        list_budget = max(0, budget - backfill_queued)
+        # 早停：连续 N 页无「新增待抓帖」即停止翻页，避免每次从头扫完整列表
+        early_stop_pages = runtime_config.get_int(
+            "xhs_behavior_early_stop_pages",
+            getattr(config, "XHS_BEHAVIOR_EARLY_STOP_PAGES", 3))
+        idle_pages: Dict[str, int] = {}
+
         async def _on_batch(notes: List[Dict], behavior: str = "likes") -> Dict:
             """回调：把本批笔记里「要抓详情+评论」的排进队列。
 
@@ -1022,7 +1096,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             nonlocal skipped_video, skipped_archived
             queued = 0
             for note in notes:
-                if queued_by_behavior.get(behavior, 0) >= budget:
+                if queued_by_behavior.get(behavior, 0) >= list_budget:
                     return {"stop": True, "queued": queued}
                 note_id = str(note.get("note_id") or note.get("id") or "")
                 if not note_id:
@@ -1046,8 +1120,17 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 ))
                 queued_by_behavior[behavior] = queued_by_behavior.get(behavior, 0) + 1
                 queued += 1
-            return {"stop": queued_by_behavior.get(behavior, 0) >= budget,
-                    "queued": queued}
+            # 本页无「新增待抓帖」→ 累计空转页；一旦连续 N 页空转即早停
+            # （点赞/收藏按时间倒序，后面只会更老，已处理/未达标都在别处兜底）。
+            stop = queued_by_behavior.get(behavior, 0) >= list_budget
+            if not stop and update_idle_streak(
+                    idle_pages, behavior, queued, early_stop_pages):
+                stop = True
+                utils.logger.info(
+                    f"[get_account_behavior_notes] 「{behavior}」连续 "
+                    f"{idle_pages[behavior]} 页无新增待抓帖，提前停止翻页"
+                    f"（不再从头扫完整列表）")
+            return {"stop": stop, "queued": queued}
 
         try:
             await self.xhs_client.get_all_behavior_notes(
