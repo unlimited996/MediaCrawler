@@ -185,20 +185,22 @@ async def test_fetch_sub_pages_open_cursor_and_resume():
         collected.update(x["id"] for x in c)
 
     # 第一轮：从第 1 页 [s1,s2] 开始，第 2 页报错 → 返回最后有效游标 "c1"
-    result, still = await client._fetch_sub_pages(
+    result, still, skipped = await client._fetch_sub_pages(
         note_id="n", root_comment_id="r1", xsec_token="t", crawl_interval=0,
         callback=cb, seen_sub_ids=set(), initial_has_more=True, initial_cursor="",
     )
     assert still == "c1"
+    assert skipped == 0  # 接口报错属「中断」，不是策略性放弃
     assert {x["id"] for x in result} == {"s1", "s2"}
     assert "s3" not in collected
 
     # 第二轮：从 "c1" 续抓 → 拿到 s3，翻到底（still=None）
-    result2, still2 = await client._fetch_sub_pages(
+    result2, still2, skipped2 = await client._fetch_sub_pages(
         note_id="n", root_comment_id="r1", xsec_token="t", crawl_interval=0,
         callback=cb, seen_sub_ids=set(), initial_has_more=True, initial_cursor="c1",
     )
     assert still2 is None
+    assert skipped2 == 0
     assert {x["id"] for x in result2} == {"s3"}
     assert collected == {"s1", "s2", "s3"}
 
@@ -230,26 +232,28 @@ async def test_resume_finishes_open_sub_roots(monkeypatch):
     # 场景 1：上一轮 r1 楼中楼翻到 sc1 中断，本轮从 sc1 续翻并收尾
     raise_on_second["flag"] = True
     calls["n"] = 0
-    result, open_sub = await client.get_comments_all_sub_comments(
+    result, open_sub, skipped = await client.get_comments_all_sub_comments(
         comments=[], xsec_token="t", crawl_interval=0, callback=cb,
         note_id="n", start_sub_cursors={"r1": "sc1"},
     )
     # r1 的楼中楼从 sc1 续翻，补齐 s3；收尾后 open_sub 不再含 r1
     assert {x["id"] for x in result} == {"s3"}
     assert "r1" not in open_sub
+    assert skipped == 0
     assert collected == {"s3"}
 
     # 场景 2：完整抓（内嵌 s1 + 翻页 s2/s3），不应报错，全部收齐
     raise_on_second["flag"] = False
     calls["n"] = 0
     collected.clear()
-    result2, open_sub2 = await client.get_comments_all_sub_comments(
+    result2, open_sub2, skipped2 = await client.get_comments_all_sub_comments(
         comments=[{"id": "r1", "sub_comment_count": 3,
                    "sub_comments": [{"id": "s1"}]}],
         xsec_token="t", crawl_interval=0, callback=cb, note_id="n",
     )
     assert {x["id"] for x in result2} == {"s1", "s2", "s3"}
     assert open_sub2 == {}
+    assert skipped2 == 0  # 未触及深度上限，无放弃
 
 
 # ---------------------------------------------------------------------------

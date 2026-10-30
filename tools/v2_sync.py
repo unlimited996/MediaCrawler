@@ -593,6 +593,7 @@ async def get_archived_content_ids(platform_code: str,
                        StoryChapter.declared_comment_count,
                        StoryChapter.comment_count,
                        Story.comment_count,
+                       StoryChapter.ext,
                        func.count(Comment.id))
                 .join(Story, Story.id == StoryChapter.story_id, isouter=True)
                 .outerjoin(Comment, Comment.story_id == Story.id)
@@ -600,19 +601,24 @@ async def get_archived_content_ids(platform_code: str,
                 .group_by(StoryChapter.source_content_id, Story.status, Story.id,
                           StoryChapter.declared_comment_count,
                           StoryChapter.comment_count,
-                          Story.comment_count)
+                          Story.comment_count, StoryChapter.ext)
             )).all()
 
             ids = set()
             incomplete: List[tuple] = []    # (content_id, fetched, declared, ratio)
             for (content_id, status, story_id, declared_c, chapter_c,
-                 story_c, cmt_count) in rows:
+                 story_c, ext, cmt_count) in rows:
                 if not content_id or story_id is None:
                     continue
                 if (status or "") in ("deleted", "hidden"):
                     continue
                 # 声明数优先级：章节字段（详情接口原值）> 章节冗余 > story 冗余
                 declared = int(declared_c or chapter_c or story_c or 0)
+                # 扣掉「楼中楼深度上限主动放弃」的条数：这些是我们策略性不抓的，
+                # 留在分母里会让帖子永远凑不满目标比例、每轮被当成未达标重抓，
+                # 而重抓只能再翻同样的几页 —— 纯浪费请求且毫无进展。
+                declared = max(0, declared - int(
+                    (ext or {}).get(COMMENT_SKIPPED_KEY, 0) or 0))
                 fetched = int(cmt_count or 0)
                 if is_comment_complete(fetched, declared, target_ratio):
                     ids.add(str(content_id))
@@ -710,6 +716,9 @@ async def get_backfill_candidates(platform_code: str,
                 if (status or "") in ("deleted", "hidden"):
                     continue
                 declared = int(declared_c or chapter_c or story_c or 0)
+                # 扣掉楼中楼深度上限主动放弃的条数（同 get_archived_content_ids）
+                declared = max(0, declared - int(
+                    (ext or {}).get(COMMENT_SKIPPED_KEY, 0) or 0))
                 fetched = int(cmt_count or 0)
                 if is_comment_complete(fetched, declared, target_ratio):
                     continue
@@ -753,6 +762,10 @@ async def get_backfill_candidates(platform_code: str,
 #   }
 # ---------------------------------------------------------------------------
 COMMENT_RESUME_KEY = "comment_resume"
+
+# 楼中楼深度上限（XHS_SUB_COMMENT_MAX_PAGES）触顶时主动放弃的子评论条数。
+# 完整率分母要扣掉它，否则这些帖永远不达标、每轮白抓。详见 save_comment_skipped_sub。
+COMMENT_SKIPPED_KEY = "comment_skipped_sub"
 
 
 async def get_comment_resume(platform_code: str,
@@ -850,6 +863,46 @@ async def clear_comment_resume(platform_code: str, content_id: str) -> None:
     except Exception as e:
         utils.logger.warning(
             f"[v2_sync] 清除评论续抓进度失败 {platform_code}/{content_id}: {e}")
+
+
+async def save_comment_skipped_sub(platform_code: str, content_id: str,
+                                   skipped: int) -> None:
+    """记录「因楼中楼深度上限主动放弃」的子评论条数。
+
+    单独存一个 ext 字段（COMMENT_SKIPPED_KEY），不放在 comment_resume 里 ——
+    后者在评论翻到底时会被 clear_comment_resume 清掉，而这个值恰恰要在
+    「翻到底之后」继续给完整率判定读。
+
+    完整率分母 = 平台声明数 - 本值。否则策略性放弃会让帖子永远凑不满
+    目标比例、每轮都被当成未达标重抓，而重抓又只能再翻同样的几页，
+    纯浪费请求且毫无进展（这正是限制翻页深度必须配套改判定的原因）。
+    """
+    if not content_id:
+        return
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return
+            chapter = (await session.execute(
+                select(StoryChapter).where(
+                    StoryChapter.source_site_id == site_id,
+                    StoryChapter.source_content_id == str(content_id))
+            )).scalar_one_or_none()
+            if chapter is None:
+                return
+            ext = dict(chapter.ext or {})
+            if skipped > 0:
+                ext[COMMENT_SKIPPED_KEY] = int(skipped)
+            else:
+                ext.pop(COMMENT_SKIPPED_KEY, None)
+            chapter.ext = ext
+            await session.commit()
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 写入楼中楼放弃条数失败 {platform_code}/{content_id}: {e}")
 
 
 async def get_declared_comment_counts(platform_code: str,
@@ -972,6 +1025,10 @@ async def refresh_comment_completeness(platform_code: str,
             for chapter, story_c, cmt_count in rows:
                 declared = int(chapter.declared_comment_count
                                or chapter.comment_count or story_c or 0)
+                # 扣掉楼中楼深度上限主动放弃的条数（口径同 get_archived_content_ids，
+                # 否则前端展示的完整率会因为这些策略性放弃而永远上不去）
+                declared = max(0, declared - int(
+                    (chapter.ext or {}).get(COMMENT_SKIPPED_KEY, 0) or 0))
                 fetched = int(cmt_count or 0)
                 chapter.fetched_comment_count = fetched
                 if declared > 0:

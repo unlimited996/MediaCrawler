@@ -5,6 +5,36 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-31] 变更 楼中楼翻页深度上限 + 单轮额度降到 40（砍无效请求）
+
+### 背景（实跑实测，2026-10-31 06:50 那轮）
+- `sub/page` **服务端固定只返回 5 条/页**（请求 `num=30` 也只给 5，和主评论固定
+  10 条/页同理）。声明 39 条回复的 root 要翻 8 页、51 条要翻 10 页，按 5-15s
+  页间隔算**单个 root 就要 1.5-2 分钟** —— 这是请求量爆炸的真凶。
+- 旧常量 `MAX_SUB_COMMENT_PAGES = 100` 只防死循环（单 root 最多 500 次请求），
+  起不到限流作用。
+- 两阶段改造后评论阶段耐受从 9 分钟提升到 24.5 分钟（+170%），说明形态有效，
+  但**仍会撞 461** —— 存在与顺序无关的速率/总量上限，只能靠削减请求量解决。
+
+### 变更
+- **新增 `config.XHS_SUB_COMMENT_MAX_PAGES`（默认 3，0=不限制）**：单条主评论的
+  楼中楼最多翻 3 页（≈15 条回复），超出主动放弃。删除写死的 `MAX_SUB_COMMENT_PAGES`。
+- **截断语义（关键，容易写错）**：触顶截断是**主动放弃**而非失败，因此
+  `_fetch_sub_pages` 触顶时返回 `None` 游标。若沿用旧逻辑留游标，下一轮只会再翻
+  同样的 3 页、永远翻不到底 → 帖子永远凑不满完整率 → 每轮重抓 → 反而打更多请求。
+  接口报错中断属「失败」，仍然保留游标供续抓（两者必须区分）。
+- **完整率分母扣减**：新增 `tools/v2_sync.save_comment_skipped_sub` +
+  `COMMENT_SKIPPED_KEY`（`story_chapter.ext`），把主动放弃的条数从声明数里扣掉。
+  `get_archived_content_ids` / `get_backfill_candidates` / `refresh_comment_completeness`
+  三处口径统一。否则这些帖永远不达标、每轮白抓。
+- **`XHS_BEHAVIOR_MAX_NOTES` 100 → 40**（单轮处理篇数），配合上面砍请求量。
+
+### 验证
+- 新增 `tests/test_xhs_sub_comment_depth.py` 5 项：触顶停止翻页 / 触顶不留游标 /
+  报错保留游标（与截断相反）/ 0=不限制 / 未触顶时 skipped=0。
+- 回归：resume 5 + risk_abort 4 + human_order 3 + completeness 15 + order 8 +
+  behavior_paging 13 + scheduler_options 6 = 54 项全过。
+
 ## [2026-10-31] 变更 评论抓取改为两阶段「真人顺序」，降低行为画像风控
 
 ### 背景

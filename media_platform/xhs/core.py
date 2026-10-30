@@ -1463,6 +1463,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             try:
                 from tools.v2_sync import (
                     get_comment_resume, save_comment_resume, clear_comment_resume,
+                    save_comment_skipped_sub,
                 )
                 resume = await get_comment_resume("xhs", note_id)
                 if resume:
@@ -1482,6 +1483,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
             async def _on_progress(nid, state, finished):
                 # page 级 / 结束级统一在这里持久化续抓进度
                 try:
+                    # 楼中楼深度上限主动放弃的条数：单独存一个 ext 字段，
+                    # 不能塞进 comment_resume —— 翻到底时 resume 会被清掉，
+                    # 而这个值恰恰要在「翻到底之后」给完整率判定读。
+                    if finished:
+                        await save_comment_skipped_sub(
+                            "xhs", nid,
+                            int(state.get("skipped_sub_count", 0) or 0))
                     if finished and state.get("reached_end"):
                         # 真翻到底：评论抓全，清掉进度，避免下轮误续或误判
                         await clear_comment_resume("xhs", nid)
@@ -1492,6 +1500,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
                             state.get("top_count", 0),
                             state.get("sub_cursors", {}),
                             reached_end=bool(state.get("reached_end", False)),
+                            skipped_sub_count=int(
+                                state.get("skipped_sub_count", 0) or 0),
                         )
                 except Exception as e:
                     utils.logger.warning(

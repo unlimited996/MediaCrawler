@@ -24,11 +24,13 @@ from urllib.parse import quote, urlencode
 
 # 子评论（楼中楼）翻页参数：
 # - SUB_COMMENT_PAGE_NUM：每页条数。原写死 10，热门主评论要翻十几页，
-#   限流下很容易中途断掉；提到 30 折中（请求数减半，单页也不超接口上限）。
-# - MAX_SUB_COMMENT_PAGES：单条主评论的翻页上限，防接口一直返回
-#   has_more=true 时死循环。
+#   限流下很容易中途断掉；提到 30 折中。
+#   实测（2026-10-31）：**服务端固定只返回 5 条/页**，num=30 也只给 5，
+#   请求侧调大没用，别再指望靠它减少翻页次数。
+# - 翻页深度上限改用配置项 config.XHS_SUB_COMMENT_MAX_PAGES（默认 3），
+#   见 _fetch_sub_pages。原先这里写死 100 只防死循环、起不到限流作用：
+#   按 5 条/页 × 100 页 = 单条主评论最多 500 次请求，正是请求量爆炸的元凶。
 SUB_COMMENT_PAGE_NUM = 30
-MAX_SUB_COMMENT_PAGES = 100
 
 import httpx
 from playwright.async_api import BrowserContext, Page
@@ -503,6 +505,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         open_sub: Dict[str, str] = {}
         # 阶段二待展开的主楼（阶段一只收集，不发 sub/page 请求）
         pending_roots: List[Dict] = []
+        # 因楼中楼深度上限主动放弃的子评论条数（阶段二累计，供完整率判定扣减分母）
+        skipped_sub = 0
 
         # -------- 阶段 1：先把整篇一级评论翻到底（真人=把评论列表滚到底）--------
         # 这一阶段只打 comment/page 一个 endpoint，绝不穿插 sub/page。
@@ -561,7 +565,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 f"阶段2：展开 {len(pending_roots)} 个主楼的回复"
                 + (f"，并收尾上一轮 {len(sub_cursors or {})} 个未完成的楼中楼"
                    if sub_cursors else ""))
-            subs, page_open = await self.get_comments_all_sub_comments(
+            subs, page_open, skipped = await self.get_comments_all_sub_comments(
                 comments=pending_roots,
                 xsec_token=xsec_token,
                 crawl_interval=crawl_interval,
@@ -572,6 +576,12 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             )
             result.extend(subs)
             open_sub.update(page_open)
+            skipped_sub += skipped
+            if skipped:
+                utils.logger.info(
+                    f"[XiaoHongShuClient.get_note_all_comments] note {note_id} "
+                    f"楼中楼深度上限生效：主动放弃 {skipped} 条子评论"
+                    f"（这些不计入完整率分母，避免该帖永远凑不满而被反复重抓）")
         # 全部翻页结束：通知上层 reached_end（是否翻到 has_more=False）。
         if progress_callback:
             await progress_callback(note_id, {
@@ -579,6 +589,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 "top_count": top_count,
                 "sub_cursors": open_sub,
                 "reached_end": (not comments_has_more),
+                "skipped_sub_count": skipped_sub,
             }, finished=True)
         utils.logger.info(
             f"[XiaoHongShuClient.get_note_all_comments] note {note_id} 抓取结束："
@@ -642,12 +653,22 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         initial_has_more: bool = True,
         initial_cursor: str = "",
     ) -> tuple:
-        """翻某个根评论的楼中楼，返回 (评论列表, 未完成游标 or None)。
+        """翻某个根评论的楼中楼，返回 (评论列表, 未完成游标 or None, 策略放弃条数)。
 
         把 get_comments_all_sub_comments 里「单根翻页」逻辑抽出来复用：既服务
         正常主评论的楼中楼，也服务「续抓」时从指定游标接着翻。
-        返回值的第二个元素：若楼中楼没翻完（接口报错/翻页触顶）返回「最后有效
-        游标」供续抓；若正常翻到底返回 None。
+
+        第二个元素（未完成游标）：
+          - 接口报错 / 响应异常导致中断 → 返回「最后有效游标」供下一轮续抓
+          - 正常翻到底 → None
+          - **因 XHS_SUB_COMMENT_MAX_PAGES 触顶截断 → 也是 None**（见下）
+
+        第三个元素（策略放弃条数）是本函数的关键语义：
+          触顶截断是我们**主动放弃**的，不是失败。这种 root 在下一轮照旧只会
+          再翻 max_pages 页、永远翻不到底，把游标存起来等于让它每轮都重抓一遍
+          却毫无进展 —— 纯浪费请求。所以触顶时不留游标（返回 None），改为把
+          「声明数 - 已抓数」作为放弃条数上报，由完整率判定从分母里扣掉，
+          这样该帖能正常达标退出待补池（见 tools/v2_sync.skipped_sub_count）。
         """
         result: List[Dict] = []
         # 1) 主评论响应里内嵌的子评论预览
@@ -663,17 +684,25 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         if not has_more and sub_count and len(inline_subs or []) < sub_count:
             has_more = True
         if not has_more:
-            return result, None
+            return result, None, 0
         cursor = initial_cursor or ""
         last_cursor = cursor
         page = 0
+        # 楼中楼翻页深度上限（0 = 不限制）。sub/page 服务端固定 5 条/页，
+        # 不设上限时声明几十条回复的 root 会深翻十几页，是请求量爆炸的主因。
+        max_pages = int(getattr(config, "XHS_SUB_COMMENT_MAX_PAGES", 3) or 0)
         while has_more:
             page += 1
-            if page > MAX_SUB_COMMENT_PAGES:
-                utils.logger.warning(
-                    f"[XiaoHongShuClient._fetch_sub_pages] root_comment_id: "
-                    f"{root_comment_id} 翻页超过 {MAX_SUB_COMMENT_PAGES} 页，停止")
-                return result, last_cursor  # 触顶：未翻完，留待续抓
+            if max_pages > 0 and page > max_pages:
+                skipped = max(0, int(sub_count or 0) - len(result))
+                utils.logger.info(
+                    f"[XiaoHongShuClient._fetch_sub_pages] "
+                    f"root={root_comment_id} 达到楼中楼深度上限 "
+                    f"{max_pages} 页，主动停止（已抓 {len(result)}/"
+                    f"声明 {sub_count}，放弃 {skipped} 条）")
+                # 主动放弃：不留游标（留了下轮也只是重复同样的 3 页），
+                # 改用 skipped 让完整率判定把这部分从分母里扣掉。
+                return result, None, skipped
             try:
                 comments_res = await self.get_note_sub_comments(
                     note_id=note_id,
@@ -689,12 +718,12 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     f"留待续抓。")
                 # 失败必须退避再翻下一个根：零间隔连打是风控最明显的特征
                 await anti_risk.xhs_sleep(f"root {root_comment_id} 楼中楼失败退避")
-                return result, last_cursor  # 报错：未翻完，留待续抓
+                return result, last_cursor, 0  # 报错：未翻完，留待续抓
             if not isinstance(comments_res, dict):
                 utils.logger.info(
                     f"[XiaoHongShuClient._fetch_sub_pages] No response for "
                     f"root_comment_id: {root_comment_id}")
-                return result, last_cursor
+                return result, last_cursor, 0
             page_comments = comments_res.get("comments") or []
             utils.logger.info(
                 f"[XiaoHongShuClient._fetch_sub_pages] "
@@ -724,7 +753,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 await callback(note_id, fresh)
             await anti_risk.interval_sleep(crawl_interval, "分页/翻页间隔")
             result.extend(fresh)
-        return result, None  # 正常翻完
+        return result, None, 0  # 正常翻完
 
     async def get_comments_all_sub_comments(
         self,
@@ -739,8 +768,11 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         """
         Get all second-level comments under specified first-level comments.
 
-        返回 (评论列表, open_sub)，其中 open_sub = {root_id: cursor} 记录「没翻完」
-        的根评论楼中楼（接口报错/翻页触顶），供断点续抓在下一轮单独收尾。
+        返回 (评论列表, open_sub, skipped_total)：
+          open_sub = {root_id: cursor} 记录「因接口报错没翻完」的根评论楼中楼，
+                     供断点续抓在下一轮单独收尾（触顶截断的不在这里，见上）
+          skipped_total = 因 XHS_SUB_COMMENT_MAX_PAGES 触顶而**主动放弃**的
+                     楼中楼条数合计，供完整率判定把这些从分母里扣掉
 
         Args:
             comments: 主评论列表（每条约带 note_id / sub_comment_count /
@@ -757,13 +789,15 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             utils.logger.info(
                 f"[XiaoHongShuClient.get_comments_all_sub_comments] Crawling sub_comment mode is not enabled"
             )
-            return [], {}
+            return [], {}, 0
 
         result: List[Dict] = []
         # 跨主评论共享：子评论 ID 全局唯一，同一子评论可能出现在内嵌预览和
         # 翻页结果里（也可能因分页重叠重复出现），必须去重后再入库。
         seen_sub_ids = seen_sub_ids if seen_sub_ids is not None else set()
         open_sub: Dict[str, str] = {}
+        # 因楼中楼深度上限主动放弃的条数（策略性放弃，非失败）
+        skipped_total = 0
 
         # 0) 续抓收尾：先把上一轮中断、没翻完的根评论楼中楼补齐。这些根的主评论
         #    已在上一轮入库，不会在下面的主评论循环里出现，所以必须单独处理。
@@ -772,7 +806,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         for root_id, cursor in list(dict(start_sub_cursors or {}).items()):
             if not root_id:
                 continue
-            subs, still = await self._fetch_sub_pages(
+            subs, still, skipped = await self._fetch_sub_pages(
                 note_id=note_id, root_comment_id=root_id,
                 xsec_token=xsec_token, crawl_interval=crawl_interval,
                 callback=callback, seen_sub_ids=seen_sub_ids,
@@ -780,6 +814,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             )
             handled_roots.add(root_id)
             result.extend(subs)
+            skipped_total += skipped
             if still:
                 open_sub[root_id] = still
 
@@ -794,7 +829,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 inline_subs = comment.get("sub_comments") or []
                 initial_has_more = bool(comment.get("sub_comment_has_more"))
                 initial_cursor = comment.get("sub_comment_cursor") or ""
-                subs, still = await self._fetch_sub_pages(
+                subs, still, skipped = await self._fetch_sub_pages(
                     note_id=cid, root_comment_id=root_comment_id,
                     xsec_token=xsec_token, crawl_interval=crawl_interval,
                     callback=callback, seen_sub_ids=seen_sub_ids,
@@ -803,6 +838,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     initial_cursor=initial_cursor,
                 )
                 result.extend(subs)
+                skipped_total += skipped
                 if still:
                     open_sub[root_comment_id] = still
             except (CaptchaError, IPBlockError, PlatformAccessError):
@@ -821,7 +857,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 # 进一步坐实风控特征。
                 await anti_risk.xhs_sleep(f"root {root_comment_id} 楼中楼失败退避")
                 continue  # Continue to next comment
-        return result, open_sub
+        return result, open_sub, skipped_total
 
     async def get_creator_info(
         self, user_id: str, xsec_token: str = "", xsec_source: str = ""

@@ -75,7 +75,7 @@ async def test_risk_error_after_partial_success_still_raises(monkeypatch):
     async def _first_ok_then_boom(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return [], None
+            return [], None, 0
         raise CaptchaError("461")
 
     monkeypatch.setattr(client, "_fetch_sub_pages", _first_ok_then_boom)
@@ -105,8 +105,9 @@ async def test_plain_error_skips_but_backs_off(monkeypatch):
 
     monkeypatch.setattr(client, "_fetch_sub_pages", _boom)
 
-    result, open_sub = await client.get_comments_all_sub_comments(
+    result, open_sub, skipped = await client.get_comments_all_sub_comments(
         comments=_comments(3), xsec_token="tok", crawl_interval=0)
 
     assert result == [] and open_sub == {}
+    assert skipped == 0
     assert len(sleeps) == 3, f"3 条根评论失败应退避 3 次，实际 {sleeps}"
