@@ -31,6 +31,7 @@ import {
 import {
   S3ConfigRow, S3BackupItem, S3BackupStats,
 } from '@/lib/api'
+import { useImageViewer } from '@/components/data/platform/ImageViewer'
 
 const api = axios.create({ baseURL: '/api' })
 
@@ -106,6 +107,8 @@ export function S3BackupView() {
   const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set())
   // 已展开的分组（按 checksum）
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  // 看图器：展开分组后点缩略图可放大查看（复用「本地→远程→S3」候选源）
+  const viewer = useImageViewer()
 
   const toggleExpand = (c: string) =>
     setExpanded((prev) => {
@@ -330,9 +333,9 @@ export function S3BackupView() {
               </div>
             )}
             {dedupOpen && dedupQ.data?.groups?.length ? (
-              <div className="mt-2 space-y-1.5">
+              <div className="mt-2">
                 <div className="flex items-center justify-between px-1 text-[10px] text-cyber-text-muted">
-                  <span>展开分组可预览每组所有图片（相同字节）；勾「保留」的副本不会被清理</span>
+                  <span>点整行展开：组内所有重复图片并排显示（点图可放大）；勾「保留」的副本不会被清理</span>
                   {excludedKeys.size > 0 && (
                     <button type="button" onClick={() => setExcludedKeys(new Set())}
                             className="text-cyber-neon-cyan hover:underline">
@@ -340,82 +343,92 @@ export function S3BackupView() {
                     </button>
                   )}
                 </div>
-                {dedupQ.data.groups.slice(0, 300).map((g: any) => {
-                  const exp = expanded.has(g.checksum)
-                  const allKept = g.keys.length > 0 && g.keys.every((k: string) => excludedKeys.has(k))
-                  return (
-                    <div key={g.checksum}
-                         className="overflow-hidden rounded border border-cyber-border-subtle">
-                      <div className="flex flex-wrap items-center gap-2 px-2 py-1.5">
-                        <button type="button" onClick={() => toggleExpand(g.checksum)}
-                                className="font-mono text-xs text-cyber-neon-cyan">
-                          {exp ? '▾' : '▸'}
-                        </button>
-                        <span className="font-mono text-[10px] text-cyber-text-secondary" title={g.checksum}>
-                          {g.checksum.slice(0, 12)}
-                        </span>
-                        <span className="text-[10px] text-cyber-text-muted">{g.media_type}</span>
-                        <span className="text-[10px] text-cyber-text-secondary">×{g.count}</span>
-                        <span className="text-[10px] text-cyber-text-secondary">
-                          可收回 {fmtBytes(g.reclaimable_bytes)}
-                        </span>
-                        <span className="ml-auto flex items-center gap-1">
-                          <input type="checkbox" checked={allKept}
-                                 onChange={(e) => toggleGroupExclude(g.keys, e.target.checked)}
-                                 className="h-3 w-3 accent-emerald-400" />
-                          <span className="text-[10px] text-cyber-text-muted">整组保留</span>
-                        </span>
-                      </div>
-                      {exp && (
-                        <div className="border-t border-cyber-border-subtle/60 p-2">
-                          <div className="mb-1.5 text-[10px] text-cyber-text-muted">
-                            涉及 {g.content_ids?.length ?? 0} 个对象(content_id)：
-                            <span className="ml-1 font-mono text-cyber-text-secondary">
-                              {(g.content_ids || []).slice(0, 10).join('、')}
-                              {(g.content_ids || []).length > 10 ? ' …' : ''}
-                            </span>
-                          </div>
-                          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-6">
-                            {g.keys.map((k: string, i: number) => {
-                              const size = (g.sizes && g.sizes[i]) || 0
-                              const kept = excludedKeys.has(k)
-                              const isCanon = k === g.canonical_key
-                              return (
-                                <div key={k}
-                                     className={`rounded border p-1 ${kept ? 'border-emerald-500/60 bg-emerald-500/5' : 'border-cyber-border-subtle'}`}>
-                                  <div className="relative">
-                                    <img src={`/api/s3-backup/object/${k}`} alt=""
-                                         loading="lazy"
-                                         className="aspect-square w-full rounded bg-cyber-bg-tertiary object-cover"
-                                         onError={(e) => {
-                                           (e.currentTarget as HTMLImageElement)
-                                             .style.visibility = 'hidden'
-                                         }} />
-                                    {isCanon && (
-                                      <span className="absolute left-0.5 top-0.5 rounded bg-cyber-neon-cyan/80 px-1 text-[8px] font-mono text-black">
-                                        规范
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="mt-1 flex items-center gap-1">
-                                    <input type="checkbox" checked={kept}
-                                           onChange={() => toggleKeyExclude(k)}
-                                           className="h-3 w-3 accent-emerald-400" />
-                                    <span className="truncate font-mono text-[9px] text-cyber-text-muted"
-                                          title={k}>{k.split('/').pop()}</span>
-                                  </div>
-                                  <div className="font-mono text-[9px] text-cyber-text-muted">
-                                    {fmtBytes(size)}
-                                  </div>
-                                </div>
-                              )
-                            })}
-                          </div>
+                {/* 分组列表独立滚动：否则展开组多了会把下面的统计卡片挤出可视区 */}
+                <div className="mt-1.5 max-h-[320px] space-y-1.5 overflow-y-auto pr-1">
+                  {dedupQ.data.groups.slice(0, 300).map((g: any) => {
+                    const exp = expanded.has(g.checksum)
+                    const allKept = g.keys.length > 0 && g.keys.every((k: string) => excludedKeys.has(k))
+                    // 组内所有副本的大图地址，交给看图器后可左右翻页对比
+                    const groupSrcs: string[][] = g.keys.map(
+                      (k: string) => [`/api/s3-backup/object/${k}`])
+                    return (
+                      <div key={g.checksum}
+                           className="overflow-hidden rounded border border-cyber-border-subtle">
+                        {/* 整行可点：不只是三角箭头；内部复选框/按钮单独 stopPropagation */}
+                        <div className="flex cursor-pointer flex-wrap items-center gap-2 px-2 py-1.5 transition-colors hover:bg-cyber-bg-tertiary/60"
+                             onClick={() => toggleExpand(g.checksum)}>
+                          <span className="font-mono text-xs text-cyber-neon-cyan">
+                            {exp ? '▾' : '▸'}
+                          </span>
+                          <span className="font-mono text-[10px] text-cyber-text-secondary" title={g.checksum}>
+                            {g.checksum.slice(0, 12)}
+                          </span>
+                          <span className="text-[10px] text-cyber-text-muted">{g.media_type}</span>
+                          <span className="text-[10px] text-cyber-text-secondary">×{g.count}</span>
+                          <span className="text-[10px] text-cyber-text-secondary">
+                            可收回 {fmtBytes(g.reclaimable_bytes)}
+                          </span>
+                          <span className="ml-auto flex items-center gap-1"
+                                onClick={(e) => e.stopPropagation()}>
+                            <input type="checkbox" checked={allKept}
+                                   onChange={(e) => toggleGroupExclude(g.keys, e.target.checked)}
+                                   className="h-3 w-3 accent-emerald-400" />
+                            <span className="text-[10px] text-cyber-text-muted">整组保留</span>
+                          </span>
                         </div>
-                      )}
-                    </div>
-                  )
-                })}
+                        {exp && (
+                          <div className="border-t border-cyber-border-subtle/60 p-2">
+                            <div className="mb-1.5 text-[10px] text-cyber-text-muted">
+                              涉及 {g.content_ids?.length ?? 0} 个对象(content_id)：
+                              <span className="ml-1 font-mono text-cyber-text-secondary">
+                                {(g.content_ids || []).slice(0, 10).join('、')}
+                                {(g.content_ids || []).length > 10 ? ' …' : ''}
+                              </span>
+                            </div>
+                            {/* 所有副本横向并排、不换行、可左右滑动，方便直接比对；点图放大 */}
+                            <div className="flex gap-2 overflow-x-auto pb-1">
+                              {g.keys.map((k: string, i: number) => {
+                                const size = (g.sizes && g.sizes[i]) || 0
+                                const kept = excludedKeys.has(k)
+                                const isCanon = k === g.canonical_key
+                                return (
+                                  <div key={k}
+                                       className={`w-24 flex-shrink-0 rounded border p-1 sm:w-28 ${kept ? 'border-emerald-500/60 bg-emerald-500/5' : 'border-cyber-border-subtle'}`}>
+                                    <div className="relative">
+                                      <img src={`/api/s3-backup/object/${k}`} alt=""
+                                           loading="lazy"
+                                           onClick={() => viewer?.open(groupSrcs, i)}
+                                           className="aspect-square w-full cursor-zoom-in rounded bg-cyber-bg-tertiary object-cover"
+                                           onError={(e) => {
+                                             (e.currentTarget as HTMLImageElement)
+                                               .style.visibility = 'hidden'
+                                           }} />
+                                      {isCanon && (
+                                        <span className="absolute left-0.5 top-0.5 rounded bg-cyber-neon-cyan/80 px-1 text-[8px] font-mono text-black">
+                                          规范
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="mt-1 flex items-center gap-1">
+                                      <input type="checkbox" checked={kept}
+                                             onChange={() => toggleKeyExclude(k)}
+                                             className="h-3 w-3 accent-emerald-400" />
+                                      <span className="truncate font-mono text-[9px] text-cyber-text-muted"
+                                            title={k}>{k.split('/').pop()}</span>
+                                    </div>
+                                    <div className="font-mono text-[9px] text-cyber-text-muted">
+                                      {fmtBytes(size)}
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
               </div>
             ) : null}
           </div>

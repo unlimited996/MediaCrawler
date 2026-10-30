@@ -140,10 +140,15 @@ export function ImageViewerProvider({ children }: { children: React.ReactNode })
     else setZoom(2)
   }
 
-  // 点图片区空白处（非图片本身）关闭；拖拽过则忽略，避免误关
+  // 点图片区空白处关闭；拖拽过则忽略，避免误关。
+  // 注意：不能用 `e.target !== e.currentTarget` 判断——图片区里有一层
+  // `h-full w-full` 的居中容器铺满了整个区域，点空白处时 target 是那层容器
+  // 而非外层，判断恒不成立 → 只有 × 能关。改为「点在图片/按钮上不关，其余都关」。
   const onBackdropClick = (e: React.MouseEvent) => {
-    if (e.target !== e.currentTarget) return
-    if (movedRef.current) { movedRef.current = false; return }
+    const t = e.target as HTMLElement
+    if (t.tagName === 'IMG') return          // 点图片本身：留给双击缩放/拖拽
+    if (t.closest('button')) return          // 翻页箭头等按钮不误关
+    if (movedRef.current) { movedRef.current = false; return }  // 刚拖过不算点击
     close()
   }
 
@@ -179,8 +184,9 @@ export function ImageViewerProvider({ children }: { children: React.ReactNode })
 
             {/* 图片区 */}
             <div
-              className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden"
+              className="relative flex min-h-0 flex-1 cursor-zoom-out items-center justify-center overflow-hidden"
               onClick={onBackdropClick}
+              title="点击空白处关闭"
             >
               {images.length > 1 && (
                 <>
