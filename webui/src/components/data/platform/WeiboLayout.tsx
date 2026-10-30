@@ -14,6 +14,7 @@ interface WeiboLayoutProps extends LayoutProps {
 export function WeiboLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: WeiboLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
+  const gallery = media.map((m) => m.candidates)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -47,12 +48,13 @@ export function WeiboLayout({ d, comments, commentsTotal, commentsToolbar, t, th
         {media.length > 0 && (
           <div className="mt-3 grid grid-cols-3 gap-1">
             {media.map((m, i) => (
-              <a key={i} href={m.url} target="_blank" rel="noopener noreferrer">
-                <MediaImage
-                  media={m}
-                  className="aspect-square w-full rounded border border-cyber-border-subtle object-cover"
-                />
-              </a>
+              <MediaImage
+                key={i}
+                media={m}
+                gallery={gallery}
+                galleryIndex={i}
+                className="aspect-square w-full cursor-zoom-in rounded border border-cyber-border-subtle object-cover"
+              />
             ))}
           </div>
         )}

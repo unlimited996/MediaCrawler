@@ -16,6 +16,7 @@ export function BiliLayout({ d, comments, commentsTotal, commentsToolbar, t, the
   const media = pickMedia(d)
   // 封面候选源：cover_local → cover_url → cover_backup(S3) → 首图，逐个回退
   const cover = pickCoverMedia(d, media)
+  const gallery = media.slice(1).map((m) => m.candidates)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -96,12 +97,13 @@ export function BiliLayout({ d, comments, commentsTotal, commentsToolbar, t, the
           {media.length > 1 && (
             <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
               {media.slice(1).map((m, i) => (
-                <a key={i} href={m.url} target="_blank" rel="noopener noreferrer">
-                  <MediaImage
-                    media={m}
-                    className="aspect-video w-full rounded border border-cyber-border-subtle object-cover"
-                  />
-                </a>
+                <MediaImage
+                  key={i}
+                  media={m}
+                  gallery={gallery}
+                  galleryIndex={i}
+                  className="aspect-video w-full cursor-zoom-in rounded border border-cyber-border-subtle object-cover"
+                />
               ))}
             </div>
           )}

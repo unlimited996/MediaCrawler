@@ -14,6 +14,7 @@ interface DefaultLayoutProps extends LayoutProps {
 export function DefaultLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: DefaultLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
+  const gallery = media.map((m) => m.candidates)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -51,12 +52,13 @@ export function DefaultLayout({ d, comments, commentsTotal, commentsToolbar, t, 
         {media.length > 0 && (
           <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
             {media.map((m, i) => (
-              <a key={i} href={m.url} target="_blank" rel="noopener noreferrer">
-                <MediaImage
-                  media={m}
-                  className="aspect-square w-full rounded-lg border border-cyber-border-subtle object-cover"
-                />
-              </a>
+              <MediaImage
+                key={i}
+                media={m}
+                gallery={gallery}
+                galleryIndex={i}
+                className="aspect-square w-full cursor-zoom-in rounded-lg border border-cyber-border-subtle object-cover"
+              />
             ))}
           </div>
         )}

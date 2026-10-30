@@ -18,6 +18,7 @@ import { Input } from '@/components/ui/input'
 import { ThemeToggle } from '@/components/layout/ThemeToggle'
 import { LanguageSwitch } from '@/components/layout/LanguageSwitch'
 import { storyApi, StoryRow } from '@/lib/api'
+import type { RouteState } from '@/lib/useHashRoute'
 import { usePlatforms } from '@/hooks/useCrawler'
 import { getPlatformTheme } from '@/components/data/platform/platformTheme'
 import { PlatformAvatar, pickCoverMedia, MediaImage } from '@/components/data/platform/shared'
@@ -28,7 +29,17 @@ const EXPORT_LIMIT = 200 // 后端一次最多导出 200 条
 
 type TimeRange = 'all' | 'today' | 'week' | 'month'
 
-export function GuestView({ onEnterFull }: { onEnterFull?: () => void }) {
+export function GuestView({
+  onEnterFull,
+  storyId,
+  navigate,
+}: {
+  onEnterFull?: () => void
+  /** 当前打开的帖子详情 ID（由 hash 路由驱动，刷新可恢复） */
+  storyId?: number | null
+  /** 路由跳转：打开/关闭详情时写入地址栏 */
+  navigate?: (next: RouteState) => void
+}) {
   const { t } = useTranslation('data')
   const [platform, setPlatform] = useState('')
   const [keyword, setKeyword] = useState('')
@@ -36,7 +47,10 @@ export function GuestView({ onEnterFull }: { onEnterFull?: () => void }) {
   const [sort, setSort] = useState('publish')
   const [range, setRange] = useState<TimeRange>('all')
   const [page, setPage] = useState(1)
-  const [detailId, setDetailId] = useState<number | null>(null)
+  // 详情由 hash 路由驱动：刷新 #/guest/story/{id} 可直接回到该帖子
+  const detailId = storyId ?? null
+  const openStory = (id: number) => navigate?.({ view: 'guest', platform, storyId: id })
+  const closeStory = () => navigate?.({ view: 'guest', platform })
 
   const platformsQ = usePlatforms()
 
@@ -91,7 +105,7 @@ export function GuestView({ onEnterFull }: { onEnterFull?: () => void }) {
       <div className="flex h-full flex-col gap-3 overflow-hidden">
         <PlatformStoryDetail
           storyId={detailId}
-          onBack={() => setDetailId(null)}
+          onBack={closeStory}
           readonly
         />
       </div>
@@ -207,7 +221,7 @@ export function GuestView({ onEnterFull }: { onEnterFull?: () => void }) {
         ) : (
           <div className="grid grid-cols-2 gap-2 pb-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
             {items.map((it) => (
-              <GuestStoryCard key={it.id} it={it} onOpen={() => setDetailId(it.id)} />
+              <GuestStoryCard key={it.id} it={it} onOpen={() => openStory(it.id)} />
             ))}
           </div>
         )}
@@ -276,6 +290,7 @@ function GuestStoryCard({ it, onOpen }: { it: StoryRow; onOpen: () => void }) {
         {!showTextCover ? (
           <MediaImage
             media={cover}
+            zoomable={false}
             className="h-full w-full object-cover"
             onFailed={() => setBroken(true)}
           />

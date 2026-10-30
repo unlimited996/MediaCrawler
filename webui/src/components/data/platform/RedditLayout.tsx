@@ -21,6 +21,7 @@ interface RedditLayoutProps extends LayoutProps {
 export function RedditLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: RedditLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
+  const gallery = media.slice(0, 4).map((m) => m.candidates)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -75,9 +76,13 @@ export function RedditLayout({ d, comments, commentsTotal, commentsToolbar, t, t
           {media.length > 0 && (
             <div className="mt-2 overflow-hidden rounded-md border border-cyber-border-subtle bg-cyber-bg-tertiary/40">
               {media.slice(0, 4).map((m, i) => (
-                <a key={i} href={m.url} target="_blank" rel="noopener noreferrer" className="block">
-                  <MediaImage media={m} className="max-h-[460px] w-full object-contain" />
-                </a>
+                <MediaImage
+                  key={i}
+                  media={m}
+                  gallery={gallery}
+                  galleryIndex={i}
+                  className="max-h-[460px] w-full cursor-zoom-in object-contain"
+                />
               ))}
             </div>
           )}

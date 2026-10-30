@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 import { storyApi } from '@/lib/api'
 import type { StoryRow } from '@/lib/api'
+import type { RouteState } from '@/lib/useHashRoute'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { toast } from 'sonner'
@@ -101,6 +102,7 @@ function StoryCard({
         {!showTextCover ? (
           <MediaImage
             media={cover}
+            zoomable={false}
             className="h-full w-full object-cover"
             onFailed={() => setBroken(true)}
           />
@@ -273,15 +275,15 @@ async function queryStories(p: StoryQuery): Promise<{
  */
 export function DataManagementView({
   platform: platformProp,
-  openStoryId,
-  onStoryOpened,
+  storyId,
+  navigate,
 }: {
   /** 当前平台（顶部导航的平台入口传入）；'' = 全部 */
   platform?: string
-  /** 跨视图跳转携带的待打开帖子 ID（如备份记录「跳转到原贴」） */
-  openStoryId?: number | null
-  /** 详情已打开后回调，用于清理跳转状态 */
-  onStoryOpened?: () => void
+  /** 当前打开的帖子详情 ID（由 hash 路由驱动，刷新可恢复） */
+  storyId?: number | null
+  /** 路由跳转：打开/关闭详情时写入地址栏（刷新不丢） */
+  navigate?: (next: RouteState) => void
 } = {}) {
   const { t } = useTranslation('data')
   const queryClient = useQueryClient()
@@ -300,16 +302,11 @@ export function DataManagementView({
   const [authorIds, setAuthorIds] = useState<number[]>([])
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<Set<number>>(new Set())
-  const [detailId, setDetailId] = useState<number | null>(null)
-
-  // 跨视图跳转（如 S3 备份记录「跳转到原贴」）：携带的 storyId 变化时
-  // 自动打开对应详情，并回调清理跳转状态
-  useEffect(() => {
-    if (openStoryId) {
-      setDetailId(openStoryId)
-      onStoryOpened?.()
-    }
-  }, [openStoryId])
+  // 详情由 hash 路由驱动：打开帖子 = 改 URL（#/data/{platform}/story/{id}），
+  // 刷新/分享链接能直接恢复到该帖子；返回列表 = 去掉 URL 里的 story 段。
+  const detailId = storyId ?? null
+  const openStory = (id: number) => navigate?.({ view: 'data', platform, storyId: id })
+  const closeStory = () => navigate?.({ view: 'data', platform })
   /** 列表 / 网格视图，选择持久化到 localStorage */
   const [viewMode, setViewMode] = useState<ViewMode>(loadViewMode)
   useEffect(() => {
@@ -478,7 +475,7 @@ export function DataManagementView({
     return (
       <PlatformStoryDetail
         storyId={detailId}
-        onBack={() => setDetailId(null)}
+        onBack={closeStory}
       />
     )
   }
@@ -872,12 +869,12 @@ export function DataManagementView({
                 it={it}
                 checked={selected.has(it.id)}
                 onCheck={() => toggle(it.id)}
-                onOpen={() => setDetailId(it.id)}
+                onOpen={() => openStory(it.id)}
               />
             ) : (
             <div
               key={it.id}
-              onClick={() => setDetailId(it.id)}
+              onClick={() => openStory(it.id)}
               className="flex cursor-pointer items-start gap-3 px-3 py-2 rounded-md hover:bg-cyber-bg-tertiary/60 transition-colors"
             >
               <span className="mt-1" onClick={(e) => e.stopPropagation()}>
@@ -927,7 +924,7 @@ export function DataManagementView({
               <Button
                 variant="ghost" size="sm"
                 className="hidden h-7 px-2 font-mono flex-shrink-0 sm:flex"
-                onClick={(e) => { e.stopPropagation(); setDetailId(it.id) }}
+                onClick={(e) => { e.stopPropagation(); openStory(it.id) }}
               >
                 <Eye className="w-3 h-3 mr-1" />
                 {t('manage.detail')}

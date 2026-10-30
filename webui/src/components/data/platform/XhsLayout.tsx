@@ -33,6 +33,7 @@ interface XhsLayoutProps extends LayoutProps {
 export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: XhsLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
+  const gallery = media.map((m) => m.candidates)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -111,14 +112,15 @@ export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, them
             }`}
           >
             {media.map((m, i) => (
-              <a key={i} href={m.url} target="_blank" rel="noopener noreferrer" className="block">
-                <MediaImage
-                  media={m}
-                  className={`w-full rounded-lg object-cover ${
-                    media.length === 1 ? 'max-h-[420px]' : 'aspect-square'
-                  }`}
-                />
-              </a>
+              <MediaImage
+                key={i}
+                media={m}
+                gallery={gallery}
+                galleryIndex={i}
+                className={`w-full cursor-zoom-in rounded-lg object-cover ${
+                  media.length === 1 ? 'max-h-[420px]' : 'aspect-square'
+                }`}
+              />
             ))}
           </div>
         )}

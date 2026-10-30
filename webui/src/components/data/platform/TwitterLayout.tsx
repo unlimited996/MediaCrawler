@@ -20,6 +20,7 @@ interface TwitterLayoutProps extends LayoutProps {
 export function TwitterLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: TwitterLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
+  const gallery = media.slice(0, 4).map((m) => m.candidates)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -69,14 +70,15 @@ export function TwitterLayout({ d, comments, commentsTotal, commentsToolbar, t, 
                 }`}
               >
                 {media.slice(0, 4).map((m, i) => (
-                  <a key={i} href={m.url} target="_blank" rel="noopener noreferrer" className="block">
-                    <MediaImage
-                      media={m}
-                      className={`w-full border border-cyber-border-subtle object-cover ${
-                        media.length === 1 ? 'max-h-96' : 'aspect-square'
-                      }`}
-                    />
-                  </a>
+                  <MediaImage
+                    key={i}
+                    media={m}
+                    gallery={gallery}
+                    galleryIndex={i}
+                    className={`w-full cursor-zoom-in border border-cyber-border-subtle object-cover ${
+                      media.length === 1 ? 'max-h-96' : 'aspect-square'
+                    }`}
+                  />
                 ))}
               </div>
             )}

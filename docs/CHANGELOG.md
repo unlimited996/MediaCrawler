@@ -5,6 +5,71 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-30] 新增 点击图片应用内弹窗看图（可缩放/翻页，不再跳新标签）
+
+### 背景
+此前帖子正文图、评论配图都用 `<a href={m.url} target="_blank">` 在新标签页打开
+平台远程原链；小红书图床带时间签名，老链接常已 403，且「点图跳出去」体验差。
+需求：点击图片改为应用内弹窗打开，弹窗内可缩放图片大小，不要跳新路径。
+
+### 新增
+- **全局看图弹窗 `ImageViewer`**（`components/data/platform/ImageViewer.tsx`）：
+  基于 `@radix-ui/react-dialog` 的全屏遮罩 + 暗色舞台。支持滚轮/按钮缩放（50%~600%）、
+  放大后拖拽平移、双击放大/复位、多图左右翻页（← → 键 / 左右箭头按钮）、
+  点空白处关闭、Esc 关闭。复用与 `MediaImage` 一致的「本地 → 平台远程 → S3 备份」
+  候选源重试（某候选 403 自动换下一个）。通过 `ImageViewerContext` 暴露 `open()`，
+  在 `App.tsx` 顶层用 `ImageViewerProvider` 包裹全站。
+- **`MediaImage` 接入点击看图**：新增 `zoomable`（默认 true）、`gallery`
+  （一组图候选源列表，用于弹窗内翻页）、`galleryIndex` 三个 props；点击图片
+  `cursor-zoom-in` 并调用 `viewer.open()`。评论配图 `CommentImages` 同步改为
+  点击弹出，不再 `<a target="_blank">`。
+
+### 变更
+- **11 个平台布局**去掉帖子正文图的 `<a href target="_blank">` 外包装，改为给
+  `MediaImage` 传入 `gallery={media.map(m=>m.candidates)}` + `galleryIndex`，
+  点击即在应用内弹窗看大图并可翻页（B站/抖音/快手封面图也沿用同一弹窗）。
+- **列表卡片封面**（`DataManagementView` / `GuestView`）显式 `zoomable={false}`，
+  保留「整卡点击跳详情」行为，不被看图弹窗拦截。
+- 「查看原文」外链（`sourceUrl`）与作者主页链接仍按原意新标签打开，未改动。
+
+### 验证
+- `npm run build`（含 `tsc -b` 类型检查）通过；grep 确认帖子正文图/评论图已无
+  `<a ... target="_blank">` 残留（仅剩「查看原文」/作者主页等有意外链）。
+
+## [2026-10-30] 新增 帖子详情进 URL 路由（刷新不丢）+ 点赞/收藏优先续抓未完成帖
+
+### 背景
+1. 帖子详情此前只存在组件内部 state，刷新页面就回到列表，很不方便；
+   希望详情有独立 URL，刷新/分享能直接定位到该帖。
+2. account 模式（点赞/收藏）抓取每次都从列表第一页翻起，即使大部分帖子
+   已归档，也要把整份列表从头扫一遍；应优先续抓「之前没抓完」的帖子。
+
+### 新增
+- **前端路由承载帖子详情**：`useHashRoute` 路由格式扩展为
+  `#/{view}[/{platform}][/story/{id}]`。打开帖子即把 `storyId` 写进 URL，
+  刷新/分享链接可直接恢复到该帖（`#/data/xhs/story/8452`）。
+  `DataManagementView` / `GuestView` 的详情由路由驱动（不再用内部 state）；
+  「返回列表」= 去掉 URL 的 story 段，列表筛选/分页状态保持不变。
+  S3 备份「定位到原贴」事件也改为带 storyId 的跳转。
+- **点赞/收藏优先续抓未完成帖**：`tools/v2_sync.get_backfill_candidates()`
+  按评论完整率筛出本轮待补帖子，连同 `story_chapter.ext` 里已存的
+  `xsec_token` 一起返回；`core.get_account_behavior_notes` 在翻列表**之前**
+  直接按 note_id 拉这些帖子的详情+评论，不必先把整份列表翻一遍。
+- **列表翻页早停**：新增 `XHS_BEHAVIOR_EARLY_STOP_PAGES`（默认 3）。点赞/收藏
+  按时间倒序，连续 3 页无「新增待抓帖」（全已归档/视频）即停止翻页，
+  不再每次从头扫完整列表。0 = 关闭早停。
+
+### 变更
+- 本轮额度分配：未完成帖优先占用，但给新增帖预留约 1/5（避免待补池长期
+  清不空时列表额度恒为 0、新点赞永远进不来）；列表阶段额度 = 总额度 − 续抓数。
+- 早停判断抽成纯函数 `core.update_idle_streak()`，便于单测。
+
+### 验证
+- `tests/test_xhs_behavior_paging.py` 新增 4 例：空转计数/归零、早停关闭、
+  495 条列表不整份扫完（5 页即停）、`xsec_token` 提取回退；全部 13 例通过。
+- 真实库验证 `get_backfill_candidates`：待补 100 篇，均带 xsec_token。
+- 前端 `npm run build` 通过（tsc 无错）。
+
 ## [2026-10-30] 修复 去重执行报错（NameError）+ 分组可展开预览/逐张排除
 
 ### 背景

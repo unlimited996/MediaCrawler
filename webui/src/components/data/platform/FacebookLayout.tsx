@@ -20,6 +20,7 @@ interface FacebookLayoutProps extends LayoutProps {
 export function FacebookLayout({ d, comments, commentsTotal, commentsToolbar, t, theme }: FacebookLayoutProps) {
   const content = buildContent(d)
   const media = pickMedia(d)
+  const gallery = media.slice(0, 4).map((m) => m.candidates)
   const sourceUrl = pickSourceUrl(d)
   const tags: string[] = d?.tags || []
 
@@ -63,14 +64,15 @@ export function FacebookLayout({ d, comments, commentsTotal, commentsToolbar, t,
         {media.length > 0 && (
           <div className={`mt-3 grid gap-0.5 ${media.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
             {media.slice(0, 4).map((m, i) => (
-              <a key={i} href={m.url} target="_blank" rel="noopener noreferrer" className="block">
-                <MediaImage
-                  media={m}
-                  className={`w-full border-y border-cyber-border-subtle object-cover ${
-                    media.length === 1 ? 'max-h-[420px]' : 'aspect-square'
-                  }`}
-                />
-              </a>
+              <MediaImage
+                key={i}
+                media={m}
+                gallery={gallery}
+                galleryIndex={i}
+                className={`w-full cursor-zoom-in border-y border-cyber-border-subtle object-cover ${
+                  media.length === 1 ? 'max-h-[420px]' : 'aspect-square'
+                }`}
+              />
             ))}
           </div>
         )}

@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, Loader2, ThumbsUp, ThumbsDown, Minus } from 'lu
 import type { ComponentType, CSSProperties } from 'react'
 import { storyApi } from '@/lib/api'
 import type { PlatformTheme } from './platformTheme'
+import { useImageViewer } from './ImageViewer'
 
 /** 统一的时间格式化（兼容秒/毫秒时间戳） */
 export function fmtTs(ts?: number | null): string {
@@ -261,7 +262,7 @@ export function pickCoverMedia(d: any, media?: MediaItem[]): MediaItem | null {
  * 这里加载失败就换下一个候选源，全部失败才回调 onFailed 交给上层退化展示。
  */
 export function MediaImage({
-  media, className = '', alt = '', style, onFailed,
+  media, className = '', alt = '', style, onFailed, zoomable = true, gallery, galleryIndex,
 }: {
   media: MediaItem | null | undefined
   className?: string
@@ -269,22 +270,36 @@ export function MediaImage({
   style?: CSSProperties
   /** 所有候选源都失败时回调一次（上层可切文字封面/占位） */
   onFailed?: () => void
+  /** 点击图片打开看图弹窗（可缩放/翻页）；false 表示不可点（如列表卡片封面，需整卡跳详情） */
+  zoomable?: boolean
+  /** 一组图的候选源列表；传入后弹窗内可左右翻页，缺省仅当前这一张 */
+  gallery?: string[][]
+  /** 在 gallery 中的起始下标 */
+  galleryIndex?: number
 }) {
   const candidates = media?.candidates || []
   const [idx, setIdx] = useState(0)
   const key = candidates[0] || ''
+  const viewer = useImageViewer()
 
   // 换数据源（重开详情/刷新列表）时从第一个候选重新开始
   useEffect(() => { setIdx(0) }, [key])
 
   if (candidates.length === 0) return null
   const current = candidates[Math.min(idx, candidates.length - 1)]
+
+  const handleClick = () => {
+    if (!zoomable || !viewer) return
+    viewer.open(gallery && gallery.length ? gallery : [candidates], galleryIndex ?? 0)
+  }
+
   return (
     <img
       src={current}
       alt={alt}
       loading="lazy"
-      className={className}
+      onClick={handleClick}
+      className={`${className} ${zoomable ? 'cursor-zoom-in' : ''}`}
       style={style}
       onError={() => {
         setIdx((i) => (i + 1 < candidates.length ? i + 1 : i))
@@ -304,7 +319,8 @@ export function pickSourceUrl(d: any): string {
 }
 
 // 表情渲染组件从这里转发，各布局统一从 shared import
-export { RichText, renderEmoji, useEmojiMap } from './EmojiText'
+import { RichText, renderEmoji, useEmojiMap } from './EmojiText'
+export { RichText, renderEmoji, useEmojiMap }
 
 /**
  * 作者链接：头像 + 昵称包一层 <a>，点击跳转平台个人主页。
@@ -661,7 +677,10 @@ export function CommentReplies({
                   </>
                 ) : null}
                 <span className={mutedClassName}>：</span>
-                <span className={textClassName}>{r.content}</span>
+                {/* 表情：子评论正文与主评论一致走 RichText，把小红书表情标记
+                    （[捂脸R] / [doge] 等）渲染成 CDN 表情图片；此前用裸 <span>
+                    会把标记当成原始方括号文本显示，导致「用户发的表情」不显示。 */}
+                <RichText content={r.content} className={textClassName} />
                 <CommentImages pictures={r.pictures} />
                 {/* 每条子评论都像原站一样展示 IP 属地 + 时间 */}
                 <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-cyber-text-muted">
@@ -706,22 +725,15 @@ export function CommentImages({
       className={`mt-1.5 grid gap-1.5 ${single ? 'max-w-[220px] grid-cols-1' : 'max-w-[340px] grid-cols-3'} ${className}`}
     >
       {pictures.map((p: any, i: number) => (
-        <a
+        <MediaImage
           key={i}
-          href={p.candidates?.[0] || p.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="block"
-        >
-          <MediaImage
-            media={{
-              url: p.url,
-              candidates: p.candidates?.length ? p.candidates : mediaCandidates(p),
-            }}
-            className="w-full rounded-lg border border-cyber-border-subtle object-cover"
-            style={{ maxHeight: single ? 220 : 120 }}
-          />
-        </a>
+          media={{
+            url: p.url,
+            candidates: p.candidates?.length ? p.candidates : mediaCandidates(p),
+          }}
+          className="w-full cursor-zoom-in rounded-lg border border-cyber-border-subtle object-cover"
+          style={{ maxHeight: single ? 220 : 120 }}
+        />
       ))}
     </div>
   )
