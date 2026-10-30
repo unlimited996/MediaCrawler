@@ -102,6 +102,29 @@ export function S3BackupView() {
     // 不自动轮询：全表扫描较重，仅在「分析报告」/「执行去重」后按需刷新
   })
   const [dedupOpen, setDedupOpen] = useState(false)
+  // 用户勾选「保留」、不参与清理的对象键（按 key 精确排除）
+  const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set())
+  // 已展开的分组（按 checksum）
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+
+  const toggleExpand = (c: string) =>
+    setExpanded((prev) => {
+      const n = new Set(prev)
+      n.has(c) ? n.delete(c) : n.add(c)
+      return n
+    })
+  const toggleKeyExclude = (k: string) =>
+    setExcludedKeys((prev) => {
+      const n = new Set(prev)
+      n.has(k) ? n.delete(k) : n.add(k)
+      return n
+    })
+  const toggleGroupExclude = (keys: string[], on: boolean) =>
+    setExcludedKeys((prev) => {
+      const n = new Set(prev)
+      keys.forEach((k) => (on ? n.add(k) : n.delete(k)))
+      return n
+    })
 
   const invalidateAll = () => {
     qc.invalidateQueries({ queryKey: ['s3Configs'] })
@@ -194,9 +217,10 @@ export function S3BackupView() {
     },
   })
   const dedupRunM = useMutation({
-    mutationFn: async () => (await api.post('/s3-backup/dedup/run', { execute: true })).data,
+    mutationFn: async (payload: any) => (await api.post('/s3-backup/dedup/run', payload)).data,
     onSuccess: (d: any) => {
       toast.success(d?.started ? '去重合并已在后台启动，稍后查看报告' : (d?.note || '未启动'))
+      if (d?.started) setExcludedKeys(new Set())  // 已提交，清空选择
     },
     onError: (e: any) => toast.error(`启动失败：${e?.response?.data?.detail || e?.message}`),
   })
@@ -272,13 +296,16 @@ export function S3BackupView() {
                       disabled={dedupRunM.isPending
                                 || !(dedupQ.data?.redundant_objects)}
                       onClick={() => {
-                        if (confirm(`确认执行去重合并？\n\n将把 ${dedupQ.data?.redundant_objects} 个冗余 S3 对象删除，` +
-                                    `释放 ${fmtBytes(dedupQ.data?.reclaimable_bytes ?? 0)} 存储空间。` +
-                                    `该操作不可撤销，建议先确认分析报告中无异常分组。`)) {
-                          dedupRunM.mutate()
+                        const excl = excludedKeys.size
+                        const msg = `确认执行去重合并？\n\n将把重复图片合并为一份、删除冗余 S3 对象并释放存储空间。` +
+                          (excl ? `\n\n已勾选 ${excl} 个副本「保留」，本次不会被清理。` : '') +
+                          `\n\n该操作不可撤销，建议先在分组里确认无异常、并勾掉想保留的副本。`
+                        if (confirm(msg)) {
+                          dedupRunM.mutate({ execute: true, exclude_keys: [...excludedKeys] })
                         }
                       }}>
                 <Trash2 className="mr-1 h-3.5 w-3.5" />执行去重
+                {excludedKeys.size > 0 && ` (保留${excludedKeys.size})`}
               </Button>
               {(dedupQ.data?.dup_groups ?? 0) > 0 && (
                 <Button size="sm" variant="ghost" className="font-mono text-xs"
@@ -303,31 +330,92 @@ export function S3BackupView() {
               </div>
             )}
             {dedupOpen && dedupQ.data?.groups?.length ? (
-              <div className="mt-2 max-h-52 overflow-auto rounded border border-cyber-border-subtle">
-                <table className="w-full font-mono text-[10px]">
-                  <thead className="sticky top-0 bg-cyber-bg-panel text-cyber-text-muted">
-                    <tr className="border-b border-cyber-border-subtle">
-                      <th className="px-2 py-1 text-left">sha256(前12)</th>
-                      <th className="px-2 py-1 text-left">类型</th>
-                      <th className="px-2 py-1 text-left">重复数</th>
-                      <th className="px-2 py-1 text-left">可收回</th>
-                      <th className="px-2 py-1 text-left">规范键</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {dedupQ.data.groups.slice(0, 50).map((g: any) => (
-                      <tr key={g.checksum} className="border-b border-cyber-border-subtle/50">
-                        <td className="px-2 py-1 text-cyber-text-secondary">{g.checksum.slice(0, 12)}</td>
-                        <td className="px-2 py-1 text-cyber-text-secondary">{g.media_type}</td>
-                        <td className="px-2 py-1 text-cyber-text-secondary">×{g.count}</td>
-                        <td className="px-2 py-1 text-cyber-text-secondary">{fmtBytes(g.reclaimable_bytes)}</td>
-                        <td className="max-w-[160px] truncate px-2 py-1 text-cyber-text-muted" title={g.canonical_key}>
-                          {g.canonical_already ? '已合并' : g.canonical_key}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <div className="mt-2 space-y-1.5">
+                <div className="flex items-center justify-between px-1 text-[10px] text-cyber-text-muted">
+                  <span>展开分组可预览每组所有图片（相同字节）；勾「保留」的副本不会被清理</span>
+                  {excludedKeys.size > 0 && (
+                    <button type="button" onClick={() => setExcludedKeys(new Set())}
+                            className="text-cyber-neon-cyan hover:underline">
+                      清空排除({excludedKeys.size})
+                    </button>
+                  )}
+                </div>
+                {dedupQ.data.groups.slice(0, 300).map((g: any) => {
+                  const exp = expanded.has(g.checksum)
+                  const allKept = g.keys.length > 0 && g.keys.every((k: string) => excludedKeys.has(k))
+                  return (
+                    <div key={g.checksum}
+                         className="overflow-hidden rounded border border-cyber-border-subtle">
+                      <div className="flex flex-wrap items-center gap-2 px-2 py-1.5">
+                        <button type="button" onClick={() => toggleExpand(g.checksum)}
+                                className="font-mono text-xs text-cyber-neon-cyan">
+                          {exp ? '▾' : '▸'}
+                        </button>
+                        <span className="font-mono text-[10px] text-cyber-text-secondary" title={g.checksum}>
+                          {g.checksum.slice(0, 12)}
+                        </span>
+                        <span className="text-[10px] text-cyber-text-muted">{g.media_type}</span>
+                        <span className="text-[10px] text-cyber-text-secondary">×{g.count}</span>
+                        <span className="text-[10px] text-cyber-text-secondary">
+                          可收回 {fmtBytes(g.reclaimable_bytes)}
+                        </span>
+                        <span className="ml-auto flex items-center gap-1">
+                          <input type="checkbox" checked={allKept}
+                                 onChange={(e) => toggleGroupExclude(g.keys, e.target.checked)}
+                                 className="h-3 w-3 accent-emerald-400" />
+                          <span className="text-[10px] text-cyber-text-muted">整组保留</span>
+                        </span>
+                      </div>
+                      {exp && (
+                        <div className="border-t border-cyber-border-subtle/60 p-2">
+                          <div className="mb-1.5 text-[10px] text-cyber-text-muted">
+                            涉及 {g.content_ids?.length ?? 0} 个对象(content_id)：
+                            <span className="ml-1 font-mono text-cyber-text-secondary">
+                              {(g.content_ids || []).slice(0, 10).join('、')}
+                              {(g.content_ids || []).length > 10 ? ' …' : ''}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-6">
+                            {g.keys.map((k: string, i: number) => {
+                              const size = (g.sizes && g.sizes[i]) || 0
+                              const kept = excludedKeys.has(k)
+                              const isCanon = k === g.canonical_key
+                              return (
+                                <div key={k}
+                                     className={`rounded border p-1 ${kept ? 'border-emerald-500/60 bg-emerald-500/5' : 'border-cyber-border-subtle'}`}>
+                                  <div className="relative">
+                                    <img src={`/api/s3-backup/object/${k}`} alt=""
+                                         loading="lazy"
+                                         className="aspect-square w-full rounded bg-cyber-bg-tertiary object-cover"
+                                         onError={(e) => {
+                                           (e.currentTarget as HTMLImageElement)
+                                             .style.visibility = 'hidden'
+                                         }} />
+                                    {isCanon && (
+                                      <span className="absolute left-0.5 top-0.5 rounded bg-cyber-neon-cyan/80 px-1 text-[8px] font-mono text-black">
+                                        规范
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="mt-1 flex items-center gap-1">
+                                    <input type="checkbox" checked={kept}
+                                           onChange={() => toggleKeyExclude(k)}
+                                           className="h-3 w-3 accent-emerald-400" />
+                                    <span className="truncate font-mono text-[9px] text-cyber-text-muted"
+                                          title={k}>{k.split('/').pop()}</span>
+                                  </div>
+                                  <div className="font-mono text-[9px] text-cyber-text-muted">
+                                    {fmtBytes(size)}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             ) : null}
           </div>

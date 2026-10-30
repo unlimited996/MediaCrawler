@@ -32,6 +32,7 @@ from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 
 from database.models_v2 import MediaAttachment, MediaBackup, S3Config
+from tools.media_backup import active_settings
 from .story import _session
 
 router = APIRouter(prefix="/s3-backup", tags=["s3-backup"])
@@ -580,6 +581,8 @@ async def dedup_run(payload: Dict[str, Any] = Body(default={})):
         return {"started": False, "note": "已有去重任务在运行"}
 
     execute = bool(payload.get("execute", False))
+    # 用户排除、不应被清理的对象键（UI 里勾掉的单张副本）
+    exclude_keys = set(payload.get("exclude_keys") or [])
 
     async def _bg():
         global _DEDUP_LAST
@@ -597,7 +600,8 @@ async def dedup_run(payload: Dict[str, Any] = Body(default={})):
                                "error": "未配置可用的 S3 存储"}
                 return
             res = await dedup_backups(session, cfg["settings"],
-                                     dry_run=not execute)
+                                     dry_run=not execute,
+                                     exclude_keys=exclude_keys or None)
             _DEDUP_LAST = {"ok": True, "execute": execute, **res,
                            "at": _now_iso()}
         except Exception as e:

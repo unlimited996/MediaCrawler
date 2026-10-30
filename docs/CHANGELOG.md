@@ -5,6 +5,35 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-10-30] 修复 去重执行报错（NameError）+ 分组可展开预览/逐张排除
+
+### 背景
+去重面板上线后，点「分析报告」报 `NameError: name 'active_settings' is not defined`——
+执行去重后台任务里引用了 `active_settings` 却没导入，失败信息被存进 `_DEDUP_LAST`，
+报告接口把它带出来显示。同时用户要求在分组里能展开看每组所有图片、并排除不合适
+清理的数据。
+
+### 修复 / 变更
+- `api/routers/s3_backup.py`：顶部补 `from tools.media_backup import active_settings`
+  （修复执行去重崩溃）；`POST /s3-backup/dedup/run` 新增 `exclude_keys` 入参透传给
+  去重逻辑。
+- `tools/media_dedup.py`：
+  - `analyze_duplicates` 每组明细新增 `sizes`（与 `keys` 一一对应）与 `content_ids`
+    （该组涉及的帖/评论去重列表），供前端预览与判断合并范围。
+  - `dedup_backups` 新增 `exclude_keys` 参数：这些对象键**绝不**改键、绝不删除（用户
+    在 UI 里勾掉的副本）；整组被排除或不足 2 个可合并副本时跳过该组，其余合并照常。
+- 前端 `S3BackupView` 去重面板：
+  - 「查看分组」改为可展开的手风琴：每组可展开预览**所有图片**（经 `/api/s3-backup/
+    object/{key}` 直接代理 S3），并显示涉及 content_id、每张体积。
+  - 每张图片带「保留」勾选（精确按对象键排除），也支持「整组保留」；排除状态带
+    清空入口；「执行去重」按钮显示已保留数量，并把 `exclude_keys` 传给后端。
+
+### 验证
+- `tests/test_s3_dedup.py`：新增「排除指定副本」用例（被排除键不改键/不删、其余合并
+  照常、protected 计数正确），共 5 例全通过。
+- 真实库只读分析（修复后）：2481 已备份 → 75 重复组、301 冗余对象、约 13.5MB 可收回；
+  `last_run` 为 `None`（无旧报错）。
+
 ## [2026-10-30] 新增 S3 备份去重（按内容合并重复图片）
 
 ### 背景

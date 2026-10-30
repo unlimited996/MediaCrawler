@@ -170,6 +170,31 @@ def test_dedup_repoints_and_deletes(fake_s3):
     assert n8_key == "xhs/image/n8/001.webp"  # failed，未动
 
 
+def test_exclude_keys_protects_selected_copies(fake_s3):
+    asyncio.run(_seed())
+    f = fake_s3
+    # 排除组A 中的 n3 副本：它不应被改键、也不应被删除；其余合并照常
+    async def _run():
+        async with SESSIONMAKER() as s:
+            stats = await media_dedup.dedup_backups(
+                s, f, dry_run=False,
+                exclude_keys={"xhs/image/n3/001.webp"})
+            rows = (await s.execute(
+                __import__("sqlalchemy").select(MediaBackup)
+                .where(MediaBackup.checksum == "aaa")
+            )).scalars().all()
+            return stats, {r.object_key for r in rows}
+    stats, keys = asyncio.run(_run())
+    # 组A：非排除副本 n1/n2 合并到 n1，n3 保留；组B：n4/n5 合并到 n4
+    assert stats["protected"] == 1, stats
+    assert stats["objects_deleted"] == 2, stats   # 组A删1 + 组B删1
+    assert stats["bytes_reclaimed"] == 150, stats  # 组A 100 + 组B 50
+    # 被排除的 n3 仍在库中且未被改键
+    assert "xhs/image/n3/001.webp" in keys, keys
+    # 非排除副本合并到规范键 n1
+    assert "xhs/image/n1/001.webp" in keys, keys
+
+
 def test_idempotent_rerun(fake_s3):
     asyncio.run(_seed())
     f = fake_s3

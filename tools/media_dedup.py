@@ -84,6 +84,7 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
         if len(items) < 2:
             continue
         sizes = [int(i.size_bytes or 0) for i in items]
+        keys = [i.object_key for i in items]
         # 若组内已存在规范键（上次去重留下的），优先复用，避免反复拷贝
         existing = [i for i in items if i.object_key.startswith(f"{CANON_PREFIX}/")]
         canonical = existing[0] if existing else items[0]
@@ -98,7 +99,10 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
             "canonical_already": canonical.object_key.startswith(f"{CANON_PREFIX}/"),
             "size_bytes": int(canonical.size_bytes or 0),
             "reclaimable_bytes": total - int(canonical.size_bytes or 0),
-            "keys": [i.object_key for i in items],
+            "keys": keys,
+            "sizes": sizes,  # 与 keys 一一对应，便于 UI 展示与精确估算
+            # 涉及的帖/评论（按 content_id 去重），便于判断合并范围
+            "content_ids": sorted({i.content_id for i in items if i.content_id}),
         })
     dup_groups.sort(key=lambda g: g["reclaimable_bytes"], reverse=True)
     return {
@@ -115,7 +119,8 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def dedup_backups(session, settings, dry_run: bool = True,
-                        concurrency: int = 4) -> Dict[str, Any]:
+                        concurrency: int = 4,
+                        exclude_keys: Optional[set] = None) -> Dict[str, Any]:
     """把重复备份合并为规范键并删除冗余对象。
 
     规范键的选取与 :func:`analyze_duplicates` 保持一致：优先复用组内已有的
@@ -125,19 +130,40 @@ async def dedup_backups(session, settings, dry_run: bool = True,
 
     :param dry_run: True 只返回将要执行的处理量，不改动任何数据/S3。
     :param settings: 生效的 S3Settings（来自 media_backup.active_settings）。
+    :param exclude_keys: 受保护的对象键集合——这些键**绝不**改键、绝不删除
+                        （用户在 UI 里把认为不该清理的副本勾掉后传入）。被排除的
+                        键保持原样留存；组内其余非排除副本合并/删除照常进行。
     :returns: 统计 + 每组处理明细（errors 列出失败组，便于排查）。
     """
+    exclude_keys = set(exclude_keys or set())
     report = await analyze_duplicates(session)
     groups = report["groups"]
     stats: Dict[str, Any] = {
         "groups": 0, "merged_rows": 0, "objects_deleted": 0,
         "bytes_reclaimed": 0, "errors": [], "skipped": 0,
+        "protected": 0,
     }
 
     if dry_run:
-        stats["groups"] = len(groups)
-        stats["objects_deleted"] = report["redundant_objects"]
-        stats["bytes_reclaimed"] = report["reclaimable_bytes"]
+        # 尊重排除：被完全排除（非排除副本 < 2）的组不计入；其余按与执行一致的
+        # 规范键选取（优先组内 dedup/ 键、否则首个非排除键）估算冗余与回收量。
+        merged, objs, reclaim = 0, 0, 0
+        for g in groups:
+            non_ex = [k for k in g["keys"] if k not in exclude_keys]
+            if len(non_ex) < 2:
+                continue
+            merged += 1
+            objs += (len(non_ex) - 1)
+            # 规范键：组内 dedup/ 键（且未排除）优先，否则首个非排除键
+            dedup_keys = [k for k in non_ex
+                          if k.startswith(f"{CANON_PREFIX}/")]
+            canon = dedup_keys[0] if dedup_keys else non_ex[0]
+            size_by_key = dict(zip(g["keys"], g["sizes"]))
+            total = sum(size_by_key[k] for k in non_ex)
+            reclaim += (total - size_by_key.get(canon, 0))
+        stats["groups"] = merged
+        stats["objects_deleted"] = objs
+        stats["bytes_reclaimed"] = reclaim
         stats["dry_run"] = True
         return stats
 
@@ -146,7 +172,6 @@ async def dedup_backups(session, settings, dry_run: bool = True,
 
     for g in groups:
         csum = g["checksum"]
-        target_canonical = g["canonical_key"]
         try:
             # 重新取该组最新行（与 analyze 隔离，避免缓存过期）
             items = (await session.execute(
@@ -156,7 +181,21 @@ async def dedup_backups(session, settings, dry_run: bool = True,
                 stats["skipped"] += 1
                 continue
 
-            # 记录每行的原始键与体积，随后统一改键
+            # 排除键不参与合并/删除；全部被排除或不足 2 条可合并则跳过整组
+            non_excluded = [i for i in items
+                            if i.object_key not in exclude_keys]
+            if len(non_excluded) < 2:
+                stats["skipped"] += 1
+                stats["protected"] += (len(items) - len(non_excluded))
+                continue
+
+            # 规范键：优先组内已存在的 dedup/ 键（且未被排除），否则取首个非排除键
+            existing = [i for i in non_excluded
+                        if i.object_key.startswith(f"{CANON_PREFIX}/")]
+            canonical = existing[0] if existing else non_excluded[0]
+            target_canonical = canonical.object_key
+
+            # 记录每行的原始键与体积（含被排除的，便于防御性核对）
             originals = {r.id: (r.object_key, int(r.size_bytes or 0))
                          for r in items}
 
@@ -166,7 +205,8 @@ async def dedup_backups(session, settings, dry_run: bool = True,
                 head = await _head(settings, target_canonical)
                 if head is None:
                     src = next((ok for ok in originals.values()
-                                if ok[0] != target_canonical), None)
+                                if ok[0] not in exclude_keys
+                                and ok[0] != target_canonical), None)
                     if src is None:
                         stats["errors"].append(
                             {"checksum": csum, "error": "组内无可用源对象"})
@@ -179,21 +219,23 @@ async def dedup_backups(session, settings, dry_run: bool = True,
                              "error": f"规范对象拷贝失败: {type(e).__name__}: {e}"})
                         continue
 
-            # 2) 全部改键到规范键（同事务提交）
-            for r in items:
+            # 2) 非排除的副本全部改键到规范键（被排除的保持原样）；同事务提交
+            for r in non_excluded:
                 r.object_key = target_canonical
             await session.commit()
 
-            # 3) 删除冗余原始对象（规范键本身不删；删前再确认无人引用）。
-            #    被删除的恰好是「行数-1」个，可收回体积不含规范对象那份。
+            # 3) 删除冗余原始对象（规范键本身不删；被排除键不删；删前再确认
+            #    无人引用）。被删除的恰好是「非排除副本数-1」个。
             dels = [orig for orig in originals.values()
-                    if orig[0] != target_canonical]
+                    if orig[0] not in exclude_keys
+                    and orig[0] != target_canonical]
             deleted = await _delete_redundant(session, settings, sem, dels)
             stats["objects_deleted"] += deleted["deleted"]
             stats["bytes_reclaimed"] += deleted["bytes"]
+            stats["protected"] += (len(items) - len(non_excluded))
             if deleted["deleted"] or len(dels):
                 stats["groups"] += 1
-                stats["merged_rows"] += len(items)
+                stats["merged_rows"] += len(non_excluded)
         except Exception as e:
             await _safe_rollback(session)
             stats["errors"].append(
