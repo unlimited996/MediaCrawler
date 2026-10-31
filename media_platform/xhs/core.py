@@ -1365,6 +1365,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 f"原因：{self._risk_abort_reason}")
             return
 
+        # 单轮评论请求预算已在上一批次耗尽：本批（新帖 / 补抓）直接跳过，
+        # 不再打评论接口，把剩余帖子留到下一轮（尊重风控冷却），避免账号被打挂。
+        if getattr(self.xhs_client, "_comment_budget_hit", False):
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler.batch_get_note_comments] 本轮评论预算已耗尽，"
+                f"跳过本批 {len(note_list)} 篇的评论抓取（剩余留到下一轮）。")
+            return
+
         utils.logger.info(f"[XiaoHongShuCrawler.batch_get_note_comments] Begin batch get note comments, note list: {note_list}")
 
         # 单篇评论上限按「原帖显示评论量」推算（不再统一吃全局的 30）：
@@ -1449,6 +1457,12 @@ class XiaoHongShuCrawler(AbstractCrawler):
         async with semaphore:
             # 熔断：前面已经连续被风控拦下，后面的笔记就别再撞了
             if self._risk_abort_reason:
+                return
+            # 单轮评论请求预算已耗尽：本篇直接跳过，留到下一轮
+            if getattr(self.xhs_client, "_comment_budget_hit", False):
+                utils.logger.info(
+                    f"[XiaoHongShuCrawler.get_comments] note {note_id} "
+                    f"评论预算已耗尽，跳过（留到下一轮）")
                 return
             utils.logger.info(f"[XiaoHongShuCrawler.get_comments] Begin get note id comments {note_id}")
             # Use randomized crawling interval (5-15s)
@@ -1549,6 +1563,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         )
                         self._comment_fail_streak = 0
                         self._comment_done_count += 1
+                        # 重试真正成功 = 账号确实解除限制，这时才解除熔断，
+                        # 让本轮后续帖子能继续（而不是因为「浏览器没验证码」误判通过）。
+                        self._risk_abort_reason = ""
                         utils.logger.info(
                             f"[XiaoHongShuCrawler.get_comments] 人工验证后评论重试成功: {note_id}")
                     except Exception as retry_err:
@@ -1792,12 +1809,17 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     self._verify_playwright = None
 
         if verified:
-            # 验证通过 → 解除熔断，让本轮继续。只有这一次机会：
-            # 若再次 461 就按真正的熔断处理，绝不无限弹窗重试。
-            self._risk_abort_reason = ""
+            # 注意：**不要在这里解除熔断**。小红书的 461 是接口层返回的，浏览器页面
+            # 永远正常，所以 wait_for_human_verify 对 XHS 一律返回 True（没有任何
+            # 真实验证动作）。此前在这里直接清空 _risk_abort_reason，等于「撞 461 →
+            # 弹窗 → 没验证码 → 误判通过 → 解除熔断 → 重试又撞 461 → 同轮后续批次
+            # 继续打评论接口」，把账号越推越死。
+            # 正确的解除时机是「重试接口真正成功」（见 get_comments 的重试成功分支）：
+            # 那才说明账号确实解除了限制。这里只重置失败计数。
             self._comment_fail_streak = 0
             utils.logger.info(
-                "[XiaoHongShuCrawler] 人工验证通过，已解除风控熔断，继续本轮抓取")
+                "[XiaoHongShuCrawler] 人工验证窗口已结束（验证通过 / 浏览器侧正常），"
+                f"是否解除熔断由紧随其后的重试结果决定，不再无条件解除。")
         return verified
 
     async def _spawn_verify_browser(self):

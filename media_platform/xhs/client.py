@@ -101,6 +101,42 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
 
+        # ---- 单轮评论接口请求量硬上限（反风控护栏，详见 config.XHS_COMMENT_BUDGET_PER_ROUND）----
+        # 小红书评论接口是累计请求量触发限流：一轮把评论请求推到 ~90 次就 461。
+        # 这里在撞 461 之前主动停手，避免账号进入惩罚态。计数器跨「同一次运行里的
+        # 所有批量评论批次」（新帖批次 + 补抓批次）累计，因为同一次任务运行共享
+        # 同一个账号/IP，必须对整轮总量负责；跨运行（新子进程）自然归零。
+        self._comment_req_budget = int(
+            getattr(config, "XHS_COMMENT_BUDGET_PER_ROUND", 0) or 0)
+        self._comment_req_used = 0
+        self._comment_budget_hit = False
+
+    # ---- 评论接口请求预算（反风控硬护栏）----
+    def _comment_req_tick(self) -> None:
+        """记一次评论接口请求（主评论页 / 楼中楼页各算 1 次）。"""
+        self._comment_req_used += 1
+
+    def _comment_budget_exhausted(self) -> bool:
+        """评论接口请求预算是否耗尽（单轮硬上限）。
+
+        返回 True 表示已达到 XHS_COMMENT_BUDGET_PER_ROUND，应停止继续打评论
+        接口（comment/page 与 sub/page 都算），把剩余帖子留到下一轮。
+        预算=0 时永不触发（向后兼容，由熔断 + 冷却兜底）。
+        """
+        if not self._comment_req_budget:
+            return False
+        if self._comment_req_used >= self._comment_req_budget:
+            if not self._comment_budget_hit:
+                self._comment_budget_hit = True
+                utils.logger.warning(
+                    f"[XiaoHongShuClient] 单轮评论接口请求已达预算上限 "
+                    f"{self._comment_req_budget}（已用 {self._comment_req_used}），"
+                    f"主动停止继续抓取评论，剩余帖子留到下一轮（尊重风控冷却）。"
+                    f"如需更大预算可调高 config.XHS_COMMENT_BUDGET_PER_ROUND，"
+                    f"但超过 ~90 会重新撞 461。")
+            return True
+        return False
+
     async def _pre_headers(self, url: str, params: Optional[Dict] = None, payload: Optional[Dict] = None) -> Dict:
         """请求头参数签名 (使用 xhshow 纯算法)
 
@@ -515,9 +551,17 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         # 是先把评论列表滚到底（A A A…），再逐条点开回复（B B B…）。
         # 参考小红书留档 skill 的风控结论：被判机器人的不是签名，是请求节奏与形态。
         while comments_has_more and (unlimited or top_count < max_count):
+            # 单轮评论请求预算：在撞 461 之前主动停手，避免账号进入惩罚态
+            if self._comment_budget_exhausted():
+                utils.logger.info(
+                    f"[XiaoHongShuClient.get_note_all_comments] note {note_id} "
+                    f"评论预算耗尽，阶段1 提前结束（已用 {self._comment_req_used}/"
+                    f"{self._comment_req_budget}），剩余帖子留到下一轮")
+                break
             comments_res = await self.get_note_comments(
                 note_id=note_id, xsec_token=xsec_token, cursor=comments_cursor
             )
+            self._comment_req_tick()
             comments_has_more = comments_res.get("has_more", False)
             comments_cursor = comments_res.get("cursor", "")
             if "comments" not in comments_res:
@@ -704,6 +748,14 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 # 改用 skipped 让完整率判定把这部分从分母里扣掉。
                 return result, None, skipped
             try:
+                # 单轮评论请求预算：达到上限立刻停手（返回 last_cursor 供下轮续抓，
+                # 这是主动停止而非失败）。优先级高于楼中楼深度上限。
+                if self._comment_budget_exhausted():
+                    utils.logger.info(
+                        f"[XiaoHongShuClient._fetch_sub_pages] root={root_comment_id} "
+                        f"评论预算耗尽，停止翻页（已用 {self._comment_req_used}/"
+                        f"{self._comment_req_budget}），留待续抓")
+                    return result, last_cursor, 0
                 comments_res = await self.get_note_sub_comments(
                     note_id=note_id,
                     root_comment_id=root_comment_id,
@@ -711,6 +763,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     num=SUB_COMMENT_PAGE_NUM,
                     cursor=cursor,
                 )
+                self._comment_req_tick()
             except DataFetchError as e:
                 utils.logger.warning(
                     f"[XiaoHongShuClient._fetch_sub_pages] Failed to get "
