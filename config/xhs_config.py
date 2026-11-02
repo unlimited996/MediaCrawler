@@ -186,12 +186,12 @@ XHS_COMMENT_BUDGET_PER_ROUND = _env_int("XHS_COMMENT_BUDGET_PER_ROUND", 20)
 # （即「本次抓取上限」字段），不再单独设值——避免「字段设了 100、补抓却只有 20」
 # 的歧义。下面这个是另一个维度的预算（评论「条数」总预算），见其注释。
 
-# 评论补抓「每篇预留额度」：account 备份任务里，评论条数预算 =
-# 本次抓取上限(XHS_BEHAVIOR_MAX_NOTES) × 本值，从而使每轮选中的待补批次
-# ≈ 本次抓取上限（不再被死值压成 9 篇，详见 core.get_account_behavior_notes）。
-# 它与「篇数上限」是不同维度：篇数上限管「处理多少篇」，本值管「每篇预留
-# 多少条评论额度」。50000 条评论 ≈ 5000 页 × 5-15s ≈ 十几小时，所以单帖
-# 评论极多的帖子（声明数几万）仍会按 XHS_COMMENT_MAX_PER_NOTE 分轮补齐。
-XHS_COMMENT_BACKFILL_MAX_COMMENTS = _env_int("XHS_COMMENT_BACKFILL_MAX_COMMENTS", 4000)
+# 内部常量（**不再暴露为配置旋钮**）：backfill 选帖时按每篇多少条评论预留，
+# 用于估算「本批候选帖的总评论量预算」= 本次抓取上限 × 本值，决定挑哪些帖。
+# ⚠️ 它不是请求量限制（那是 XHS_COMMENT_BUDGET_PER_ROUND 的硬闸），只是选帖启发式。
+# 2026-11-02：原先暴露为「每篇预留评论额度」旋钮，但与「单轮评论请求预算」在
+# 「每轮评论工作量」上重叠、且被其硬闸碾压成死配置，故下掉旋钮、改为内部常量。
+# （此前硬编码 3000 会导致每轮只补约 8 篇——本值需足够大，使选帖 ≈ 本次抓取上限）
+_XHS_COMMENT_BACKFILL_PER_POST = 4000
 
 

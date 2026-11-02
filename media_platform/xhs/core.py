@@ -1004,15 +1004,16 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 # 跳过判据 = 评论完整率（已抓 / 原帖显示）>= 90%。
                 # backfill_limit（篇数上限）与「本次抓取上限」(XHS_BEHAVIOR_MAX_NOTES)
                 # 统一；backfill_max_comments（评论条数预算）= 本次抓取上限 ×
-                # XHS_COMMENT_BACKFILL_MAX_COMMENTS（每篇预留额度），使每轮选中的
-                # 待补批次 ≈ 本次抓取上限。旧实现把评论条数预算写成死值 3000，导致
-                # 168 篇待补帖每轮只挑得出 ~8 篇、其余被「顺延=假装已归档」永久跳过，
-                # 点赞备份永远停在 9 篇。本预算只决定「本轮挑哪些帖重抓」，真正抓
-                # 几条评论由 XHS_COMMENT_MAX_PER_NOTE 管。
+                # _XHS_COMMENT_BACKFILL_PER_POST（每篇预留额度，已下掉旋钮、改为内部
+                # 常量），使每轮选中的待补批次 ≈ 本次抓取上限。旧实现把评论条数预算
+                # 写成死值 3000，导致 168 篇待补帖每轮只挑得出 ~8 篇、其余被
+                # 「顺延=假装已归档」永久跳过，点赞备份永远停在 9 篇。本预算只决定
+                # 「本轮挑哪些帖重抓」，真正抓几条评论由 XHS_COMMENT_MAX_PER_NOTE 管；
+                # 实际每轮打多少评论请求由 XHS_COMMENT_BUDGET_PER_ROUND 硬闸管。
                 backfill_limit = runtime_config.get_int(
                     "xhs_behavior_max_notes", config.XHS_BEHAVIOR_MAX_NOTES)
-                per_post = runtime_config.get_int(
-                    "xhs_comment_backfill_max_comments", config.XHS_COMMENT_BACKFILL_MAX_COMMENTS)
+                # 每篇预留评论量 = 内部常量（已下掉旋钮，避免与单轮请求硬闸重复配置）
+                per_post = config._XHS_COMMENT_BACKFILL_PER_POST
                 backfill_max_comments = max(1, budget) * max(1, per_post)
                 known_ids = await get_archived_content_ids(
                     "xhs",
@@ -1040,8 +1041,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 from tools.v2_sync import get_backfill_candidates
                 # 待补「篇数」上限 = 本次抓取上限 budget；评论条数预算沿用
                 # max(1,budget) × 每篇预留额度（与 get_archived_content_ids 保持一致）
-                _per_post = runtime_config.get_int(
-                    "xhs_comment_backfill_max_comments", config.XHS_COMMENT_BACKFILL_MAX_COMMENTS)
+                _per_post = config._XHS_COMMENT_BACKFILL_PER_POST
                 _bf_max_comments = max(1, budget) * max(1, _per_post)
                 candidates = await get_backfill_candidates(
                     "xhs", limit=budget, max_comments=_bf_max_comments)

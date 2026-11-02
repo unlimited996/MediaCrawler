@@ -182,10 +182,6 @@ CONFIG_ITEMS: List[Dict] = [
     dict(group="xhs_backup", key="xhs_behavior_incremental", label="增量模式", value_type="bool",
          default="true", timing="next_task", weight=15,
          desc="开启后已归档（评论已完整）的帖子跳过详情与评论，只抓新帖与未完整的帖子"),
-    dict(group="xhs_backup", key="xhs_comment_backfill_max_comments", label="每篇预留评论额度", value_type="int",
-         default="4000", min=0, max=100000, timing="next_task", weight=20, unit="条",
-         desc="每轮补抓批次的总评论预算 = 单次抓取上限 × 本值；决定一轮能补多少篇未完成评论的帖子。"
-              "此前硬编码 3000 导致每轮只补约 8 篇"),
     dict(group="xhs_backup", key="xhs_comment_max_per_note", label="单篇评论硬顶", value_type="int",
          default="0", min=0, max=100000, timing="next_task", weight=25, unit="条",
          desc="单篇最多抓多少条评论；0 = 不限制（翻到 has_more=false 或达到声明数）"),
@@ -293,6 +289,18 @@ async def _seed(session: AsyncSession) -> Dict[str, int]:
             await session.delete(row)
     except Exception as e:
         print(f"[init_v2] 清理 risk_cooldown_hours 跳过: {e}")
+
+    # 清理已废弃的「每篇预留评论额度」旋钮（2026-11-02：与单轮评论请求预算在
+    # 「每轮评论工作量」上重叠、且被其硬闸碾压成死配置，已降级为内部常量
+    # _XHS_COMMENT_BACKFILL_PER_POST，不再暴露为配置项）
+    try:
+        dead2 = await session.execute(
+            select(CrawlConfigItem).where(
+                CrawlConfigItem.cfg_key == "xhs_comment_backfill_max_comments"))
+        for row in dead2.scalars().all():
+            await session.delete(row)
+    except Exception as e:
+        print(f"[init_v2] 清理 xhs_comment_backfill_max_comments 跳过: {e}")
 
     # S3 / 媒体备份表登记（2026.10.2）
     ver2 = (await session.execute(
