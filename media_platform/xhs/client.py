@@ -111,6 +111,17 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         self._comment_req_used = 0
         self._comment_budget_hit = False
 
+        # ---- 单轮「笔记详情接口」请求量硬上限（反风控护栏，详见 config.XHS_DETAIL_BUDGET_PER_ROUND）----
+        # 2026-11-02 实跑发现：点赞/收藏备份任务每轮要把账号里所有点赞帖的详情都拉一遍
+        # （一篇 = 一次 note 详情请求），87 篇 = 87 次详情请求，单这一项就超过小红书
+        # 单轮累计请求量阈值(~80-90) → 详情接口直接 461，评论阶段整批被熔断。
+        # 所以详情接口必须和评论接口一样有独立预算护栏。计数器语义同评论预算：
+        # 跨同一次运行里的所有批量详情批次累计，跨运行自然归零。
+        self._detail_req_budget = int(
+            getattr(config, "XHS_DETAIL_BUDGET_PER_ROUND", 0) or 0)
+        self._detail_req_used = 0
+        self._detail_budget_hit = False
+
     # ---- 评论接口请求预算（反风控硬护栏）----
     def _comment_req_tick(self) -> None:
         """记一次评论接口请求（主评论页 / 楼中楼页各算 1 次）。"""
@@ -134,6 +145,32 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                     f"主动停止继续抓取评论，剩余帖子留到下一轮（尊重风控冷却）。"
                     f"如需更大预算可调高 config.XHS_COMMENT_BUDGET_PER_ROUND，"
                     f"但超过 ~90 会重新撞 461。")
+            return True
+        return False
+
+    # ---- 笔记详情接口请求预算（反风控硬护栏，与评论预算相互独立）----
+    def _detail_req_tick(self) -> None:
+        """记一次笔记详情接口请求（每篇帖子的详情拉取算 1 次）。"""
+        self._detail_req_used += 1
+
+    def _detail_budget_exhausted(self) -> bool:
+        """笔记详情接口请求预算是否耗尽（单轮硬上限）。
+
+        返回 True 表示已达到 XHS_DETAIL_BUDGET_PER_ROUND，应停止继续拉取更多
+        帖子的详情，把剩余帖子留到下一轮（尊重风控冷却 + 增量逻辑自然续抓）。
+        预算=0 时永不触发（向后兼容，由熔断 + 冷却兜底）。
+        """
+        if not self._detail_req_budget:
+            return False
+        if self._detail_req_used >= self._detail_req_budget:
+            if not self._detail_budget_hit:
+                self._detail_budget_hit = True
+                utils.logger.warning(
+                    f"[XiaoHongShuClient] 单轮笔记详情请求已达预算上限 "
+                    f"{self._detail_req_budget}（已用 {self._detail_req_used}），"
+                    f"主动停止继续拉取详情，剩余帖子留到下一轮（尊重风控冷却）。"
+                    f"如需更大预算可调高 config.XHS_DETAIL_BUDGET_PER_ROUND，"
+                    f"但详情+评论合计超过 ~80 会重新撞 461。")
             return True
         return False
 

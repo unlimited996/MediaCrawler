@@ -1202,6 +1202,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
         # 风控熔断：前面已经连续被验证码拦下，这篇直接跳过，别再撞
         if self._risk_abort_reason:
             return None
+        # 单轮笔记详情请求预算：在撞 461 之前主动停手（详见 config.XHS_DETAIL_BUDGET_PER_ROUND）。
+        # 详情接口累计请求量同样会触发风控（2026-11-02 实跑：87 篇点赞帖详情=87 次请求，
+        # 单这一项就超过阈值把账号打挂），必须和评论接口一样有独立护栏。
+        if getattr(self.xhs_client, "_detail_budget_hit", False):
+            utils.logger.info(
+                f"[get_note_detail_async_task] 本轮详情请求预算已耗尽，跳过 {note_id}（留到下一轮）")
+            return None
+        self.xhs_client._detail_req_tick()
         utils.logger.info(f"[get_note_detail_async_task] Begin get note detail, note_id: {note_id}")
         async with semaphore:
             try:

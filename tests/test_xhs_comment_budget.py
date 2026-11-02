@@ -15,10 +15,12 @@
    保证整轮总量受控；跨运行（新子进程）自然归零。
 """
 
+import asyncio
 import pytest
 
 import config
 from media_platform.xhs.client import XiaoHongShuClient
+from media_platform.xhs.core import XiaoHongShuCrawler
 
 SUB = "/api/sns/web/v2/comment/sub/page"
 TOP = "/api/sns/web/v2/comment/page"
@@ -108,3 +110,51 @@ async def test_budget_zero_means_unlimited(monkeypatch):
     )
     assert len(calls) == 5, f"预算=0 应翻到 has_more=False(5 页)，实际 {len(calls)}"
     assert client._comment_budget_hit is False
+
+
+def _detail_client(detail_budget=0):
+    c = XiaoHongShuClient(headers={}, playwright_page=None, cookie_dict={})
+    c._detail_req_budget = detail_budget
+    c._detail_req_used = 0
+    c._detail_budget_hit = False
+    return c
+
+
+def test_detail_budget_counter():
+    """笔记详情预算按篇累计，达到上限即触顶（独立计数，与评论预算互不影响）。"""
+    c = _detail_client(detail_budget=2)
+    c._detail_req_tick()
+    c._detail_req_tick()
+    assert c._detail_budget_exhausted() is True
+    # 评论预算应独立不受影响
+    assert getattr(c, "_comment_budget_hit", False) is False
+
+
+@pytest.mark.asyncio
+async def test_detail_skips_when_budget_exhausted():
+    """详情预算耗尽后，剩余帖子直接跳过（不发起详情请求），留到下一轮。"""
+
+    class _Stub:
+        _risk_abort_reason = ""
+        def __init__(self, hit):
+            self.xhs_client = _detail_client(detail_budget=1)
+            self.xhs_client._detail_budget_hit = hit
+        # 绑定真实方法：跳过分支只读 _risk_abort_reason 与 xhs_client，不触及其他依赖
+        get_note_detail_async_task = XiaoHongShuCrawler.get_note_detail_async_task
+
+    crawler = _Stub(hit=True)
+    res = await crawler.get_note_detail_async_task(
+        note_id="n1", xsec_source="pc_feed", xsec_token="t",
+        semaphore=asyncio.Semaphore(1))
+    assert res is None, "详情预算耗尽应直接跳过返回 None"
+
+
+@pytest.mark.asyncio
+async def test_detail_zero_means_unlimited():
+    """详情预算=0 时不限制（向后兼容）。"""
+    c = _detail_client(detail_budget=0)
+    for _ in range(5):
+        c._detail_req_tick()
+    assert c._detail_budget_exhausted() is False
+    assert c._detail_budget_hit is False
+
