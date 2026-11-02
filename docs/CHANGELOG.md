@@ -34,6 +34,37 @@
 - 回归：comment_budget 6 + sub_comment_depth 5 + human_order 3 + comment_resume 4 + 评论补抓 1 = 19 项全过（已知 flaky 的 risk_circuit 未纳入）。
 - `config` 实测 DETAIL=25 / COMMENT=20。
 
+## [2026-11-02] 移除风控冷却闸口 + 预算配置接入配置管理页
+
+### 背景（用户要求）
+- 用户认为「风控冷却」（`risk_cooldown_hours` + 任务选项 `ignore_risk_cooldown` +
+  手动运行 `force`）是垃圾限制、一点用没有——撞 461 后冷却期内不让跑，反而把任务
+  拖死；而真正能防 461 的是「单轮请求预算护栏」（`XHS_DETAIL_BUDGET_PER_ROUND` /
+  `XHS_COMMENT_BUDGET_PER_ROUND`），在撞 461 之前就主动停手。
+- 另外用户指出两个预算配置只写在代码里、没进「配置管理」页，无法在界面调。
+
+### 变更
+- **彻底移除风控冷却机制**：
+  - 删除 `task_scheduler._risk_cooldown_remaining_sec` 及 `execute_task` 内的冷却闸口
+    （撞 461 后「几小时内禁止发起」的拦截逻辑）。
+  - 删除 `ignore_risk_cooldown` 选项（schema / `_normalize_options` / 前端复选框 /
+    `scheduler.ts` 类型 / 测试）；删除 `trigger` 与 `run_task` 的 `force` 参数。
+  - 从 `init_v2` 种子 + `runtime_config.LEGACY_FALLBACK` 删除 `risk_cooldown_hours`，
+    并在 `_seed` 中清理库中已存在的该死配置项。
+  - 平台限流改由单轮请求预算护栏兜底，正常调度不再被「冷却」拦截。
+- **预算配置接入「配置管理」页（小红书账号备份 分组）**：
+  - `init_v2` 新增种子 `xhs_detail_budget_per_round`（默认 25）、
+    `xhs_comment_budget_per_round`（默认 20）。
+  - `runtime_config.LEGACY_FALLBACK` 新增对应回退；`build_crawler_env` 注入这两个
+    环境变量，使页面改值经 `runtime_config` 落库后**真正传进爬虫子进程**生效
+    （之前只在代码里硬编码，页面改了也白改）。
+
+### 验证
+- `tests/test_scheduler_options.py` 去掉 `ignore_risk_cooldown` 断言（改用 headless
+  等真实字段），6 项全过。
+- 后端重启后 `/config/groups` 的「小红书账号备份」分组应出现「单轮详情请求预算 /
+  单轮评论请求预算」两项；改值后下一轮爬虫即按新值执行。
+
 ## [2026-10-31] 修复 评论接口仍撞 461 的根因 + 新增「单轮评论请求量硬上限」护栏
 
 ### 背景（为什么「改了还是一样触发风控」）

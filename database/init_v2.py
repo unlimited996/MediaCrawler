@@ -110,11 +110,6 @@ CONFIG_ITEMS: List[Dict] = [
     dict(group="risk", key="static_proxy_url", label="静态代理地址", value_type="string",
          default="", regex=r"^https?://", timing="next_task", weight=25, advanced=True,
          desc="形如 http://user:password@host:port"),
-    dict(group="risk", key="risk_cooldown_hours", label="风控冷却时长", value_type="int",
-         default="6", min=0, max=168, timing="next_task", weight=30, unit="小时",
-         desc="一轮任务因验证码/限流（461/471）熔断后，同平台（同账号）在这段时间内"
-              "不再发起新任务。平台惩罚窗口以小时计，冷却期内继续跑只会越推越死；"
-              "0 = 不启用冷却"),
     # ---------------- browser ----------------
     dict(group="browser", key="enable_browser", label="启用浏览器", value_type="bool",
          default="true", timing="next_task", weight=5,
@@ -197,6 +192,16 @@ CONFIG_ITEMS: List[Dict] = [
     dict(group="xhs_backup", key="xhs_comment_count_margin", label="评论数余量", value_type="int",
          default="30", min=0, max=10000, timing="next_task", weight=30, unit="条",
          desc="判定评论是否抓全时，允许比声明数少这么多条仍算完整，容忍平台计数延迟"),
+    dict(group="xhs_backup", key="xhs_detail_budget_per_round", label="单轮详情请求预算", value_type="int",
+         default="25", min=0, max=200, timing="next_task", weight=35, unit="次",
+         desc="单轮最多发起多少篇笔记详情请求（点赞/收藏备份每篇=1次请求）。"
+              "小红书按『单轮累计请求量』限流，约 80 次即触发 461；本预算在撞 461 之前"
+              "主动停手，剩余帖子留到下一轮。0 = 不限制（回到旧行为，有撞 461 风险）"),
+    dict(group="xhs_backup", key="xhs_comment_budget_per_round", label="单轮评论请求预算", value_type="int",
+         default="20", min=0, max=200, timing="next_task", weight=40, unit="次",
+         desc="单轮最多打多少次评论接口（主评论+楼中楼都算）。与『详情预算』合计应"
+              "稳定低于 ~80 才安全：默认 25+20+列表≈9 ≈ 54。两者之和别超过 ~75。"
+              "0 = 不限制（有撞 461 风险）"),
 ]
 
 
@@ -278,6 +283,16 @@ async def _seed(session: AsyncSession) -> Dict[str, int]:
         await ensure_seed_config(session)
     except Exception as e:
         print(f"[init_v2] S3 种子配置跳过: {e}")
+
+    # 清理已废弃的配置项（2026-11-02：风控冷却闸口已移除，
+    # risk_cooldown_hours 不再有任何读取方，从页面与库中删掉避免误导）
+    try:
+        dead = await session.execute(
+            select(CrawlConfigItem).where(CrawlConfigItem.cfg_key == "risk_cooldown_hours"))
+        for row in dead.scalars().all():
+            await session.delete(row)
+    except Exception as e:
+        print(f"[init_v2] 清理 risk_cooldown_hours 跳过: {e}")
 
     # S3 / 媒体备份表登记（2026.10.2）
     ver2 = (await session.execute(

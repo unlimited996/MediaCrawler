@@ -25,9 +25,12 @@ class TaskOptions(BaseModel):
     2026-10-29 就因此连续踩了两次：
       - `max_notes`（本次抓取上限）丢弃 → 用户填了 100 仍按默认跑，
         「设了上限却只更新 20 篇」的真因（当时只改了 _normalize_options，
-        其实请求在 schema 层就被吃掉了，改动等于没生效）；
-      - `ignore_risk_cooldown` 同理 → 勾了保存也不生效。
+        其实请求在 schema 层就被吃掉了，改动等于没生效）。
     现在显式声明 + `extra="allow"` 兜底，避免以后再静默吞掉新选项。
+
+    注：原 `ignore_risk_cooldown`（风控冷却豁免）已于 2026-11-02 随冷却闸口
+    一并移除——平台限流改由单轮请求预算护栏在撞 461 之前主动停手，
+    不再需要「强制绕过冷却」的开关。
     """
     model_config = ConfigDict(extra="allow")
 
@@ -48,9 +51,6 @@ class TaskOptions(BaseModel):
     max_notes: Optional[int] = Field(default=None, ge=1, le=10000)
     #: 抓取模式（顶层 mode 列才是主来源，这里仅兼容存进 options 的情况）
     mode: Optional[str] = None
-    #: 风控冷却豁免：撞验证码/限流熔断后，同账号在 risk_cooldown_hours 内
-    #: 默认不再发起任务；勾上则允许本次强制执行（会优先弹浏览器让人工过验证）
-    ignore_risk_cooldown: bool = False
 
 
 class ScheduledTaskCreate(BaseModel):

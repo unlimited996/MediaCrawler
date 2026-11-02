@@ -269,6 +269,22 @@ def build_crawler_env(task: Dict[str, Any]) -> Dict[str, str]:
     env["PYTHONUNBUFFERED"] = "1"
     env["MAX_CONCURRENCY_NUM"] = str(int(task.get("max_concurrency") or 1))
     env["CRAWLER_MAX_SLEEP_SEC"] = str(float(task.get("rate_interval_sec") or 3))
+    # 单轮请求预算护栏（详情 + 评论）：从配置管理页（crawl_config_item）读取，
+    # 落库值优先，回退到 config/xhs_config 常量。注入环境变量后，爬虫子进程
+    # 的 config.xhs_config 在 import 时用 _env_int 覆盖默认值，页面改值即时生效。
+    if task.get("platform") == "xhs":
+        try:
+            from config import xhs_config as _xc
+            from config.runtime_config import runtime_config
+
+            env["XHS_DETAIL_BUDGET_PER_ROUND"] = str(
+                runtime_config.get_int("xhs_detail_budget_per_round",
+                                      _xc.XHS_DETAIL_BUDGET_PER_ROUND))
+            env["XHS_COMMENT_BUDGET_PER_ROUND"] = str(
+                runtime_config.get_int("xhs_comment_budget_per_round",
+                                      _xc.XHS_COMMENT_BUDGET_PER_ROUND))
+        except Exception as e:
+            print(f"[build_crawler_env] 读取小红书预算配置失败，回退常量: {e}")
     if task.get("task_type") == "account":
         # 账号维度：行为来源（点赞/收藏）由任务选项决定，经环境变量传给爬虫
         opts = task.get("options") or {}

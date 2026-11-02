@@ -38,10 +38,6 @@ def _normalize_options(opts: Dict[str, Any]) -> Dict[str, Any]:
         "max_notes": opts.get("max_notes"),
         # 抓取模式：顶层 task.mode 列才是主来源，这里仅兼容存进 options 的情况
         "mode": opts.get("mode"),
-        # 风控冷却豁免：撞验证码/限流熔断后，同账号在 risk_cooldown_hours 内
-        # 默认不再发起；勾了这个选项才允许本次强制跑（2026-10-29）。
-        # 同样必须显式保留 —— 白名单会静默丢弃未知键，用户勾了也存不住。
-        "ignore_risk_cooldown": bool(opts.get("ignore_risk_cooldown", False)),
     }
     # 未知键原样透传。这里是「schema → 归一化 → 落库」的第三道白名单，
     # 任何一层把字段吞掉，表现都是「前端填了/勾了，保存后毫无变化」，
@@ -161,17 +157,17 @@ async def toggle_task(task_id: int, payload: Dict[str, Any] = Body(default={})):
 
 
 @router.post("/tasks/{task_id}/run")
-async def run_task(task_id: int, force: bool = False):
+async def run_task(task_id: int):
     """立即手动执行一次（不影响调度周期）。
 
-    force=True 表示本次忽略风控冷却强制执行：冷却期内（撞过验证码/限流）
-    默认会直接跳过，手动点运行时可用 force 绕过；若仍撞验证码，
-    爬虫会弹出浏览器等你人工过验证。
+    注：原 `force`（忽略风控冷却）参数已随冷却闸口移除（2026-11-02）。
+    平台限流改由单轮请求预算护栏在撞 461 之前主动停手，正常调度不再被
+    「冷却期内禁止发起」拦截，手动运行即立即开跑。
     """
     task = await task_scheduler.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    result = await task_scheduler.trigger(task_id, force=force)
+    result = await task_scheduler.trigger(task_id)
     return result
 
 

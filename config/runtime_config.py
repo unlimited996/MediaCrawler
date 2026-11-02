@@ -37,7 +37,6 @@ LEGACY_FALLBACK: Dict[str, str] = {
     "ip_proxy_provider_name": "IP_PROXY_PROVIDER_NAME",
     "ip_proxy_pool_count": "IP_PROXY_POOL_COUNT",
     "static_proxy_url": "STATIC_PROXY_URL",
-    "risk_cooldown_hours": "RISK_COOLDOWN_HOURS",
     "headless": "HEADLESS",
     "save_login_state": "SAVE_LOGIN_STATE",
     "enable_cdp_mode": "ENABLE_CDP_MODE",
@@ -62,6 +61,9 @@ LEGACY_FALLBACK: Dict[str, str] = {
     "xhs_comment_backfill_max_comments": "XHS_COMMENT_BACKFILL_MAX_COMMENTS",
     "xhs_comment_max_per_note": "XHS_COMMENT_MAX_PER_NOTE",
     "xhs_comment_count_margin": "XHS_COMMENT_COUNT_MARGIN",
+    # 单轮请求预算护栏（2026-11-02 纳管，原仅在 config/xhs_config.py 以常量存在）
+    "xhs_detail_budget_per_round": "XHS_DETAIL_BUDGET_PER_ROUND",
+    "xhs_comment_budget_per_round": "XHS_COMMENT_BUDGET_PER_ROUND",
 }
 
 
