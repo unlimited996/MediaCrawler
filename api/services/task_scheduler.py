@@ -21,7 +21,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import config
 from config.runtime_config import runtime_config
@@ -293,7 +293,18 @@ class _TaskState:
 
 
 class TaskScheduler:
-    """定时拉取任务调度器（单例，随 API 服务启停）。"""
+    """定时拉取任务调度器（单例）。
+
+    运行位置有两种（2026-11-04 拆分后）：
+      * **worker 进程**（默认）：`runs_in_worker=True`，真正跑 tick + 抓取；
+      * **API 进程**（兼容旧部署，`SCHEDULER_IN_API=1`）：原地跑。
+
+    两种模式下 `trigger()` 行为不同：
+      * 本进程在跑调度（started）→ 直接在进程内 create_task 执行；
+      * 本进程只是 API（未 started）→ 往库里写一条 `queued` 运行记录，
+        由 worker 的 tick 拾取执行。**API 重启不会打断抓取**，因为它根本
+        没持有抓取。
+    """
 
     def __init__(self):
         self._states: Dict[int, _TaskState] = {}
@@ -303,8 +314,30 @@ class TaskScheduler:
         self._loop_task: Optional[asyncio.Task] = None
         self._stopping = False
         self.started = False
+        #: 本实例是否运行在独立执行器（worker）进程里
+        self.runs_in_worker = False
+        #: 实时日志落点：worker 里指向 logs/scheduler_live.jsonl，
+        #: 兼容模式（API 内跑）下为 None → 推 crawler_manager 内存控制台
+        self.log_sink: Optional[Callable[[str, str], None]] = None
         self.last_tick_at: Optional[datetime] = None
         self.last_error = ""
+
+    # ---------- 日志 ----------
+
+    def _emit_log(self, message: str, level: str = "info") -> None:
+        """把执行日志同时送到「文件桥」和（若在同进程）控制台缓冲。"""
+        if self.log_sink is not None:
+            try:
+                self.log_sink(message, level)
+            except Exception:
+                pass
+        try:
+            from .crawler_manager import crawler_manager
+
+            crawler_manager.push_external_log_sync(message, level)
+        except Exception:
+            pass
+
 
     # ---------- 生命周期 ----------
 
@@ -388,6 +421,45 @@ class TaskScheduler:
         except Exception as e:
             self.last_error = f"加载任务失败: {e}"
 
+    async def _pickup_queued(self, limit: int = 10) -> int:
+        """拾取并执行 status='queued' 的运行记录（API 手动触发写入）。
+
+        为什么用库而不是进程内队列：API 与执行器是两个进程，进程内队列在
+        任一方重启后都会丢；落库则天然具备「重启后继续」的语义。
+        """
+        picked: List[tuple] = []
+        try:
+            async with _session() as session:
+                if session is None:
+                    return 0
+                rows = (await session.execute(
+                    select(ScheduledTaskRun)
+                    .where(ScheduledTaskRun.status == "queued")
+                    .order_by(ScheduledTaskRun.id)
+                    .limit(max(1, int(limit)))
+                )).scalars().all()
+                for r in rows:
+                    state = self._states.get(r.task_id)
+                    if state is None:
+                        state = _TaskState()
+                        self._states[r.task_id] = state
+                    # 同一任务上一次还没跑完 → 本轮先不动它（这条继续留在 queued）
+                    if state.running or state.lock.locked():
+                        continue
+                    picked.append((r.id, r.task_id, r.trigger_type or "manual"))
+        except Exception as e:
+            self.last_error = f"查询排队任务失败: {e}"
+            return 0
+
+        for run_id, task_id, trigger in picked:
+            self._emit_log(
+                f"[定时任务#{task_id}] 拾取到排队中的手动触发（run#{run_id}），开始执行")
+            task = asyncio.create_task(
+                self._execute(task_id, trigger=trigger, run_id=run_id))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        return len(picked)
+
     async def _loop(self) -> None:
         tick = max(1, int(config.SCHEDULER_TICK_SEC))
         while not self._stopping:
@@ -402,6 +474,13 @@ class TaskScheduler:
 
     async def _tick(self) -> None:
         self.last_tick_at = cst_now()
+        # 手动触发排队（API 进程写进来的 queued 记录）优先拾取：
+        # 这是「接口与抓取分离」后的主通道 —— API 重启不影响这里，
+        # 因为排队信息在库里，执行器一重启就能接着捞。
+        try:
+            await self._pickup_queued()
+        except Exception as e:
+            self.last_error = f"拾取排队任务失败: {e}"
         try:
             async with _session() as session:
                 if session is None:
@@ -603,13 +682,16 @@ class TaskScheduler:
         一次抓取动辄几十分钟，若在这里同步 await 整轮执行，HTTP 请求会一直
         挂到前端 axios 超时（30s）断开 —— 于是弹「触发失败」，但任务其实
         还在后台跑得好好的，用户白白以为失败了（2026-10-29 修）。
-        改成和 tick 到点触发一致：后台 create_task，立刻给回执；
-        进度与结果看执行记录 / 日志面板。
 
-        注：原 `force`（忽略风控冷却）参数已随冷却闸口一并移除（2026-11-02）：
-        平台限流改由单轮请求预算护栏在撞 461 之前主动停手，不再需要
-        「强制绕过冷却」的开关。
+        **2026-11-04 拆分后**：
+          * 本进程没在跑调度（默认架构：API 只提供接口）→ 往库里写一条
+            `status='queued'` 的运行记录，由 worker 的 tick 拾取执行。
+            这样触发动作只是一次 DB 写入，API 重启完全不影响排队与执行。
+          * 本进程在跑调度（兼容模式 `SCHEDULER_IN_API=1`）→ 进程内后台执行。
         """
+        if not self.started:
+            return await self.enqueue_run(task_id, trigger="manual")
+
         state = self._states.get(task_id)
         if state is None:
             state = _TaskState()
@@ -625,7 +707,63 @@ class TaskScheduler:
         return {"status": "started",
                 "message": "已在后台开始执行，可在下方执行记录查看进度与结果"}
 
-    async def _execute(self, task_id: int, trigger: str = "manual") -> Dict[str, Any]:
+    async def enqueue_run(self, task_id: int,
+                          trigger: str = "manual") -> Dict[str, Any]:
+        """把一次执行请求写入库里排队，等 worker 拾取。
+
+        跨进程语义：API 只负责写 `queued` 记录，抓取由独立执行器负责，
+        所以重启 API 不会打断/丢失触发。
+        """
+        try:
+            async with _session() as session:
+                if session is None:
+                    return {"status": "failed", "message": "数据库不可用"}
+                row = await session.get(ScheduledTask, task_id)
+                if row is None:
+                    return {"status": "failed", "message": "任务不存在"}
+                # 幂等：已有排队中/执行中的记录就忽略本次，避免狂点堆积
+                existing = (await session.execute(
+                    select(ScheduledTaskRun)
+                    .where(ScheduledTaskRun.task_id == task_id,
+                           ScheduledTaskRun.status.in_(("queued", "running")))
+                    .order_by(ScheduledTaskRun.id.desc()).limit(1)
+                )).scalars().first()
+                if existing is not None:
+                    return {
+                        "status": "skipped", "reason": "already_queued",
+                        "run_id": existing.id,
+                        "message": "该任务已有排队中/执行中的记录，本次触发已忽略",
+                    }
+                run = ScheduledTaskRun(task_id=task_id, trigger_type=trigger,
+                                       status="queued", attempt_count=0)
+                session.add(run)
+                await session.commit()
+                rid = run.id
+        except Exception as e:
+            return {"status": "failed", "message": f"排队失败: {e}"}
+
+        # 执行器若没在跑，这里顺手拉起来（不影响已有的抓取）
+        try:
+            from .worker_control import ensure_worker, worker_alive
+
+            if not worker_alive():
+                ensure_worker(auto_spawn=True)
+        except Exception:
+            pass
+
+        return {
+            "status": "queued",
+            "run_id": rid,
+            "message": "已提交给抓取执行器，稍后开始（进度见下方执行记录）",
+        }
+
+    async def _execute(self, task_id: int, trigger: str = "manual",
+                       run_id: Optional[int] = None) -> Dict[str, Any]:
+        """执行一次任务。
+
+        run_id 不为空时表示「复用一条已存在的运行记录」（API 侧写入的
+        `queued` 记录），执行器只把它置为 running 并往下跑，不再新建记录。
+        """
         from .profile_crawler import execute_task
 
         state = self._states.get(task_id)
@@ -633,12 +771,20 @@ class TaskScheduler:
             state = _TaskState()
             self._states[task_id] = state
         if state.lock.locked():
+            # 幂等保护：同任务已在跑，把这条排队记录结掉，避免永远卡 queued
+            if run_id is not None:
+                await self._finish_run(
+                    task_id, run_id,
+                    {"status": "skipped", "new_count": 0, "updated_count": 0,
+                     "skipped_count": 0, "attempts": 0,
+                     "error": "该任务正在执行中，本次触发行已跳过"},
+                    [], mark_task_error=False)
             return {"status": "skipped", "reason": "already_running",
                     "message": "该任务正在执行中，已跳过本次触发（幂等保护）"}
 
         async with state.lock:
             state.running = True
-            run_id = None
+            run_id = run_id
             try:
                 async with _session() as session:
                     if session is None:
@@ -646,13 +792,24 @@ class TaskScheduler:
                     row = await session.get(ScheduledTask, task_id)
                     if row is None:
                         return {"status": "failed", "message": "任务不存在"}
-                    run = ScheduledTaskRun(
-                        task_id=task_id,
-                        trigger_type=trigger,
-                        status="running",
-                        attempt_count=1,
-                    )
-                    session.add(run)
+                    run = None
+                    if run_id is not None:
+                        run = await session.get(ScheduledTaskRun, run_id)
+                    if run is None:
+                        run = ScheduledTaskRun(
+                            task_id=task_id,
+                            trigger_type=trigger,
+                            status="running",
+                            attempt_count=1,
+                        )
+                        session.add(run)
+                    else:
+                        # 复用 API 写下的排队记录：现在真正开始跑
+                        run.status = "running"
+                        run.started_at = utc_now()
+                        run.finished_at = None
+                        run.error_message = None
+                        run.attempt_count = max(1, int(run.attempt_count or 0))
                     row.status = "running"
                     await session.commit()
                     run_id = run.id
@@ -704,23 +861,19 @@ class TaskScheduler:
                         log_lines.append(f"[{level}] {msg}")
                         if len(log_lines) > 200:
                             del log_lines[: len(log_lines) - 200]
-                        # 同步到 WebUI 控制台，手动抓取和定时任务一个视图看
-                        try:
-                            from .crawler_manager import crawler_manager
-                            crawler_manager.push_external_log_sync(
-                                f"[定时任务#{task_id}] {msg}", level)
-                        except Exception:
-                            pass
+                        # 执行日志同时进「文件桥」（worker 进程）与内存控制台
+                        # （兼容模式），保证 WebUI 控制台手动抓取/定时任务同视图
+                        self._emit_log(f"[定时任务#{task_id}] {msg}", level)
 
                     # 同平台 + 同登录态串行：前面还有任务没跑完就排队等。
                     # 明确不做的事：不 kill、不 cancel、不停掉正在运行的任务 ——
                     # 那个任务跑完释放执行权后，排队的才会开跑（2026-10-29）。
                     queue_key = self._queue_key(task_dict)
 
-                    # 注：原「风控冷却闸口」已于 2026-11-02 移除。平台限流改由
-                    # 单轮请求预算护栏（XHS_DETAIL_BUDGET_PER_ROUND /
-                    # XHS_COMMENT_BUDGET_PER_ROUND）在撞 461 之前主动停手，
-                    # 不再用「几小时内禁止发起」的硬冷却拦截正常调度。
+                    # 注：原「风控冷却闸口」已于 2026-11-02 移除；单轮请求数量
+                    # 上限（详情/评论预算）也于 2026-11-03 移除。平台限流现由
+                    # 「慢速随机间隔 + 撞 461 退避并断点续抓」承担，不再用硬冷却
+                    # 或硬砍数量来拦截正常调度。
                     if await self._acquire_slot(queue_key, on_log=_on_log):
                         try:
                             # 反风控：任务真正发起前随机抖动 1-5s。
@@ -832,8 +985,38 @@ class TaskScheduler:
                     task.next_run_at = self._compute_next(task)
                 await session.commit()
                 await self._trim_runs(session, task_id)
+                self._notify_data_service(task_id, run_id, summary)
         except Exception as e:
             self.last_error = f"写运行记录失败: {e}"
+
+    @staticmethod
+    def _notify_data_service(task_id: int, run_id: Optional[int],
+                             summary: Dict[str, Any]) -> None:
+        """把「一轮跑完」的事件推给 data 服务（跨服务调用，走 Nacos 发现）。
+
+        设计成**旁路**：data 服务没起、Nacos 没配，都只打一行日志，
+        绝不影响抓取本身；放到线程里跑，避免阻塞事件循环。
+        """
+        async def _bg() -> None:
+            try:
+                from . import discovery
+
+                await asyncio.to_thread(
+                    discovery.notify_data_service, "run_finished", {
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "status": summary.get("status"),
+                        "new_count": int(summary.get("new_count") or 0),
+                        "updated_count": int(summary.get("updated_count") or 0),
+                        "error": (summary.get("error") or "")[:200],
+                    })
+            except Exception:
+                pass
+
+        try:
+            asyncio.create_task(_bg())
+        except Exception:
+            pass
 
     async def _trim_runs(self, session, task_id: int) -> None:
         """每个任务只保留最近 SCHEDULER_RUN_HISTORY 条运行记录。"""
@@ -855,12 +1038,28 @@ class TaskScheduler:
 
     @staticmethod
     def _channel_busy() -> bool:
-        """抓取通道是否被手动抓取占用。"""
+        """抓取通道是否被别人占着（手抓 or 另一个进程的抓取）。
+
+        拆分后执行器与 API 是两个进程，进程内的 `crawler_manager.is_running()`
+        已经看不全了，所以再加一层跨进程标记（`logs/.crawl_channel.json`）：
+        谁在真正抓取，谁就登记 pid；这里的 pid 是自己就忽略（自己不算占）。
+        """
         try:
             from .crawler_manager import crawler_manager
-            return crawler_manager.is_running()
+
+            if crawler_manager.is_running():
+                return True
         except Exception:
-            return False
+            pass
+        try:
+            from tools.proc_lock import read_channel
+
+            info = read_channel()
+            if info and int(info.get("pid") or 0) != os.getpid():
+                return True
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     async def _check_storage(task: Dict[str, Any]) -> Optional[str]:
@@ -875,6 +1074,7 @@ class TaskScheduler:
 
     async def get_status(self) -> Dict[str, Any]:
         running = sum(1 for s in self._states.values() if s.running)
+        queued = 0
         try:
             async with _session() as session:
                 if session is None:
@@ -886,16 +1086,44 @@ class TaskScheduler:
                     enabled = (await session.execute(
                         select(func.count()).select_from(ScheduledTask)
                         .where(ScheduledTask.enabled.is_(True)))).scalar() or 0
+                    queued = (await session.execute(
+                        select(func.count()).select_from(ScheduledTaskRun)
+                        .where(ScheduledTaskRun.status == "queued"))).scalar() or 0
         except Exception:
             total = enabled = 0
+
+        # 执行器（worker）状态：本进程在跑调度时就是自己
+        worker: Dict[str, Any] = {"alive": bool(self.started), "pid": None,
+                                  "started_at": None}
+        if not self.started:
+            try:
+                from .worker_control import worker_info
+
+                worker = worker_info()
+            except Exception:
+                pass
+
+        if self.runs_in_worker:
+            mode = "worker"
+        elif self.started:
+            mode = "inline"          # 兼容模式：调度跑在 API 进程内
+        elif worker.get("alive"):
+            mode = "worker"          # 接口进程，抓取由独立执行器负责
+        else:
+            mode = "offline"         # 执行器没在跑：触发会排队但不会被执行
+
         return {
             "started": self.started,
+            "mode": mode,
+            "worker": worker,
+            "worker_alive": bool(worker.get("alive")),
             "enabled": bool(config.SCHEDULER_ENABLED),
             "max_concurrency": int(config.SCHEDULER_MAX_CONCURRENCY),
             "tick_sec": int(config.SCHEDULER_TICK_SEC),
             "total_tasks": int(total),
             "enabled_tasks": int(enabled),
             "running_tasks": running,
+            "queued_runs": int(queued),
             "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
             "last_error": self.last_error,
         }

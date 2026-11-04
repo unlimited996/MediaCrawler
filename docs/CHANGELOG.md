@@ -5,6 +5,346 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-04] 变更 按服务名拆分为 crawler / data 两个独立应用（Nacos 注册发现 + 双镜像流水线）
+
+### 背景
+- 原来「爬虫 + 数据增删改查」混在一个 FastAPI 应用里：接口与抓取同生共死，
+  没法独立扩缩容/独立重启，也没法分别发版。
+
+### 变更
+- **两个独立应用**（同一份代码，不同入口）：
+  * `api/crawler_app.py` → `/crawler/api/**`（抓取/调度/账号/抓取配置/日志 WS），默认 8001；
+  * `api/data_app.py` → `/data/api/**`（故事/评论/导出/标签/S3/菜谱/配置），默认 8081，
+    并**内置网关**：把 `/crawler/**` 按服务名转发给 crawler，同时托管前端静态页。
+  * 一体化入口 `api/main.py` 保留，并把同一批路由**额外挂到 `/crawler/api`、`/data/api`**，
+    本地单进程开发与线上两服务用同一份前端。
+- **Nacos 注册发现**（`tools/nacos_client.py` + `api/services/discovery.py`）：
+  零第三方依赖的 v1 OpenAPI 客户端（注册/心跳/摘除/发现/可选鉴权）；
+  服务名 `mediacrawler-crawler` / `mediacrawler-data`；Nacos 不可用时自动回退静态地址，
+  **不影响可用性**。
+- **跨服务调用**：crawler 每轮跑完 `POST /data/api/internal/events`（异步、超时 5s、失败只打日志）。
+- **前端**：`webui/src/lib/api.ts` 按 URL 首段自动加 `/crawler/api` 或 `/data/api` 前缀，
+  调用方代码不变；WS 改为 `/crawler/api/ws/logs`。
+- **Docker**：`Dockerfile` 改为多目标（`crawler` / `data` / `all`），入口脚本按 `APP_ROLE`
+  决定是否同容器拉起 worker，并把 stdout 同时写入 `/app/logs/<role>.console.log`。
+- **编排**：新增 `docker-compose.split.yml`（两服务 + 日志/环境变量/登录态/数据全部挂载）。
+- **CI**：`.github/workflows/build-push.yml`，push 触发矩阵构建两个镜像并推送到
+  `ccr.ccs.tencentyun.com/<ns>/mediacrawler-{crawler,data}`；缺密钥时降级为「只构建不推送」。
+- 新增 `tests/test_service_split.py`（5 项契约测试）与 `docs/DEPLOY_SPLIT.md`。
+
+### 兼容性
+- 旧路径 `/api/**` 在单体入口下仍然可用；拆分部署下需改用 `/crawler/api` 或 `/data/api`。
+- `GET /api/config/options` 移入 `config_admin` 路由（crawler 域），接口行为不变。
+
+## [2026-11-04] 变更 抓取执行器与接口进程彻底分离（互不影响重启）
+
+### 背景
+- 原来 FastAPI 进程既提供接口，又跑定时调度 + 抓取子进程：重启 API 会打断
+  跑了几小时的抓取；起第二个实例还会执行「恢复残留 running 记录」，把对方
+  正在跑的记录误标成 failed。
+
+### 变更
+- 新增 `worker.py`：独立**抓取执行器**进程（`python -m worker`），独占
+  `logs/.worker.lock`（单实例），跑 `task_scheduler` + 抓取子进程，不提供 HTTP。
+- `SCHEDULER_IN_API`（默认 **0**）：API 启动时不再把调度循环塞进自身，只确保
+  执行器在线（`WORKER_AUTO_SPAWN=1` 时自动 detached 拉起）。设 1 回到旧行为。
+- 两个进程只通过「数据库 + 日志文件」通信：
+  * 手动触发 → API 往 `scheduled_task_run` 写一条 `status='queued'`；
+  * worker 每 tick 拾取 `queued` 记录执行（带同任务幂等保护）；
+  * worker 实时日志写 `logs/scheduler_live.jsonl`，`/api/crawler/logs` 跨进程读取合并。
+- 新增 `tools/proc_lock.py`：OS 文件锁 + PID 探活（Windows 上不能用
+  `os.kill(pid,0)`，会真的杀进程，改走 OpenProcess/GetExitCodeProcess）；
+  抓取通道标记 `logs/.crawl_channel.json` 让「API 手动抓取」与「执行器抓取」
+  互相看得见，避免两个浏览器同时打同一账号。
+- `/api/scheduler/status` 增加 `mode`（worker/inline/offline）、`worker`、`worker_alive`、`queued_runs`。
+- Docker：`docker-entrypoint.sh` 在容器内额外后台起一份 worker（`WORKER_ENABLED=0` 可关）。
+
+### 行为
+- 重启 API → 执行器与其正在跑的抓取**不受影响**（实测 worker pid 不变）。
+- 重启执行器 → 接口不掉线；未完成帖靠断点续抓在下一轮继续。
+- 执行器不在线时手动触发会「排队」，等执行器上线后自动执行（不再静默失败）。
+
+## [2026-11-04] 修复 任务仍在执行但执行记录显示失败（第二个后端实例误杀）
+
+### 现象
+- 8081 上的爬虫子进程仍在跑（评论持续入库），但最新执行记录显示 failed。
+
+### 根因
+- 同一项目目录下还有**另一个后端实例（端口 8082，来自另一个 WorkBuddy 会话）**，
+  与 8081 共用同一个 PostgreSQL。
+- 它的启动恢复 `task_scheduler._recover_stale_runs()` 会把**所有** `status=running`
+  的运行记录标记为 failed（"服务重启，执行中断"）；但 8081 的子进程并没有被杀，
+  继续在跑 → 记录失败、任务照跑。
+- 另：scheduler tick 报 `asyncpg.ConnectionDoesNotExistError`（连接被中途掐断）。
+
+### 修复
+- `api/main.py` 新增**单实例锁**（OS 文件锁 `logs/.api_instance.lock`，进程退出自动释放）：
+  第二个实例拿不到锁 → 只提供 API、**不启动调度器**，不会再误杀运行记录。
+- `database/db_session.py` 引擎加 `pool_pre_ping=True` + `pool_recycle=1800`，
+  防连接被服务端/中间层掐断。
+- 注：需重启后端才生效；为避免打断仍在跑的 run#135 子进程，本次未重启 8081。
+
+## [2026-11-04] 修复 跑了几小时却显示「补进 0 条评论 / 无新增刷新」
+
+### 现象
+- run#135 实跑 **286 分钟**（≈4.8h），期间评论库真实新增 **~3156 条**，
+  但运行记录 `new=0 updated=0`，UI「统计明细」显示「补进 0 条 / 无新增或刷新」。
+
+### 根因
+- `get_run_crawl_stats()` / `get_run_crawl_detail()` 只用 `chapter.ext.crawled_at`
+  是否落在执行窗内来判定「本轮动过哪些帖」。
+- 2026-11-03 起「待补帖跳过详情、直接用存量 token 拉评论」，`crawled_at`
+  （只在详情 upsert 时写）不再更新 → 统计认为本轮没动任何帖 → 0。
+- 数据其实已正常入库，纯粹是**统计归属口径**问题。
+
+### 修复
+- 两个统计函数增加「按 `Comment.created_at` 落在 `[start,end]`」归属：
+  有评论入库的 story 即视为本轮动过（`crawled_at` 作补充），取并集。
+- 验证：run#135 按新口径回算 = 刷新 4 篇、本轮补进 **3180 条**（如 3240→6128）；
+  已回填该历史运行记录的 `stats_json/new_count/updated_count`。回归 51 项全过。
+
+## [2026-11-04] 新增 穿插式抓取（评论翻页穿插详情/回首页滚动，撞 461 先穿插重试）
+
+### 背景（用户判断）
+- 风控根因不只是「请求量」，更是「长时间只打同一个接口」的机器画像。真人会在评论
+  之间回首页、滚信息流、再看详情。所以应在评论翻页中**穿插其他动作**，撞 461 时
+  先穿插几次再重试，而不是直接放弃。
+
+### 变更
+- 新增 `anti_risk.human_interlude(page, base_url, scrolls)`：回首页 + 滚动几下
+  （无浏览器时退化为短暂休眠）。
+- `client.get_note_all_comments` 阶段一：每 N 页评论插入一次
+  `_interleave_diversion`（拉一次 `/v1/feed` 详情 + 回首页滚动），打断单一接口画像。
+- `core.get_comments` 撞 461：先「回首页+滚动+拉详情 → 重试评论接口」最多 N 次
+  （**每次从上次断点续，不重头翻**），全失败才弹窗等人工验证。
+- 配置页新增「每N页穿插一次」(默认 4)、「461穿插重试次数」(默认 3)；env
+  `XHS_INTERLEAVE_EVERY_PAGES` / `XHS_461_INTERLEAVE_RETRIES`，已播种+注入。
+
+### 验证
+- 配置页 4/3，`build_crawler_env` 注入 4/3；回归 51 项全过。保留间隔 35-55s、
+  验证码人工等待 300s、窗口必现。
+
+## [2026-11-04] 修正 撞验证码必须弹可见窗口等人工（撤销「快速失败」）
+
+### 用户反馈
+- 「为什么要裸 461 快速失败？我要的就是手动输入过验证，但一直没看到验证码弹出来就停止抓取了。」
+
+### 修正
+- **撤销**上一条「裸 461/471 快速熔断」：删除 `_is_bare_rate_limit()` 及提前 return。
+  撞 461 一律走 `_human_verify`（弹窗 + 等待），不再替用户决定放弃。
+- `XHS_CAPTCHA_WAIT_SEC` 30 → **300s**（配置页「验证码人工等待」可调大），留足人工时间。
+- **窗口必现**：`_human_verify` 改为**一律另开专用可见窗口**（`headless=False`），
+  不再复用不可靠的主浏览器（CDP 回退的无头实例 / 后台窗口，用户常看不到）。
+- 专用窗口**继承主浏览器实时 Cookie**（优先于 config.COOKIES），避免弹出未登录页。
+
+### 保留
+- 抓取间隔 35-55s（慢速抓全，降低累计请求量）保持不变。
+
+## [2026-11-04] 修复 连续触发 461 风控（慢速抓全 + 裸 461 快速熔断）
+
+### 现象（run#132/133/134）
+- 三次评论抓取均 461，**成功篇数 5 → 2 → 0 递减**；run#134 150 篇全失败，
+  却跑了 77 分钟。账号在惩罚态被反复捶，越捶越死。
+
+### 根因
+1. **间隔太快**：评论翻页 5-15s，小时内可发 240-720 次评论请求，远超小红书
+   「累计请求量」阈值 → 必然 461。
+2. **撞 461 后仍弹窗等 300s 人工验证**（无人值守时纯空转），期间继续捶号；
+   成功数逐轮下降即惩罚升级的表现。
+
+### 修复
+- **抓取间隔 5-15s → 35-55s**（配置页 `抓取间隔下限/上限`，env `XHS_SLEEP_MIN/MAX_SEC`），
+  把小时请求量压到阈值内，实现「慢速抓全」而非撞线。
+- **验证码等待 300s → 30s**（配置页 `验证码人工等待`，env `XHS_CAPTCHA_WAIT_SEC`）；
+  并从配置页注入子进程（`build_crawler_env`）。
+- **裸 461/471（无验证页）快速熔断**：`_is_bare_rate_limit()` 判定后不弹窗、不等待，
+  直接结束本轮；只有真验证码页才走人工验证。杜绝 77 分钟空转。
+- 新增 3 个配置项种子（`init_v2 postgres` 播种）+ `runtime_config` 映射 + env 注入。
+
+### 验证
+- 配置页显示 35/55/30；`build_crawler_env` 注入 35.0/55.0/30；子进程解析一致；
+  裸 461→快速熔断、真验证码→人工验证。回归 51 项全过。
+
+## [2026-11-03] 变更 待补帖直接用存量 token 抓评论，跳过逐篇详情
+
+### 现象
+- 待补 157 篇时，仍逐篇 `get_note_detail_async_task` + 每篇 5-15s「详情间隔」，
+  光详情就要 ~24 分钟才轮到评论。用户要求直接拉数据。
+
+### 变更（`core.get_account_behavior_notes`）
+- 待补帖不再排详情任务，改为收集 `(note_id, xsec_token)` 直接并入
+  `batch_get_note_comments`（详情/正文/媒体早已在库，只缺评论）。
+- 汇总日志改为「新增详情 N + 待补直连评论 M」；列表为空/页面兜底判断同步修正。
+
+### 兼容（token 可能过期）
+- `batch_get_note_comments(..., backfill_ids=)` + `get_comments(..., fallback_detail=True)`：
+  待补帖评论失败（RetryError/登录失效）时，回退拉一次该帖详情换新 token 再试一次
+  （仅单篇、概率低，不影响其它帖）。
+
+### 验证（实跑 run#132）
+- 日志：`新增详情 0 + 待补直连评论 157` → `Begin batch get note comments` →
+  `Begin get note id comments`，**详情间隔出现 0 次**，直接拉评论。回归 51 项全过。
+
+## [2026-11-03] 修复 重跑仍在翻整份列表（私有常量 `config._XHS_...` 取不到）
+
+### 现象
+- 用户重跑任务 27，日志仍在「点赞列表翻页间隔」逐页翻整个点赞列表，不补未完成帖。
+- 日志：`读取已归档列表失败，退回全量模式：AttributeError: module 'config'
+  has no attribute '_XHS_COMMENT_BACKFILL_PER_POST'`；`读取待补帖子失败` 同因。
+- 后果：`get_archived_content_ids`（决定跳过哪些已完成帖）与 `get_backfill_candidates`
+  （选未完成帖）双双崩溃 → 退回「全量模式」→ 每轮从头翻整个列表 + 重抓所有帖。
+
+### 根因
+- `config/base_config.py` 用 `from .xhs_config import *` 导出，星号导入**跳过下划线
+  开头**的名字；`config/__init__` 也不直接导出 xhs_config。故 `config._XHS_COMMENT_
+  BACKFILL_PER_POST` 必然 AttributeError（实测 False）。
+
+### 修复
+- `core.py` 改为 `from config.xhs_config import _XHS_COMMENT_BACKFILL_PER_POST`，
+  两处改用模块级名字，不再走 `config._xxx`。
+- 新增回归 `test_backfill_per_post_constant_not_accessed_via_config_package`。
+
+### 验证（实跑 run#130）
+- 日志：`增量：160 篇未达 90%，跳过 97 篇已达标` → `优先续抓未完成帖子 159 篇
+  （按 note_id 直连，本轮不翻列表）` → `跳过点赞/收藏列表翻页`，**无 AttributeError、
+  无列表翻页间隔**。回归 51 项全过。
+
+## [2026-11-03] 变更 有待补帖时只补它们、不再翻整份列表
+
+### 用户要求
+- 「之前抓到的详情评论没达标，下次执行别再把所有帖子读一遍；优先读未完成的帖子，
+  没有未完成的了再重新拉取列表。」
+
+### 变更（`core.get_account_behavior_notes`）
+- 有待补帖（`backfill_queued>0`）时：本轮**只按 note_id 直连补这些未完成帖**，
+  `list_budget=0` 且**跳过整个点赞/收藏列表翻页**，省掉几十页列表请求，
+  也避免新帖不断涌入待补池。
+- 没有待补帖时：才重新拉列表发现新增。
+- 移除旧的「给新增帖预留 1/5 额度」逻辑（与「待补优先、清空再拉列表」相悖）。
+
+### 修复
+- `get_backfill_candidates` 排除**没有 xsec_token** 的候选：这类帖按 note_id 直连
+  详情会 404，留在待补池会让「有待补」恒成立 → 列表阶段永远不执行 → 新帖永远
+  发现不了（死锁）。现在交给「待补清空后重新拉列表」时带新 token 重新发现。
+
+### 测试
+- 相关回归 50 项全过；实测当前待补 157 篇均已带 xsec_token。
+
+## [2026-11-03] 变更 移除单轮请求数量上限；根治「已完成帖被反复重抓」
+
+### 背景（用户反馈）
+- 「正常爬取就是要慢慢抓取而不是限制抓取数量，不要每次都引入一堆抓取数的限制」。
+- 「抓取了那么多批量结果只入库了一条数据？为什么还抓取那么多已抓取的数据？」
+
+### 数据证据（run#127，手动跑点赞备份）
+- 本轮更新 100 篇，**净新增评论合计仅 1 条**，99 篇 `gained=0`（早已抓全却被重抓）。
+- 真·待补：97 篇已完成（跳过）、158 篇 `fetched=0` 从未抓过评论（声明 500-600 条/篇）。
+- 结论：不是「只入库一条」，而是本轮 99 篇已完成帖被重复抓取、净增量极小，还白打
+  请求把单轮请求量堆到 461。
+
+### 变更
+- 彻底移除「单轮请求数量上限」：`XHS_DETAIL_BUDGET_PER_ROUND` /
+  `XHS_COMMENT_BUDGET_PER_ROUND` 的计数与拦截逻辑（client/core）全部删除，
+  `build_crawler_env` 不再注入这两个 env；配置项标记「已弃用」仅作展示。
+  风控改由「慢速随机间隔 5-15s + 撞 461 退避并断点续抓」承担。
+- `XHS_BEHAVIOR_MAX_NOTES` 支持 `0 = 不限制`（默认改 0）：不限制单轮篇数，
+  待补篇数与评论条数预算同步按「0=不限」处理，去掉隐式总量上限；靠增量跳过已完成帖
+  + 慢速间隔自然收敛，而不是靠硬数量上限截断。
+
+### 修复
+- 根因（已完成帖被反复重抓）：`refresh_comment_completeness` 在「已翻到 has_more=False
+  抓全」或「已抓 >= 平台声明数」时，把 `declared_comment_count` 永久纠正为真实已抓数，
+  完整率置 100%。这样平台声明数虚高（含已删/折叠/私密评论）的帖子不会再被每轮当成
+  「未达标」重抓 —— 下一轮必跳过，彻底终结「抓一堆、净增一条」的浪费。
+
+### 测试
+- 重写 `tests/test_xhs_comment_budget.py`：锁「预算属性/方法已移除」、「无上限下评论
+  必须翻到 has_more=False 抓全」、「build_crawler_env 仍会在任务启动时 refresh()」。
+- 评论/行为/调度相关回归 50 项全过。
+
+## [2026-11-03] 修复 评论续抓进度持久化失败（`save_comment_resume` 误传参）
+
+### 现象
+- 11-03 任务 27 手动跑（00:35→02:36 CST）撞 461：`评论接口触发风控：CaptchaError`，
+  `本轮 100 篇里有 76 篇没抓到评论`。
+- 日志每翻一页评论都刷：`[xhs] 续抓进度持久化失败 ...: save_comment_resume()
+  got an unexpected keyword argument 'skipped_sub_count'`。
+
+### 根因
+- `media_platform/xhs/core.py::_on_progress` 的 `else` 分支调 `save_comment_resume`
+  时**多传了 `skipped_sub_count`** 关键字参数；该函数签名只接受
+  `(platform_code, content_id, top_cursor, top_count, sub_cursors, reached_end)`，
+  多出的参数直接 TypeError → 被 except 兜成 warning，**续抓进度从不落库**。
+- 后果：没抓完的帖下轮从第一页重抓，白打请求、加速累计量撞 461。`skipped_sub_count`
+  本该只给 `save_comment_skipped_sub`（已在其上方单独调用，位置参数 `skipped`）。
+
+### 修复
+- 删掉 `save_comment_resume` 调用里多余的 `skipped_sub_count=int(...)` 三行。
+- 新增契约测试 `tests/test_xhs_comment_budget.py::test_save_comment_resume_signature_contract`
+  （锁 `save_comment_resume` 不接受 skipped 类参数、`save_comment_skipped_sub` 保留）。
+- 评论相关 46 项 + 预算 8 项全过。
+
+### 另：主因是评论预算=0
+- 配置页 `xhs_comment_budget_per_round` 当前仍 = 0（不限制）。用户 11-02 主动改成 0，
+  等于关掉评论接口硬闸，单轮评论请求累积到 ~90 触发 461。**建议填回 20**（默认）。
+
+## [2026-11-02] 修复 平台声明评论数虚高导致达标帖每轮反复重抓（99% 帖进待补池）
+
+### 现象
+- 增量任务把「完成度 99% / 98% / 100%」的帖子也排进待补池反复拉（只补 +4/+3/+2 条），
+  用户预期是「≥90% 跳过、低完成度优先」，看到高完成度帖被抓一脸懵。
+
+### 根因
+- 完整率判据 `is_comment_complete` 只看 `已抓/平台声明数`。小红书平台声明的评论数
+  **普遍虚高**（含已删/折叠/私密评论），实际能翻到 `has_more=False` 抓全的只有更少。
+- 旧逻辑：翻到 `has_more=False`（已抓全）时只 `clear_comment_resume`，**没有标记完成**。
+  于是 `337/400=84% < 90%` → 判「未完成」→ 每轮重拉 → 白打请求 + 撞 461 风险。
+
+### 修复
+- `tools/v2_sync.py` 新增 `COMMENT_FULLY_FETCHED_KEY` 与 `mark_comment_fully_fetched()`：
+  评论翻到 `has_more=False` 时打持久化标记（存在 `chapter.ext`，不在会被清的 resume 里）。
+- 新增统一判据 `is_comment_complete_full(fetched, declared, ext, target_ratio)`，三条命中
+  其一即「完成、可跳过」：①比例达标 ②已标记抓全（视为 100%）③已抓 ≥ 分母（平台少报）。
+  `get_archived_content_ids` / `get_backfill_candidates` 两处跳过判定改用它。
+- `refresh_comment_completeness` 对已抓全帖直接写 `completeness = 1.0`，前端不再显示「差一点」。
+- `media_platform/xhs/core.py::_on_progress`：`reached_end` 时调用 `mark_comment_fully_fetched`。
+
+### 验证
+- 新增回归 `tests/test_xhs_comment_completeness.py::test_comment_fully_fetched_skips_next_round`
+  / `test_fetched_gte_declared_is_complete`；评论相关 46 项全过。
+- 诊断脚本确认：当前待补池「已抓≥分母却仍待补」的假性未达标 = 0 篇，系统为干净稳态。
+
+## [2026-11-02] 修复 单轮预算页改成 0 仍按默认 20 执行（next_task 配置不生效）
+
+### 现象
+- 配置页把「单轮评论请求预算」改成 **0（不限制）** 并保存成功（库里 value=0、
+  version 递增），但下一轮任务日志仍显示「预算上限 20」，实际仍按 20 截断。
+
+### 根因
+- 该配置 `apply_timing = next_task`。`config_admin` 的 PUT/batch 只在编辑了
+  **immediate** 项时才调用 `runtime_config.refresh()`（`need_reload` 门控），
+  所以 next_task 项改完，`runtime_config` 的内存缓存**仍是进程启动时的旧值**（默认 20）。
+- `build_crawler_env` 直接读 `runtime_config.get_int(...)` 这个旧缓存，把 20 注入
+  子进程环境变量，于是「改 0 → 仍 20」。凡是 next_task 类的预算/额度都受此影响。
+
+### 修复
+- `api/services/profile_crawler.py::build_crawler_env` 改为 `async`，在构造 env
+  前先 `await runtime_config.refresh()` 重新从 `crawl_config_item` 拉最新值，
+  保证任务启动时读到的是库里的当前值（next_task 语义 = 下一轮生效）。
+- 唯一调用点 `_run_once` 改为 `env = await build_crawler_env(task)`。
+- 附带收益：所有 next_task 配置项的页面改动都会在本轮任务启动时生效，不再依赖重启。
+
+### 验证
+- 改后直接调用 `build_crawler_env({"platform":"xhs"})`：评论预算注入 `'0'`、
+  详情预算注入 `'25'`（修复前评论会注入 `'20'`）。
+- 子进程侧 `XHS_COMMENT_BUDGET_PER_ROUND=0` → `config.XHS_COMMENT_BUDGET_PER_ROUND = 0`（不限制）。
+- 新增回归 `tests/test_xhs_comment_budget.py::test_build_crawler_env_reads_fresh_db_value_for_next_task`
+  （断言 refresh 被调用一次，且用刷新后的 0 覆盖旧缓存 20）；`tests/` 相关 13 项全过。
+
+### 提醒
+- **0 = 不限制**：评论接口硬闸关闭后，单轮累计评论请求会重新冲到 ~90 并再次触发
+  461。若要长期稳定，建议填 **20**（默认）；详情 25 + 评论 20 + 列表 ≈ 9 ≈ 54，留足余量。
+
 ## [2026-11-02] 清理冗余旋钮「每篇预留评论额度」
 
 ### 背景

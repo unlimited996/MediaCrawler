@@ -341,3 +341,39 @@ async def update_batch(payload: BatchPayload):
             pass
 
     return _ok({"updated": updated, "failed": failed, "rolled_back": False})
+
+
+@router.get("/options")
+async def get_config_options():
+    """抓取配置页的下拉选项（登录方式/抓取类型/可用存储方式）。
+
+    `save_options` 按「此刻是否真的能用」动态探测（见 services/storage_probe）：
+    没配或连不上的数据库不出现，避免用户选了就报错。
+    拆分成独立服务后这个接口归属 crawler 服务（配置属于抓取域）。
+    """
+    from ..services.storage_probe import available_save_options
+
+    try:
+        storage = await available_save_options()
+    except Exception:
+        # 探测本身失败时退化为"仅文件类"，保证配置页始终可用
+        storage = {"items": [
+            {"value": v, "label": l} for v, l in [
+                ("jsonl", "JSONL File"), ("json", "JSON File"),
+                ("csv", "CSV File"), ("excel", "Excel File"),
+            ]
+        ], "hidden": []}
+
+    return {
+        "login_types": [
+            {"value": "qrcode", "label": "QR Code Login"},
+            {"value": "cookie", "label": "Cookie Login"},
+        ],
+        "crawler_types": [
+            {"value": "search", "label": "Search Mode"},
+            {"value": "detail", "label": "Detail Mode"},
+            {"value": "creator", "label": "Creator Mode"},
+        ],
+        "save_options": storage["items"],
+        "save_options_hidden": storage["hidden"],
+    }

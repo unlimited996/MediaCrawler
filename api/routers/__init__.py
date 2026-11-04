@@ -27,10 +27,13 @@ from .accounts import router as accounts_router
 from .scheduler import router as scheduler_router
 from .stance_tags import router as stance_tags_router
 from .s3_backup import router as s3_backup_router
+from .recipe import (
+    app_config_router, media_router, router as recipe_router,
+)
 
 __all__ = [
     "crawler_router", "data_router", "websocket_router",
     "export_router", "config_router", "story_router", "discover_router",
     "accounts_router", "scheduler_router", "stance_tags_router",
-    "s3_backup_router",
+    "s3_backup_router", "recipe_router", "media_router", "app_config_router",
 ]

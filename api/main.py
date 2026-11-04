@@ -37,10 +37,52 @@ import config as config_module
 
 from .routers import (crawler_router, data_router, websocket_router, export_router,
                       config_router, story_router, discover_router, accounts_router,
-                      scheduler_router, stance_tags_router, s3_backup_router)
+                      scheduler_router, stance_tags_router, s3_backup_router,
+                      recipe_router, media_router, app_config_router)
 
 # Project root directory (used for running subprocesses like uv run main.py)
 PROJECT_ROOT = Path(__file__).parent.parent
+
+# ---- 单实例锁 ----------------------------------------------------------------
+# 两个后端实例共用同一个库会互相误伤：后启动的实例在启动恢复
+# (`task_scheduler._recover_stale_runs`) 里会把「所有 running 的运行记录」标记为
+# failed（"服务重启，执行中断"），但对方实例的子进程仍活着 —— 表现为
+# 「任务还在执行，执行记录却显示失败」（2026-11-04 实际发生）。
+# 用 OS 文件锁做单实例保护：拿不到锁的实例只提供 API，不启动调度器。
+_INSTANCE_LOCK_FH = None
+
+
+def _acquire_instance_lock() -> bool:
+    """独占 logs/.api_instance.lock；True=主实例，False=已有实例在跑。
+
+    锁由操作系统持有，进程退出自动释放，不会留下"僵尸锁"。
+    """
+    global _INSTANCE_LOCK_FH
+    try:
+        lock_path = PROJECT_ROOT / "logs" / ".api_instance.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "a+")
+        # 确保至少有 1 字节可锁（空文件在部分平台锁不上）
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write("0")
+            fh.flush()
+        fh.seek(0)
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        _INSTANCE_LOCK_FH = fh  # 持有到进程退出
+        return True
+    except Exception as e:
+        print(f"[guard] 实例锁异常，按主实例继续：{e}")
+        return True
 
 app = FastAPI(
     title="MediaCrawler WebUI API",
@@ -78,17 +120,38 @@ async def _install_loop_exception_handler():
 
     asyncio.create_task(warmup())
 
-    # 定时拉取任务调度器：建表 + 恢复调度 + 起循环。
-    # 任何失败都不能影响 API 主流程，所以整体 try 包裹。
+    # 定时拉取执行器：2026-11-04 起默认**跑在独立进程**（python -m worker），
+    # API 只提供接口 —— 这样重启 API 不会打断抓取，重启执行器也不会让接口
+    # 掉线。这里只负责「确保执行器在线」，绝不把调度循环塞回 API 进程。
+    # 需要单进程调试时设 SCHEDULER_IN_API=1 回到老行为。
     try:
-        from .services.task_scheduler import task_scheduler
+        if not config_module.SCHEDULER_ENABLED:
+            print("[scheduler] SCHEDULER_ENABLED=0，执行器未启动"
+                  "（手动触发会排队，但没人执行）")
+        elif getattr(config_module, "SCHEDULER_IN_API", False):
+            from .services.task_scheduler import task_scheduler
 
-        if config_module.SCHEDULER_ENABLED:
-            ok = await task_scheduler.start()
-            if not ok:
-                print(f"[scheduler] 启动失败：{task_scheduler.last_error}")
+            if not _acquire_instance_lock():
+                print("[guard] 已检测到另一个后端实例在运行 → 本实例不启动调度器"
+                      "（避免把对方的运行记录误标为失败）。请只保留一个实例。")
+            else:
+                ok = await task_scheduler.start()
+                if not ok:
+                    print(f"[scheduler] 启动失败：{task_scheduler.last_error}")
+                else:
+                    print("[scheduler] 调度器运行在 API 进程内（SCHEDULER_IN_API=1）")
         else:
-            print("[scheduler] SCHEDULER_ENABLED=0，调度器未启动（手动触发仍可用）")
+            from .services.worker_control import ensure_worker, worker_info
+
+            action = ensure_worker(auto_spawn=bool(
+                getattr(config_module, "WORKER_AUTO_SPAWN", True)))
+            info = worker_info()
+            if action == "absent":
+                print("[worker] 抓取执行器未运行 → 手动触发会排队等它上线。"
+                      "启动方式：python -m worker")
+            else:
+                print(f"[worker] 抓取执行器{'已在运行' if action == 'running' else '已拉起'}"
+                      f"（pid={info.get('pid')}），抓取与接口已解耦")
     except Exception as e:
         print(f"[scheduler] 启动异常（不影响 API）：{e}")
 
@@ -169,6 +232,37 @@ async def _install_loop_exception_handler():
     except Exception as e:
         print(f"[s3-backup] 启动失败（不影响 API）：{e}")
 
+    # 菜谱域（KitchenHelper）：建表幂等 + 打印库内统计。
+    # 建表只补缺、不动已有数据；失败不阻断 API（首次访问会给出 503 说明）。
+    try:
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        from config.db_config import resolve_config_db_type
+        from database.db_session import get_async_engine
+        from tools.recipe_import import ensure_schema, verify
+
+        async def _recipe_boot():
+            engine = get_async_engine(resolve_config_db_type())
+            if engine is None:
+                print("[recipe] 非数据库存储，菜谱接口不可用")
+                return
+            try:
+                sch = await ensure_schema(engine)
+                async with AsyncSession(engine, expire_on_commit=False) as s:
+                    rep = await verify(s)
+                c = rep["counts"]
+                print(f"[recipe] 表就绪 {sch['tables']} 张：{c['recipes']} 菜谱 / "
+                      f"{c['ingredients']} 配料 / {c['steps']} 步骤 / "
+                      f"{c['tagLinks']} 标签关联")
+            except Exception as e:
+                print(f"[recipe] 初始化失败（不影响其它 API）：{e}")
+            finally:
+                await engine.dispose()
+
+        asyncio.create_task(_recipe_boot())
+    except Exception as e:
+        print(f"[recipe] 启动任务创建失败（不影响 API）：{e}")
+
 # CORS configuration - allow frontend dev server access
 app.add_middleware(
     CORSMiddleware,
@@ -195,6 +289,31 @@ app.include_router(accounts_router, prefix="/api")
 app.include_router(scheduler_router, prefix="/api")
 app.include_router(stance_tags_router, prefix="/api")
 app.include_router(s3_backup_router, prefix="/api")
+# 菜谱域（KitchenHelper）：/api/recipes、/api/media、/api/app-config
+app.include_router(recipe_router, prefix="/api")
+app.include_router(media_router, prefix="/api")
+app.include_router(app_config_router, prefix="/api")
+
+# 服务名路由兼容（2026-11-04 拆分后）：
+# 前端现在按服务名调用 `/crawler/api/**` 与 `/data/api/**`。单体进程把同一批
+# 路由**再挂一遍**到这两个前缀下，这样本地开发（单进程）和线上（两服务 + 网关）
+# 用的是同一份前端，不需要区分。真正的拆分入口见 api/crawler_app.py / api/data_app.py。
+for _prefix, _routers in (
+    ("/crawler/api", (crawler_router, scheduler_router, accounts_router,
+                      config_router, websocket_router)),
+    ("/data/api", (story_router, data_router, discover_router, export_router,
+                   stance_tags_router, s3_backup_router, recipe_router,
+                   media_router, app_config_router)),
+):
+    for _r in _routers:
+        app.include_router(_r, prefix=_prefix)
+
+try:  # 服务间内部接口（crawler -> data），单体进程里也提供，便于本地联调
+    from .routers.internal import router as _internal_router
+
+    app.include_router(_internal_router, prefix="/data/api")
+except Exception:
+    pass
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -293,41 +412,6 @@ async def get_platforms():
             {"value": "tieba", "label": "Baidu Tieba", "icon": "messages-square"},
             {"value": "zhihu", "label": "Zhihu", "icon": "help-circle"},
         ]
-    }
-
-
-@app.get("/api/config/options")
-async def get_config_options():
-    """Get all configuration options
-
-    save_options 按"此刻是否真的能用"动态探测（见 services/storage_probe）：
-    没配或连不上的数据库不出现，避免用户选了就报错。
-    """
-    from .services.storage_probe import available_save_options
-
-    try:
-        storage = await available_save_options()
-    except Exception as e:
-        # 探测本身失败时退化为"仅文件类"，保证配置页始终可用
-        storage = {"items": [
-            {"value": v, "label": l} for v, l in [
-                ("jsonl", "JSONL File"), ("json", "JSON File"),
-                ("csv", "CSV File"), ("excel", "Excel File"),
-            ]
-        ], "hidden": []}
-
-    return {
-        "login_types": [
-            {"value": "qrcode", "label": "QR Code Login"},
-            {"value": "cookie", "label": "Cookie Login"},
-        ],
-        "crawler_types": [
-            {"value": "search", "label": "Search Mode"},
-            {"value": "detail", "label": "Detail Mode"},
-            {"value": "creator", "label": "Creator Mode"},
-        ],
-        "save_options": storage["items"],
-        "save_options_hidden": storage["hidden"],
     }
 
 

@@ -60,6 +60,12 @@ LEGACY_FALLBACK: Dict[str, str] = {
     "xhs_behavior_incremental": "XHS_BEHAVIOR_INCREMENTAL",
     "xhs_comment_max_per_note": "XHS_COMMENT_MAX_PER_NOTE",
     "xhs_comment_count_margin": "XHS_COMMENT_COUNT_MARGIN",
+    # 抓取节奏 / 验证码等待（2026-11-04 纳管：慢速抓全，避免累计请求量撞 461）
+    "xhs_sleep_min_sec": "XHS_SLEEP_MIN_SEC",
+    "xhs_sleep_max_sec": "XHS_SLEEP_MAX_SEC",
+    "xhs_captcha_wait_sec": "XHS_CAPTCHA_WAIT_SEC",
+    "xhs_interleave_every_pages": "XHS_INTERLEAVE_EVERY_PAGES",
+    "xhs_461_interleave_retries": "XHS_461_INTERLEAVE_RETRIES",
     # 单轮请求预算护栏（2026-11-02 纳管，原仅在 config/xhs_config.py 以常量存在）
     "xhs_detail_budget_per_round": "XHS_DETAIL_BUDGET_PER_ROUND",
     "xhs_comment_budget_per_round": "XHS_COMMENT_BUDGET_PER_ROUND",

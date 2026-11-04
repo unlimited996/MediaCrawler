@@ -194,6 +194,34 @@ async def _show_banner(page, text: str, color: str = "#e11d48") -> None:
         pass  # 页面可能正在导航，打不上横幅不影响等待本身
 
 
+async def human_interlude(page, base_url: Optional[str] = None,
+                          scrolls: int = 3) -> None:
+    """模拟真人操作：返回首页 + 滚动几下（打断「死磕同一接口」的机器画像）。
+
+    小红书的风控很大程度看「请求节奏与形态」——连续几十次只打 comment/page 这一
+    个接口，是最典型的爬虫画像。真人会在评论之间回首页、滚信息流、再看详情。
+    没有浏览器页面时退化为短暂随机休眠（至少不零间隔连打）。
+
+    仅做浏览器侧动作（不产生额外 API 请求，除 page.goto 本身）。
+    """
+    if page is None:
+        await asyncio.sleep(random.uniform(2.5, 5.0))
+        return
+    try:
+        if base_url:
+            await page.goto(base_url, wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(random.uniform(1.2, 2.5))
+        for _ in range(max(0, int(scrolls))):
+            try:
+                await page.mouse.wheel(0, random.randint(600, 1400))
+            except Exception:
+                pass
+            await asyncio.sleep(random.uniform(0.8, 1.8))
+        await asyncio.sleep(random.uniform(1.0, 2.5))
+    except Exception as e:
+        utils.logger.warning(f"[anti_risk] 人类行为穿插失败（忽略）：{e}")
+
+
 async def wait_for_human_verify(page, timeout_sec: int = 300,
                                 poll_sec: float = 5.0,
                                 url: Optional[str] = None,

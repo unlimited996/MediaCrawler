@@ -32,7 +32,8 @@ export function useLogWebSocket() {
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const host = window.location.host
-      const wsUrl = `${protocol}//${host}/api/ws/logs`
+      // 服务拆分后 WS 归属 crawler 服务，URL 里带服务名（网关按前缀转发）
+      const wsUrl = `${protocol}//${host}/crawler/api/ws/logs`
 
       const ws = new WebSocket(wsUrl)
       globalWs = ws

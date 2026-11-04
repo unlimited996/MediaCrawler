@@ -102,12 +102,22 @@ XHS_AUTO_CLOSE_BROWSER = _env_bool("XHS_AUTO_CLOSE_BROWSER", False)
 # 并发数。小红书默认 1：串行请求最像真人，风控最低
 XHS_MAX_CONCURRENCY_NUM = _env_int("XHS_MAX_CONCURRENCY_NUM", 1)
 
-# 抓取请求之间的随机间隔（秒）：每次在 [MIN, MAX] 里随机取一个值
-XHS_SLEEP_MIN_SEC = _env_float("XHS_SLEEP_MIN_SEC", 5)
-XHS_SLEEP_MAX_SEC = _env_float("XHS_SLEEP_MAX_SEC", 15)
+# 抓取请求之间的随机间隔（秒）：每次在 [MIN, MAX] 里随机取一个值。
+# 2026-11-04 调慢（原 5/15）：小红书按「累计请求量」限流，5-15s 一轮很快撞 461；
+# 35-55s 把小时请求量压到阈值内，实现「慢速抓全」而不撞风控。配置页可覆盖。
+XHS_SLEEP_MIN_SEC = _env_float("XHS_SLEEP_MIN_SEC", 35)
+XHS_SLEEP_MAX_SEC = _env_float("XHS_SLEEP_MAX_SEC", 55)
 
-# 触发安全验证时，等待用户人工完成验证的最长时间（秒）
+# 触发安全验证时，等待用户人工完成验证的最长时间（秒）。
+# 用户明确要求「手动过验证」，所以保留 300s（5 分钟）留足人工操作时间；
+# 撞验证码一定会弹可见窗口并等待，不会快速放弃。配置页可调大。
 XHS_CAPTCHA_WAIT_SEC = _env_int("XHS_CAPTCHA_WAIT_SEC", 300)
+
+# 穿插式抓取（2026-11-04）：小红书按「请求形态」识别机器人——连续几十次只打
+# comment/page 一个接口最典型。每翻 N 页评论插入一次「详情(feed 接口) + 回首页滚动」，
+# 打断画像；撞 461 时先穿插几次再重试评论接口，而不是立刻放弃。
+XHS_INTERLEAVE_EVERY_PAGES = _env_int("XHS_INTERLEAVE_EVERY_PAGES", 4)   # 0=不穿插
+XHS_461_INTERLEAVE_RETRIES = _env_int("XHS_461_INTERLEAVE_RETRIES", 3)   # 0=不重试直接熔断
 
 # ---- account 模式（登录用户的点赞 / 收藏）----
 # 「本次抓取上限」：本轮任务最多处理多少篇笔记。**新点赞/收藏 + 已入库待补评论
@@ -163,24 +173,17 @@ XHS_COMMENT_COUNT_MARGIN = _env_int("XHS_COMMENT_COUNT_MARGIN", 30)
 XHS_SUB_COMMENT_MAX_PAGES = _env_int("XHS_SUB_COMMENT_MAX_PAGES", 3)
 
 # ---------------------------------------------------------------------------
-# 单轮请求量硬上限（两道独立止血点，合计必须明显低于触发阈值 ~80-90）。
+# 【2026-11-03 已移除】单轮请求数量上限（XHS_DETAIL_BUDGET_PER_ROUND /
+# XHS_COMMENT_BUDGET_PER_ROUND）。
 #
 # 背景：小红书对账号是**按「单轮累计请求量」**触发限流，不是纯速率。
-# 实测 2026-10-31：评论接口一轮推到 ~90 次就 461；2026-11-02 又发现——「点赞/收藏
-# 备份」类任务每轮要把账号里所有点赞帖的**详情**都拉一遍（一篇 = 一次 note 详情请求），
-# 87 篇点赞帖 = 87 次详情请求，单这一项就超过阈值 → 详情接口直接 461，评论阶段整批
-# 被熔断（现象：「没抓几个评论就触发风控」）。所以详情和评论必须分别设上限。
-#
-# 两道独立预算：
-#   - XHS_DETAIL_BUDGET_PER_ROUND：本轮最多拉多少篇帖子的「详情」（默认 25）。
-#   - XHS_COMMENT_BUDGET_PER_ROUND：本轮最多打多少次「评论接口」（主评论+楼中楼都算，默认 20）。
-# 两者外加列表翻页（约 5-9 次）合计需 < ~80，默认 25+20+列表 ≈ 50，留足余量。
-# 超出部分留到下一轮（任务间隔 10h，滚动窗口不跨轮累积），账号永不进入惩罚态。
-#
-# 取舍：调大能一轮多备份，但 合计 超过 ~80 就会重新撞 461。0 表示不限制（交给熔断+冷却兜底，不推荐）。
+# 但用「硬砍每轮请求数」来规避会与「正常慢速抓全」的诉求冲突，且人为截断单篇
+# 评论导致抓不全。现改为：慢速随机间隔（xhs_sleep_bounds 5-15s）+ 撞 461 时退避并
+# 断点续抓（resume 机制保留进度，下轮接着抓，不重头来），风控不再靠砍数量。
+# 下方常量保留仅作占位，已无任何调用方读取。
 # ---------------------------------------------------------------------------
-XHS_DETAIL_BUDGET_PER_ROUND = _env_int("XHS_DETAIL_BUDGET_PER_ROUND", 25)
-XHS_COMMENT_BUDGET_PER_ROUND = _env_int("XHS_COMMENT_BUDGET_PER_ROUND", 20)
+XHS_DETAIL_BUDGET_PER_ROUND = _env_int("XHS_DETAIL_BUDGET_PER_ROUND", 0)
+XHS_COMMENT_BUDGET_PER_ROUND = _env_int("XHS_COMMENT_BUDGET_PER_ROUND", 0)
 
 # 评论补抓的「篇数」上限已统一到上面的 XHS_BEHAVIOR_MAX_NOTES
 # （即「本次抓取上限」字段），不再单独设值——避免「字段设了 100、补抓却只有 20」
@@ -188,9 +191,7 @@ XHS_COMMENT_BUDGET_PER_ROUND = _env_int("XHS_COMMENT_BUDGET_PER_ROUND", 20)
 
 # 内部常量（**不再暴露为配置旋钮**）：backfill 选帖时按每篇多少条评论预留，
 # 用于估算「本批候选帖的总评论量预算」= 本次抓取上限 × 本值，决定挑哪些帖。
-# ⚠️ 它不是请求量限制（那是 XHS_COMMENT_BUDGET_PER_ROUND 的硬闸），只是选帖启发式。
-# 2026-11-02：原先暴露为「每篇预留评论额度」旋钮，但与「单轮评论请求预算」在
-# 「每轮评论工作量」上重叠、且被其硬闸碾压成死配置，故下掉旋钮、改为内部常量。
+# 它只是选帖启发式，不是请求量限制。
 # （此前硬编码 3000 会导致每轮只补约 8 篇——本值需足够大，使选帖 ≈ 本次抓取上限）
 _XHS_COMMENT_BACKFILL_PER_POST = 4000
 

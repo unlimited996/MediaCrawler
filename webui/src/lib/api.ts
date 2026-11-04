@@ -4,11 +4,33 @@ import type { ScheduledTask, ScheduledTaskRun, SchedulerStatus,
               ScheduledTaskPayload, SchedulerDimensions } from '@/types/scheduler'
 
 const api = axios.create({
-  baseURL: '/api',
+  // 2026-11-04 服务拆分为 crawler / data 两个独立应用后，URL 第一段就是服务名：
+  //   /crawler/api/**  -> 抓取服务（crawler/scheduler/accounts/config）
+  //   /data/api/**     -> 数据服务（stories/data/export/stance-tags/s3-backup/recipes...）
+  // baseURL 交给拦截器拼，调用的地方仍然写 '/stories/xxx' 这种相对路径。
+  baseURL: '',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
   },
+})
+
+/** 归属 crawler 服务的路径首段（其余一律走 data 服务） */
+const CRAWLER_SEGMENTS = new Set(['crawler', 'scheduler', 'accounts', 'config'])
+
+/** 根据路径首段决定加哪个服务名前缀；已带服务名的不重复加。 */
+export function servicePrefix(url: string): string {
+  if (!url.startsWith('/')) return ''
+  if (/^\/(crawler|data)\/api(\/|$)/.test(url)) return ''
+  const seg = url.slice(1).split('/')[0]
+  return CRAWLER_SEGMENTS.has(seg) ? '/crawler/api' : '/data/api'
+}
+
+api.interceptors.request.use((cfg) => {
+  if (cfg.url && cfg.url.startsWith('/')) {
+    cfg.url = servicePrefix(cfg.url) + cfg.url
+  }
+  return cfg
 })
 
 // 把后端返回的具体错误（detail）提升为 error.message，

@@ -23,6 +23,7 @@ from media_platform.xhs.client import XiaoHongShuClient
 from media_platform.xhs.core import _comment_max_count
 from tools.v2_sync import (
     comment_completeness, is_comment_complete, plan_backfill,
+    is_comment_complete_full, COMMENT_FULLY_FETCHED_KEY,
 )
 
 
@@ -60,6 +61,38 @@ def test_risk_control_zero_comments_must_retry():
     # 抓到 38/42 = 90.4% 才算完成
     assert is_comment_complete(38, declared) is True
     assert is_comment_complete(37, declared) is False
+
+
+# ---------------------------------------------------------------------------
+# 2b. 完整率判据（含 ext 策略标记）：is_comment_complete_full
+# ---------------------------------------------------------------------------
+def test_fully_fetched_beats_inflated_declared():
+    """平台声明数虚高（含已删/折叠）时，翻到 has_more=False 抓全即视为完成。
+
+    场景：声明 400、实际只抓到 337（has_more=False），337/400=84% < 90%。
+    若只按比例判，这篇会每轮反复重抓；打了 fully_fetched 标记后应直接跳过。
+    """
+    ext = {COMMENT_FULLY_FETCHED_KEY: True}
+    assert is_comment_complete_full(337, 400, ext) is True
+    # 没打标记时仍按真实比例判（84% 未完成）
+    assert is_comment_complete_full(337, 400, {}) is False
+
+
+def test_fetched_gte_declared_is_complete():
+    """平台少报声明数：已抓 >= 分母时直接算完成，不依赖比例。"""
+    # 声明 200、抓到 200：边界即判完成
+    assert is_comment_complete_full(200, 200, {}) is True
+    # 声明 1000、只抓 199：比例 19.9% < 90% 且 199<1000，两个条件都不满足 → 未完成
+    assert is_comment_complete_full(199, 1000, {}) is False
+    # 声明 1000、抓到 1000：已抓 >= 分母 → 完成（哪怕比例口径因取整而 <90%）
+    assert is_comment_complete_full(1000, 1000, {}) is True
+
+
+def test_fully_fetched_false_does_not_short_circuit():
+    """标记显式为 False 时回落到正常比例判据。"""
+    ext = {COMMENT_FULLY_FETCHED_KEY: False}
+    assert is_comment_complete_full(337, 400, ext) is False
+    assert is_comment_complete_full(380, 400, ext) is True
 
 
 # ---------------------------------------------------------------------------

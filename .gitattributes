@@ -1,3 +1,9 @@
 *.js linguist-language=python
 *.css linguist-language=python
 *.html linguist-language=python
+
+# 容器相关文件必须 LF，否则 Linux 里 `#!/usr/bin/env bash\r` 会报 bad interpreter
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf

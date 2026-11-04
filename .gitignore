@@ -193,3 +193,8 @@ _t_*.log
 _t_recovery/
 # 运行日志（uvicorn / 抓取）
 logs/
+
+# 拆分部署
+deploy/.env
+/data/
+/browser_data/

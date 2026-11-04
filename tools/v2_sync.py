@@ -515,6 +515,32 @@ def is_comment_complete(fetched: int, declared: int,
     return comment_completeness(fetched, declared) >= target_ratio
 
 
+def is_comment_complete_full(fetched: int, declared: int, ext: Any = None,
+                             target_ratio: float = 0.0) -> bool:
+    """完整率判据（含 ext 里的策略性标记），增量跳过判定的统一入口。
+
+    三条命中任一即算「完成、可跳过」：
+      1) 已抓/声明 >= 目标比例（正常路径）；
+      2) ext[COMMENT_FULLY_FETCHED_KEY]：评论已翻到 has_more=False 抓全 ——
+         平台声明数常虚高（含已删/折叠），可抓的都抓到了，直接视为 100%，
+         否则这类帖会每轮反复重抓、白打请求且容易撞 461；
+      3) 已抓 >= 分母：平台少报声明数时，抓到的比声明还多，同样算完成。
+
+    注意：`is_comment_complete` 仍是纯比例判据（单测覆盖）；本函数把它与
+    两条 ext/数量兜底合并，供 get_archived_content_ids / get_backfill_candidates
+    统一调用，避免两处逻辑漂移。
+    """
+    if is_comment_complete(fetched, declared, target_ratio):
+        return True
+    ext = ext or {}
+    if ext.get(COMMENT_FULLY_FETCHED_KEY, False):
+        return True
+    if declared > 0 and fetched >= declared:
+        return True
+    return False
+
+
+
 def plan_backfill(incomplete: List[tuple], backfill_limit: int = 0,
                   backfill_max_comments: int = 0):
     """把「未达标帖子」切成 (本轮补抓, 顺延下一轮) 两份。
@@ -620,7 +646,7 @@ async def get_archived_content_ids(platform_code: str,
                 declared = max(0, declared - int(
                     (ext or {}).get(COMMENT_SKIPPED_KEY, 0) or 0))
                 fetched = int(cmt_count or 0)
-                if is_comment_complete(fetched, declared, target_ratio):
+                if is_comment_complete_full(fetched, declared, ext, target_ratio):
                     ids.add(str(content_id))
                 else:
                     incomplete.append((str(content_id), fetched, declared,
@@ -720,15 +746,22 @@ async def get_backfill_candidates(platform_code: str,
                 declared = max(0, declared - int(
                     (ext or {}).get(COMMENT_SKIPPED_KEY, 0) or 0))
                 fetched = int(cmt_count or 0)
-                if is_comment_complete(fetched, declared, target_ratio):
+                if is_comment_complete_full(fetched, declared, ext, target_ratio):
                     continue
                 cid = str(content_id)
+                token = _extract_xsec_token(ext, source_url or "")
+                if not token:
+                    # 没有 xsec_token：按 note_id 直连详情会 404。留在待补池里会
+                    # 让「有待补」恒成立 → 列表阶段永远不执行 → 新帖永远发现不了
+                    # （死锁）。这里排除它，交给「待补清空后重新拉列表」时带新
+                    # token 重新发现。
+                    continue
                 incomplete.append((cid, fetched, declared,
                                    comment_completeness(fetched, declared)))
                 meta[cid] = {
                     "content_id": cid,
                     "source_url": source_url or "",
-                    "xsec_token": _extract_xsec_token(ext, source_url or ""),
+                    "xsec_token": token,
                     "fetched": fetched,
                     "declared": declared,
                 }
@@ -766,6 +799,13 @@ COMMENT_RESUME_KEY = "comment_resume"
 # 楼中楼深度上限（XHS_SUB_COMMENT_MAX_PAGES）触顶时主动放弃的子评论条数。
 # 完整率分母要扣掉它，否则这些帖永远不达标、每轮白抓。详见 save_comment_skipped_sub。
 COMMENT_SKIPPED_KEY = "comment_skipped_sub"
+
+# 评论已「翻到 has_more=False」抓全的标记（story_chapter.ext）。
+# 小红书平台声明的评论数普遍虚高（含已删/折叠/私密评论），导致「已抓/声明」
+# 永远到不了 90%，本该跳过的帖被每轮反复重抓、白打请求还容易撞 461。
+# 一旦评论翻到 has_more=False，说明可抓的都抓到了，直接视为 100% 完成、
+# 下一轮增量跳过 —— 不再依赖声明数这个不可靠的分母。
+COMMENT_FULLY_FETCHED_KEY = "comment_fully_fetched"
 
 
 async def get_comment_resume(platform_code: str,
@@ -905,6 +945,42 @@ async def save_comment_skipped_sub(platform_code: str, content_id: str,
             f"[v2_sync] 写入楼中楼放弃条数失败 {platform_code}/{content_id}: {e}")
 
 
+async def mark_comment_fully_fetched(platform_code: str, content_id: str) -> None:
+    """标记某帖评论已翻到 has_more=False（全部可抓的都抓到了）。
+
+    与 save_comment_skipped_sub 同理，单独存一个 ext 字段（
+    COMMENT_FULLY_FETCHED_KEY），不放在 comment_resume 里 —— 后者在翻到底时
+    会被 clear_comment_resume 清掉，而这个标记恰恰要在「翻到底之后」继续给
+    增量跳过判定读。
+
+    作用：平台声明评论数虚高（含已删/折叠）时，即使「已抓/声明」< 90%，只要
+    已翻到 has_more=False 就视为 100% 完成、下一轮跳过，避免反复重抓。
+    """
+    if not content_id:
+        return
+    try:
+        async with _v2_session() as session:
+            if session is None:
+                return
+            site_id = await _get_site_id(session, platform_code)
+            if site_id is None:
+                return
+            chapter = (await session.execute(
+                select(StoryChapter).where(
+                    StoryChapter.source_site_id == site_id,
+                    StoryChapter.source_content_id == str(content_id))
+            )).scalar_one_or_none()
+            if chapter is None:
+                return
+            ext = dict(chapter.ext or {})
+            ext[COMMENT_FULLY_FETCHED_KEY] = True
+            chapter.ext = ext
+            await session.commit()
+    except Exception as e:
+        utils.logger.warning(
+            f"[v2_sync] 标记评论抓全失败 {platform_code}/{content_id}: {e}")
+
+
 async def get_declared_comment_counts(platform_code: str,
                                       content_ids: Optional[List[str]] = None
                                       ) -> Dict[str, int]:
@@ -1031,7 +1107,16 @@ async def refresh_comment_completeness(platform_code: str,
                     (chapter.ext or {}).get(COMMENT_SKIPPED_KEY, 0) or 0))
                 fetched = int(cmt_count or 0)
                 chapter.fetched_comment_count = fetched
-                if declared > 0:
+                fully = bool((chapter.ext or {}).get(COMMENT_FULLY_FETCHED_KEY, False))
+                if fully or (declared > 0 and fetched >= declared):
+                    # 已翻到 has_more=False 抓全，或已抓数 >= 平台声明数：
+                    # 这类帖平台声明数普遍虚高（含已删/折叠/私密评论），用声明数当
+                    # 分母会永远算「没抓够」→ 每轮被当成未达标重抓、白打请求还撞
+                    # 461。把分母纠正为真实已抓数，完整率永久 100%，下一轮必跳过，
+                    # 不再反复重抓已抓全的帖。
+                    chapter.declared_comment_count = fetched
+                    chapter.completeness = 1.0
+                elif declared > 0:
                     chapter.completeness = round(
                         comment_completeness(fetched, declared), 4)
                 updated += 1
@@ -1442,19 +1527,34 @@ async def get_run_crawl_stats(platform_code: str, start_ts: int,
             site_id = await _get_site_id(session, platform_code)
             if site_id is None:
                 return (0, 0)
+            # 本轮有评论入库的 story（按评论 created_at 归属）。
+            # 待补帖会「跳过详情、只拉评论」，此时 chapter.ext.crawled_at 不会更新；
+            # 只按 crawled_at 归因会导致「评论进了库但统计为 0」。
+            # 评论入库时间才是真正「本轮动过」的证据。
+            start_dt = datetime.fromtimestamp(start_ts / 1000.0, tz=timezone.utc)
+            end_dt = datetime.fromtimestamp(end_ts / 1000.0, tz=timezone.utc)
+            touched: Dict[int, int] = {}
+            for sid, c in (await session.execute(
+                    select(Comment.story_id, func.count(Comment.id))
+                    .where(Comment.created_at >= start_dt,
+                           Comment.created_at <= end_dt)
+                    .group_by(Comment.story_id))).all():
+                touched[int(sid)] = int(c or 0)
+
             rows = (await session.execute(
-                select(StoryChapter.ext, Story.created_at)
+                select(StoryChapter.ext, Story.created_at, StoryChapter.story_id)
                 .join(Story, Story.id == StoryChapter.story_id)
                 .where(StoryChapter.source_site_id == site_id)
             )).all()
-            for ext, created_at in rows:
+            for ext, created_at, story_id in rows:
                 ts = 0
                 if isinstance(ext, dict):
                     try:
                         ts = int(ext.get("crawled_at") or 0)
                     except (TypeError, ValueError):
                         ts = 0
-                if not (start_ts <= ts <= end_ts):
+                if not (start_ts <= ts <= end_ts) and not touched.get(
+                        int(story_id or 0)):
                     continue
                 if created_at is not None:
                     try:
@@ -1541,12 +1641,22 @@ async def get_run_crawl_detail(platform_code: str, start_ts: int, end_ts: int,
             # 「之前」= 本轮开始前已入库的评论数，按评论入库时间戳还原。
             # 比抓取前的内存快照更可靠：历史运行记录也能回填出前后对比。
             cut_dt = datetime.fromtimestamp(start_ts / 1000.0, tz=timezone.utc)
+            end_dt = datetime.fromtimestamp(end_ts / 1000.0, tz=timezone.utc)
             before_cnt: Dict[int, int] = {}
             for sid, c in (await session.execute(
                     select(Comment.story_id, func.count(Comment.id))
                     .where(Comment.created_at < cut_dt)
                     .group_by(Comment.story_id))).all():
                 before_cnt[int(sid)] = int(c or 0)
+            # 本轮有新评论入库的 story：作为「本轮动过」的补充归属依据
+            # （待补帖只拉评论、不更新 chapter.ext.crawled_at）。
+            touched: Dict[int, int] = {}
+            for sid, c in (await session.execute(
+                    select(Comment.story_id, func.count(Comment.id))
+                    .where(Comment.created_at >= cut_dt,
+                           Comment.created_at <= end_dt)
+                    .group_by(Comment.story_id))).all():
+                touched[int(sid)] = int(c or 0)
 
             rows = (await session.execute(
                 select(StoryChapter.source_content_id,
@@ -1576,7 +1686,8 @@ async def get_run_crawl_detail(platform_code: str, start_ts: int, end_ts: int,
                         ts = int(ext.get("crawled_at") or 0)
                     except (TypeError, ValueError):
                         ts = 0
-                if not (start_ts <= ts <= end_ts):
+                if not (start_ts <= ts <= end_ts) and not touched.get(
+                        int(story_id or 0)):
                     continue  # 不是本轮抓的
 
                 declared = int(dc or cc or sc or 0)

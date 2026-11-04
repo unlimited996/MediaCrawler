@@ -263,28 +263,47 @@ def build_crawler_command(task: Dict[str, Any]) -> List[str]:
     return cmd
 
 
-def build_crawler_env(task: Dict[str, Any]) -> Dict[str, str]:
-    """任务级执行参数通过环境变量注入爬虫（base_config 已支持 _env_int）。"""
+async def build_crawler_env(task: Dict[str, Any]) -> Dict[str, str]:
+    """任务级执行参数通过环境变量注入爬虫（base_config 已支持 _env_int）。
+
+    关键修复：每次任务启动都重新从库表加载 runtime_config。否则配置页里
+    apply_timing='next_task' 的项（如两个单轮预算）编辑后不会触发热刷新
+    （config_admin 仅对 immediate 项调用 refresh），build_crawler_env 读到的
+    仍是进程启动时的旧缓存 —— 表现为「页面改成 0 仍然按默认 20 执行」。
+    在任务启动入口统一刷新，既保证 next_task 改动本轮生效，也顺带让所有
+    配置项都读到最新库值。
+    """
+    # 重新拉取库表最新值，确保 next_task 类配置的页面改动在本轮生效
+    try:
+        from config.runtime_config import runtime_config
+        await runtime_config.refresh()
+    except Exception as e:
+        print(f"[build_crawler_env] 刷新运行时配置失败，沿用缓存: {e}")
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     env["MAX_CONCURRENCY_NUM"] = str(int(task.get("max_concurrency") or 1))
     env["CRAWLER_MAX_SLEEP_SEC"] = str(float(task.get("rate_interval_sec") or 3))
-    # 单轮请求预算护栏（详情 + 评论）：从配置管理页（crawl_config_item）读取，
-    # 落库值优先，回退到 config/xhs_config 常量。注入环境变量后，爬虫子进程
-    # 的 config.xhs_config 在 import 时用 _env_int 覆盖默认值，页面改值即时生效。
+    # 小红书抓取节奏 / 验证码等待：从配置页读最新值注入子进程 env，
+    # 子进程的 config.xhs_config 用 _env_float/_env_int 覆盖默认值。
     if task.get("platform") == "xhs":
         try:
             from config import xhs_config as _xc
-            from config.runtime_config import runtime_config
-
-            env["XHS_DETAIL_BUDGET_PER_ROUND"] = str(
-                runtime_config.get_int("xhs_detail_budget_per_round",
-                                      _xc.XHS_DETAIL_BUDGET_PER_ROUND))
-            env["XHS_COMMENT_BUDGET_PER_ROUND"] = str(
-                runtime_config.get_int("xhs_comment_budget_per_round",
-                                      _xc.XHS_COMMENT_BUDGET_PER_ROUND))
+            from config.runtime_config import runtime_config as _rc
+            env["XHS_SLEEP_MIN_SEC"] = str(float(
+                _rc.get_float("xhs_sleep_min_sec", _xc.XHS_SLEEP_MIN_SEC)))
+            env["XHS_SLEEP_MAX_SEC"] = str(float(
+                _rc.get_float("xhs_sleep_max_sec", _xc.XHS_SLEEP_MAX_SEC)))
+            env["XHS_CAPTCHA_WAIT_SEC"] = str(int(
+                _rc.get_int("xhs_captcha_wait_sec", _xc.XHS_CAPTCHA_WAIT_SEC)))
+            env["XHS_INTERLEAVE_EVERY_PAGES"] = str(int(
+                _rc.get_int("xhs_interleave_every_pages", _xc.XHS_INTERLEAVE_EVERY_PAGES)))
+            env["XHS_461_INTERLEAVE_RETRIES"] = str(int(
+                _rc.get_int("xhs_461_interleave_retries", _xc.XHS_461_INTERLEAVE_RETRIES)))
         except Exception as e:
-            print(f"[build_crawler_env] 读取小红书预算配置失败，回退常量: {e}")
+            print(f"[build_crawler_env] 读取小红书节奏配置失败，回退常量: {e}")
+    # 注：2026-11-03 起不再注入 XHS_DETAIL_BUDGET_PER_ROUND /
+    # XHS_COMMENT_BUDGET_PER_ROUND —— 单轮请求数量上限已移除（会与「慢速抓全」
+    # 诉求冲突，且人为截断单篇评论）。风控改由慢速随机间隔 + 撞 461 退避续抓承担。
     if task.get("task_type") == "account":
         # 账号维度：行为来源（点赞/收藏）由任务选项决定，经环境变量传给爬虫
         opts = task.get("options") or {}
@@ -398,7 +417,7 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
 
     # 3) 构造命令并起子进程
     cmd = build_crawler_command(task)
-    env = build_crawler_env(task)
+    env = await build_crawler_env(task)
     timeout = int(task.get("timeout_sec") or 1800)
     if on_log:
         on_log(f"启动抓取：{' '.join(cmd[:6])} ...", "info")
@@ -540,7 +559,25 @@ async def execute_task(task: Dict[str, Any], busy_wait_sec: int = 300,
 
     result = CrawlExecutionResult()
     for attempt in range(1, total_attempts + 1):
-        result = await _run_once(task, busy_wait_sec, is_busy, on_log)
+        # 跨进程抓取通道：登记「本进程正在抓取」，让另一侧的 API 手动抓取
+        # 能看到（反之亦然）。拿不到（别人在抓）就不登记，_run_once 里的
+        # 通道等待会先把这一轮排到空闲再开跑。
+        _ch_ok = False
+        try:
+            from tools.proc_lock import acquire_channel, release_channel
+
+            _ch_ok = acquire_channel(
+                "scheduler", note=str(task.get("name") or task.get("task_id") or ""))
+        except Exception:
+            _ch_ok = False
+        try:
+            result = await _run_once(task, busy_wait_sec, is_busy, on_log)
+        finally:
+            if _ch_ok:
+                try:
+                    release_channel()
+                except Exception:
+                    pass
         result.attempts = attempt
         if result.status == "success":
             break

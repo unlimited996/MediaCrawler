@@ -359,6 +359,25 @@ class CrawlerManager:
             # Start log reading task
             self._read_task = asyncio.create_task(self._read_output())
 
+            # 跨进程抓取通道：登记「本进程正在抓取」。执行器（worker）那边的
+            # 定时任务会看到并排队避让，避免两个浏览器同时打同一个账号。
+            # force=True：手动抓取是用户明确指令，即使定时任务在跑也照常登记
+            # （此时只提示风险，不强行拦截）。
+            try:
+                from tools.proc_lock import acquire_channel, read_channel
+
+                cur = read_channel()
+                if cur and cur.get("owner") != "manual":
+                    entry = self._create_log_entry(
+                        "注意：定时任务正在抓取，同时开启手动抓取会加大平台风控风险",
+                        "warning")
+                    await self._push_log(entry)
+                acquire_channel("manual",
+                                note=f"{config.platform.value}/{config.crawler_type.value}",
+                                force=True)
+            except Exception:
+                pass
+
             return True
         except Exception as e:
             self.status = "error"
@@ -420,6 +439,12 @@ class CrawlerManager:
             self.current_config = None
             self._current_batch_id = None
             self._current_batch_items = []
+            try:
+                from tools.proc_lock import release_channel
+
+                release_channel()
+            except Exception:
+                pass
 
             return True
 
@@ -451,6 +476,12 @@ class CrawlerManager:
 
             # 清掉句柄，is_running() 才会如实返回 False，下一批才能起
             self.process = None
+            try:
+                from tools.proc_lock import release_channel
+
+                release_channel()
+            except Exception:
+                pass
 
             started = await self._drain_queue_locked()
             if not started:

@@ -108,7 +108,13 @@ def get_async_engine(db_type: str = None):
     else:
         raise ValueError(f"Unsupported database type: {db_type}")
 
-    engine = create_async_engine(db_url, echo=False)
+    engine = create_async_engine(
+        db_url, echo=False,
+        # 连接被服务端/中间层掐断（idle 超时、网络抖动、双实例争用）时自动重连，
+        # 防止 scheduler tick 报 asyncpg.ConnectionDoesNotExistError。
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
     _engines[db_type] = engine
     return engine
 

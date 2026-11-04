@@ -186,11 +186,18 @@ class ScheduledTaskRunOut(BaseModel):
 
 class SchedulerStatusOut(BaseModel):
     started: bool = False
+    #: 抓取执行位置：worker=独立执行器（默认） / inline=兼容模式(进程内) / offline=执行器未运行
+    mode: str = "worker"
+    #: 执行器（worker）存活信息：alive / pid / started_at
+    worker: Dict[str, Any] = {}
+    worker_alive: bool = False
     enabled: bool = True
     max_concurrency: int = 1
     tick_sec: int = 15
     total_tasks: int = 0
     enabled_tasks: int = 0
     running_tasks: int = 0
+    #: 排队中的手动触发（status='queued'），等执行器拾取
+    queued_runs: int = 0
     last_tick_at: Optional[str] = None
     last_error: str = ""

@@ -45,6 +45,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_str(name: str, default: str) -> str:
+    """读字符串型环境变量（空串也回退默认）。"""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip()
+
+
 def _env_float(name: str, default: float) -> float:
     """读浮点型环境变量（非法值回退默认）。"""
     raw = os.getenv(name)
@@ -203,6 +211,47 @@ PAGE_GOTO_TIMEOUT_SEC = 45
 # ---------------------------------------------------------------------------
 # 调度器总开关：关掉后已存任务不自动执行（手动触发仍可用）
 SCHEDULER_ENABLED = _env_bool("SCHEDULER_ENABLED", True)
+# 调度器跑在哪个进程（2026-11-04 拆分）：
+#   0（默认）→ 交给独立执行器 `python -m worker`，API 只提供接口。
+#              好处：重启 API 不会打断抓取，重启执行器也不会让接口掉线。
+#   1        → 老行为，调度器跑在 API 进程内（单进程调试/旧部署兼容）。
+SCHEDULER_IN_API = _env_bool("SCHEDULER_IN_API", False)
+# API 启动时若发现执行器没在跑，是否自动拉起（detached，父进程退出不带走）。
+# 设为 0 则要求手动 `python -m worker`，适合用 systemd/supervisor 托管。
+WORKER_AUTO_SPAWN = _env_bool("WORKER_AUTO_SPAWN", True)
+
+# ---------------------------------------------------------------------------
+# 微服务拆分 / Nacos 服务发现（2026-11-04）
+# ---------------------------------------------------------------------------
+# 两个独立应用，URL 里的服务名决定打到哪个应用：
+#   /crawler/api/**  -> crawler 服务（抓取 + 调度 + 账号）
+#   /data/api/**     -> data 服务（数据增删改查 + 配置 + S3）
+# 每个进程用 SERVICE_NAME 表明自己是谁，启动时注册到 Nacos。
+SERVICE_NAME = _env_str("SERVICE_NAME", "mediacrawler")
+# 本进程监听端口（容器内/宿主端口由部署决定）
+SERVICE_PORT = _env_int("SERVICE_PORT", 8081)
+# 注册到 Nacos 的 IP；留空自动探测（容器里就是容器 IP）
+SERVICE_IP = _env_str("SERVICE_IP", "")
+
+# Nacos 开关与地址（注册/发现都走它；关掉则退化为静态地址）
+NACOS_ENABLED = _env_bool("NACOS_ENABLED", True)
+NACOS_SERVER = _env_str("NACOS_SERVER", "www.joyeuse.cn:8085")
+NACOS_NAMESPACE = _env_str("NACOS_NAMESPACE", "public")
+NACOS_GROUP = _env_str("NACOS_GROUP", "DEFAULT_GROUP")
+NACOS_USERNAME = _env_str("NACOS_USERNAME", "")
+NACOS_PASSWORD = _env_str("NACOS_PASSWORD", "")
+
+# 两个服务的注册名（Nacos 里的 serviceName），也是网关路由的目标
+CRAWLER_SERVICE_NAME = _env_str("CRAWLER_SERVICE_NAME", "mediacrawler-crawler")
+DATA_SERVICE_NAME = _env_str("DATA_SERVICE_NAME", "mediacrawler-data")
+
+# Nacos 不可用时的静态兜底地址（本地开发/单机起两个进程最常用）
+CRAWLER_BASE_URL = _env_str("CRAWLER_BASE_URL", "http://127.0.0.1:8001")
+DATA_BASE_URL = _env_str("DATA_BASE_URL", "http://127.0.0.1:8081")
+# 网关（服务名路由 + 静态页）是否随 data 服务一起启动
+GATEWAY_ENABLED = _env_bool("GATEWAY_ENABLED", True)
+# 跨服务调用/代理的超时（秒）
+SERVICE_CALL_TIMEOUT = _env_float("SERVICE_CALL_TIMEOUT", 30)
 # 同时执行的定时任务上限。抓取是单子进程模型，默认 1 最稳
 SCHEDULER_MAX_CONCURRENCY = _env_int("SCHEDULER_MAX_CONCURRENCY", 1)
 # 调度循环粒度（秒）：每个 tick 检查哪些任务到点

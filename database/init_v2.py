@@ -177,8 +177,10 @@ CONFIG_ITEMS: List[Dict] = [
          desc="立即生效"),
     # ---------------- xhs_backup ----------------
     dict(group="xhs_backup", key="xhs_behavior_max_notes", label="备份单次抓取上限", value_type="int",
-         default="100", min=1, max=5000, timing="next_task", weight=10, unit="篇",
-         desc="账号点赞/收藏备份任务每轮最多抓多少篇（新帖 + 待补抓）。调大可让每轮覆盖更多帖子，但更易触发风控"),
+         default="0", min=0, max=5000, timing="next_task", weight=10, unit="篇",
+         desc="账号点赞/收藏备份任务每轮最多抓多少篇（新帖 + 待补抓）。0 = 不限制"
+              "（推荐：靠增量跳过已完成帖自然收敛，不靠硬数量上限截断；单篇评论仍会抓全）。"
+              "设正整数则每轮最多抓这么多篇，剩余留到下一轮。"),
     dict(group="xhs_backup", key="xhs_behavior_incremental", label="增量模式", value_type="bool",
          default="true", timing="next_task", weight=15,
          desc="开启后已归档（评论已完整）的帖子跳过详情与评论，只抓新帖与未完整的帖子"),
@@ -188,16 +190,35 @@ CONFIG_ITEMS: List[Dict] = [
     dict(group="xhs_backup", key="xhs_comment_count_margin", label="评论数余量", value_type="int",
          default="30", min=0, max=10000, timing="next_task", weight=30, unit="条",
          desc="判定评论是否抓全时，允许比声明数少这么多条仍算完整，容忍平台计数延迟"),
-    dict(group="xhs_backup", key="xhs_detail_budget_per_round", label="单轮详情请求预算", value_type="int",
-         default="25", min=0, max=200, timing="next_task", weight=35, unit="次",
-         desc="单轮最多发起多少篇笔记详情请求（点赞/收藏备份每篇=1次请求）。"
-              "小红书按『单轮累计请求量』限流，约 80 次即触发 461；本预算在撞 461 之前"
-              "主动停手，剩余帖子留到下一轮。0 = 不限制（回到旧行为，有撞 461 风险）"),
-    dict(group="xhs_backup", key="xhs_comment_budget_per_round", label="单轮评论请求预算", value_type="int",
-         default="20", min=0, max=200, timing="next_task", weight=40, unit="次",
-         desc="单轮最多打多少次评论接口（主评论+楼中楼都算）。与『详情预算』合计应"
-              "稳定低于 ~80 才安全：默认 25+20+列表≈9 ≈ 54。两者之和别超过 ~75。"
-              "0 = 不限制（有撞 461 风险）"),
+    dict(group="xhs_backup", key="xhs_sleep_min_sec", label="抓取间隔下限", value_type="int",
+         default="35", min=0, max=600, timing="next_task", weight=45, unit="秒",
+         desc="每次评论/列表翻页前随机休眠的下限。小红书按『累计请求量』限流，间隔太短"
+              "（如 5-15s）单轮很快撞 461；调到 35-55s 可把小时请求量压到阈值内，"
+              "实现『慢速抓全』而不撞风控。"),
+    dict(group="xhs_backup", key="xhs_sleep_max_sec", label="抓取间隔上限", value_type="int",
+         default="55", min=0, max=1200, timing="next_task", weight=50, unit="秒",
+         desc="每次请求前随机休眠的上限。建议与下限保持约 20s 的随机区间，避免固定节奏被识别。"),
+    dict(group="xhs_backup", key="xhs_captcha_wait_sec", label="验证码人工等待", value_type="int",
+         default="300", min=0, max=1800, timing="next_task", weight=55, unit="秒",
+         desc="撞验证码（含裸 461/471）时都会弹出可见浏览器窗口，并在该窗口等待你手动"
+              "完成验证/重新登录的最长秒数。默认 300s（5 分钟）；窗口若没出现在桌面，"
+              "请查看任务栏或其它桌面。设更大可留更多人工时间。"),
+    dict(group="xhs_backup", key="xhs_interleave_every_pages", label="每N页穿插一次", value_type="int",
+         default="4", min=0, max=100, timing="next_task", weight=60, unit="页",
+         desc="评论翻页时，每 N 页穿插一次「详情(feed 接口) + 回首页滚动」，打断"
+              "『连续死磕 comment 接口』的机器画像。0 = 不穿插。"),
+    dict(group="xhs_backup", key="xhs_461_interleave_retries", label="461穿插重试次数", value_type="int",
+         default="3", min=0, max=10, timing="next_task", weight=65, unit="次",
+         desc="撞 461 时，先『回首页+滚动+拉详情』再重试评论接口的次数；全失败才弹窗"
+              "等人工验证。0 = 不穿插重试（直接弹窗）。"),
+    dict(group="xhs_backup", key="xhs_detail_budget_per_round", label="单轮详情请求预算（已弃用）", value_type="int",
+         default="0", min=0, max=200, timing="next_task", weight=35, unit="次",
+         desc="【已弃用】2026-11-03 起不再强制限制单轮请求数量（会与『慢速抓全』诉求"
+              "冲突，且人为截断单篇评论）。风控改由『慢速随机间隔 5-15s + 撞 461 退避续抓』"
+              "承担。此配置项保留仅作展示，改值不再生效。"),
+    dict(group="xhs_backup", key="xhs_comment_budget_per_round", label="单轮评论请求预算（已弃用）", value_type="int",
+         default="0", min=0, max=200, timing="next_task", weight=40, unit="次",
+         desc="【已弃用】同上，单轮评论请求数量上限已移除。保留仅作展示，改值不再生效。"),
 ]
 
 

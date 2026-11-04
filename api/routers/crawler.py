@@ -113,9 +113,42 @@ async def get_login_qrcode():
 
 @router.get("/logs")
 async def get_logs(limit: int = 100):
-    """Get recent logs"""
-    logs = crawler_manager.logs[-limit:] if limit > 0 else crawler_manager.logs
-    return {"logs": [log.model_dump() for log in logs]}
+    """Get recent logs
+
+    合并两个来源，保证「手动抓取」和「定时任务」在控制台是同一个视图：
+      * 本进程内存缓冲（手动抓取，跑在 API 进程里）；
+      * 抓取执行器（worker 进程）的实时日志文件 —— 拆分后定时任务日志
+        必须跨进程读取，否则控制台会显得"定时任务没有输出"。
+    """
+    from datetime import datetime
+
+    items: List[Dict[str, Any]] = [log.model_dump() for log in crawler_manager.logs]
+    today = datetime.now().strftime("%Y-%m-%d")
+    for it in items:
+        it["_sort"] = f"{today} {it.get('timestamp') or '00:00:00'}"
+
+    try:
+        from ..services.worker_control import tail_live
+
+        for e in tail_live(max(0, limit) or 100):
+            ts = e.get("ts") or ""
+            items.append({
+                "id": 0,
+                "timestamp": ts,
+                "level": e.get("level") or "info",
+                "message": e.get("msg") or "",
+                "_sort": e.get("at") or f"{today} {ts}",
+            })
+    except Exception:
+        pass
+
+    items.sort(key=lambda d: d.get("_sort") or "")
+    if limit > 0:
+        items = items[-limit:]
+    for idx, it in enumerate(items, 1):
+        it["id"] = idx
+        it.pop("_sort", None)
+    return {"logs": items}
 
 
 # ---------------------------------------------------------------------------

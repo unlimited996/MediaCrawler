@@ -1,0 +1,77 @@
+# =============================================================================
+# 拆分部署：crawler 服务 + data 服务（data 同时是网关/唯一对外入口）
+#
+#   docker compose -f docker-compose.split.yml --env-file deploy/.env up -d
+#
+# 对外只有一个端口：data 的 8081
+#   http://host:8081/            前端
+#   http://host:8081/data/api/** 数据增删改查
+#   http://host:8081/crawler/api/** 抓取（按服务名转发给 crawler 容器）
+#
+# 两个容器都从同一批镜像仓库拉取，日志与环境变量文件全部挂到宿主机：
+#   ./logs/          应用日志（worker.out.log / *.console.log / scheduler_live.jsonl）
+#   ./deploy/.env    启动环境变量（数据库、Nacos、时区等），改完 restart 生效
+#   ./browser_data/  浏览器登录态（必须持久化，否则每轮都要重新扫码）
+#   ./data/          抓取产物
+# =============================================================================
+
+services:
+  crawler:
+    image: ${IMAGE_CRAWLER:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-media}/mediacrawler-crawler:${IMAGE_TAG:-latest}}
+    container_name: mediacrawler-crawler
+    restart: unless-stopped
+    env_file:
+      - ./deploy/.env
+    environment:
+      APP_ROLE: crawler
+      SERVICE_NAME: ${CRAWLER_SERVICE_NAME:-mediacrawler-crawler}
+      SERVICE_PORT: "8001"
+      PORT: "8001"
+      WORKER_ENABLED: "1"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./browser_data:/app/browser_data
+      - ./database:/app/database
+      - ./deploy:/app/deploy:ro
+    # 只在内网暴露给 data 容器；如需直连调试再打开
+    # ports:
+    #   - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/crawler/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  data:
+    image: ${IMAGE_DATA:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-media}/mediacrawler-data:${IMAGE_TAG:-latest}}
+    container_name: mediacrawler-data
+    restart: unless-stopped
+    depends_on:
+      crawler:
+        condition: service_started
+    env_file:
+      - ./deploy/.env
+    environment:
+      APP_ROLE: data
+      SERVICE_NAME: ${DATA_SERVICE_NAME:-mediacrawler-data}
+      SERVICE_PORT: "8081"
+      PORT: "8081"
+      GATEWAY_ENABLED: "1"
+      # 容器内直连 crawler 服务的兜底地址（Nacos 正常时优先用 Nacos 发现）
+      CRAWLER_BASE_URL: http://crawler:8001
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./browser_data:/app/browser_data
+      - ./database:/app/database
+      - ./deploy:/app/deploy:ro
+    ports:
+      - "${DATA_PORT:-8081}:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/data/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
