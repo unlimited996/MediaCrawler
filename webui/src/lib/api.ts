@@ -6,7 +6,7 @@ import type { ScheduledTask, ScheduledTaskRun, SchedulerStatus,
 const api = axios.create({
   // 2026-11-04 服务拆分为 crawler / data 两个独立应用后，URL 第一段就是服务名：
   //   /crawler/api/**  -> 抓取服务（crawler/scheduler/accounts/config）
-  //   /data/api/**     -> 数据服务（stories/data/export/stance-tags/s3-backup/recipes...）
+  //   /library/api/**  -> 内容库服务（stories/assets/export/stance-tags/s3-backup/recipes...）
   // baseURL 交给拦截器拼，调用的地方仍然写 '/stories/xxx' 这种相对路径。
   baseURL: '',
   timeout: 30000,
@@ -15,15 +15,15 @@ const api = axios.create({
   },
 })
 
-/** 归属 crawler 服务的路径首段（其余一律走 data 服务） */
+/** 归属 crawler 服务的路径首段（其余一律走 library 内容库服务） */
 const CRAWLER_SEGMENTS = new Set(['crawler', 'scheduler', 'accounts', 'config'])
 
 /** 根据路径首段决定加哪个服务名前缀；已带服务名的不重复加。 */
 export function servicePrefix(url: string): string {
   if (!url.startsWith('/')) return ''
-  if (/^\/(crawler|data)\/api(\/|$)/.test(url)) return ''
+  if (/^\/(crawler|library)\/api(\/|$)/.test(url)) return ''
   const seg = url.slice(1).split('/')[0]
-  return CRAWLER_SEGMENTS.has(seg) ? '/crawler/api' : '/data/api'
+  return CRAWLER_SEGMENTS.has(seg) ? '/crawler/api' : '/library/api'
 }
 
 api.interceptors.request.use((cfg) => {
@@ -132,13 +132,13 @@ export const crawlerQueueApi = {
 
 export const dataApi = {
   getFiles: (platform?: string, fileType?: string) =>
-    api.get<{ files: DataFile[] }>('/data/files', { params: { platform, file_type: fileType } }),
+    api.get<{ files: DataFile[] }>('/assets/files', { params: { platform, file_type: fileType } }),
   getFileContent: (path: string, limit = 100) =>
-    api.get<FilePreviewResponse>('/data/files/' + path, { params: { preview: true, limit } }),
-  getStats: () => api.get('/data/stats'),
-  getDownloadUrl: (path: string) => `/api/data/download/${path}`,
+    api.get<FilePreviewResponse>('/assets/files/' + path, { params: { preview: true, limit } }),
+  getStats: () => api.get('/assets/stats'),
+  getDownloadUrl: (path: string) => `/library/api/assets/download/${path}`,
   deleteFile: (path: string) => api.delete<{ success: boolean; deleted: string }>(
-    '/data/files/' + path),
+    '/assets/files/' + path),
 }
 
 export interface ExportPdfResult {

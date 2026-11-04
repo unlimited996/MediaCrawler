@@ -7,7 +7,7 @@
 #
 # APP_ROLE：
 #   crawler : 抓取服务（默认同容器再起一个 worker）
-#   data    : 数据服务 + 网关（不跑 worker）
+#   library : 内容库服务 + 网关（不跑 worker）
 #   worker  : 只跑抓取执行器（独立容器部署时用）
 #   all     : 一体化（旧行为）
 set -e
@@ -46,7 +46,7 @@ fi
 
 # ---- 抓取执行器（worker）---------------------------------------------------
 # crawler / all：同容器再起一个 worker（有文件锁保证全局只有一个在跑）
-# data：不跑；worker：只跑它
+# library：不跑；worker：只跑它
 case "$APP_ROLE" in
     crawler|all)
         if [ "${WORKER_ENABLED:-1}" = "1" ]; then

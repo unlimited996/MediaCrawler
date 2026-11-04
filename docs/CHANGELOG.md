@@ -5,6 +5,42 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-04] 变更 data 服务更名为 library（内容库），并把 /data 子路径改为 /assets
+
+### 背景
+- `data` 这个名字太笼统，看不出到底装的是哪类数据。这个服务承载的是**抓取产出的
+  内容资产**：帖子/评论/图片视频、标签词库、菜谱，以及导出与 S3 备份。
+
+### 变更（全链路改名）
+| 项 | 原 | 现 |
+|---|---|---|
+| 应用模块 | `api/data_app.py` | `api/library_app.py` |
+| 服务注册名 | `mediacrawler-data` | `mediacrawler-library` |
+| URL 前缀 | `/data/api/**` | `/library/api/**` |
+| 文件/媒体子路径 | `/data/files`、`/data/stats`、`/data/media` | `/assets/files`、`/assets/stats`、`/assets/media` |
+| 镜像 | `mediacrawler-data` | `mediacrawler-library` |
+| 环境变量 | `DATA_SERVICE_NAME`/`DATA_BASE_URL`/`DATA_PORT` | `LIBRARY_SERVICE_NAME`/`LIBRARY_BASE_URL`/`LIBRARY_PORT` |
+| 跨服务方法 | `discovery.notify_data_service` | `discovery.notify_library_service` |
+| 健康检查 | `/data/health` | `/library/health` |
+
+同步改动：`config/base_config.py`、`api/gateway.py`、`api/main.py`（单体入口双挂前缀）、
+`api/services/task_scheduler.py`、`webui/src/lib/api.ts`、`webui/src/components/data/platform/shared.tsx`、
+`Dockerfile`（target `data`→`library`）、`docker-entrypoint.sh`、`docker-compose.split.yml`、
+`deploy/.env.example`、`.github/workflows/build-push.yml`、`docs/DEPLOY_SPLIT.md`、
+`tests/test_service_split.py`。
+
+### 修复（顺带发现的真问题）
+- `api/routers/story.py` 里媒体/原始文件链接**硬编码** `/api/data/...`：拆分成两个服务后
+  这个路径根本不存在（404），图片会全部裂掉。新增 `api/service_paths.py`
+  （`library_api()` / `asset_url()` / `media_url()`），统一按 `LIBRARY_API_PREFIX`
+  （默认 `/library/api`）拼装，单体与拆分两种部署都能用。
+- 新增回归：`test_media_urls_carry_library_prefix`、`test_library_app_routes_are_prefixed_by_service_name`
+  断言旧 `/data/api/**` 必须彻底消失。
+
+### 兼容性
+- **不保留 `/data/**` 旧地址**（会返回 404），前端已同步改为 `/library/api/**`；
+  如果外部有脚本在调旧地址，需要改。Nacos 里旧服务名 `mediacrawler-data` 会随实例下线自动摘除。
+
 ## [2026-11-04] 变更 按服务名拆分为 crawler / data 两个独立应用（Nacos 注册发现 + 双镜像流水线）
 
 ### 背景

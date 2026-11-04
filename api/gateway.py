@@ -4,7 +4,7 @@
 规则（路径的第一段就是服务名）：
 
     /crawler/api/**  -> crawler 服务（Nacos 里注册的 mediacrawler-crawler）
-    /data/api/**     -> 本进程（data 服务自己处理，不走代理）
+    /library/api/**  -> 本进程（library 服务自己处理，不走代理）
     /crawler/api/ws/logs、/crawler/api/ws/status -> WebSocket 代理
 
 实例从 Nacos 发现；Nacos 不可用时回退 `CRAWLER_BASE_URL`（默认 127.0.0.1:8001）。
@@ -149,8 +149,8 @@ async def gateway_status():
         "gateway": "ok",
         "routes": {
             "/crawler/**": {"service": svc, "instances": instances},
-            "/data/**": {"service": getattr(config, "DATA_SERVICE_NAME",
-                                           "mediacrawler-data"),
+            "/library/**": {"service": getattr(config, "LIBRARY_SERVICE_NAME",
+                                              "mediacrawler-library"),
                          "instances": ["self"]},
         },
         "discovery": discovery.status(),

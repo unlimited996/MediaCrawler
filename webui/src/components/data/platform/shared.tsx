@@ -39,13 +39,13 @@ export interface AvatarProps {
  * 平台头像 URL 改写成本地代理地址。
  *
  * 头像 CDN（xhscdn 等）和图片 CDN 一样有防盗链，浏览器 <img> 直连吃 403，
- * 头像永远裂。服务端 /api/data/avatar-proxy 带头部 cookie 转发（实测 200），
+ * 头像永远裂。服务端 /library/api/assets/avatar-proxy 带头部 cookie 转发（实测 200），
  * 所以这里统一改写；已经是本地地址的（/api/... 或 data:）不重复包。
  */
 export function toAvatarSrc(avatar?: string | null): string {
   if (!avatar) return ''
   if (/^https?:\/\//i.test(avatar)) {
-    return `/api/data/avatar-proxy?url=${encodeURIComponent(avatar)}`
+    return `/library/api/assets/avatar-proxy?url=${encodeURIComponent(avatar)}`
   }
   return avatar
 }

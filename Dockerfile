@@ -4,16 +4,16 @@
 #   Stage 1  webui-builder : Node 构建 React 前端 -> /app/api/webui
 #   Stage 2  runtime       : Python 3.11 + Node(execjs) + Chromium + FastAPI
 #   Stage 3+ 按服务拆分的三个目标（同一份代码，不同启动命令）：
-#            crawler : 抓取服务  /crawler/api/**   （容器内同时拉起 worker）
-#            data    : 数据服务  /data/api/** + 网关（按服务名转发 /crawler/**）
+#            crawler : 抓取服务    /crawler/api/**  （容器内同时拉起 worker）
+#            library : 内容库服务  /library/api/** + 网关（按服务名转发 /crawler/**）
 #            all     : 一体化（旧行为，本地/单机用；也是默认目标）
 #
 # 构建（推荐用 buildx 一次构建两个服务镜像）：
 #   docker build --target crawler -t mediacrawler-crawler:latest .
-#   docker build --target data    -t mediacrawler-data:latest    .
+#   docker build --target library -t mediacrawler-library:latest .
 #   docker build -t mediacrawler:latest .            # = 默认 all 目标
 # 跳过前端重新构建（沿用宿主机已构建好的 api/webui，省 1~2 分钟）：
-#   docker build --target data --build-arg SKIP_WEBUI_BUILD=1 -t mediacrawler-data .
+#   docker build --target library --build-arg SKIP_WEBUI_BUILD=1 -t mediacrawler-library .
 # 更多： docs/DEPLOY_SPLIT.md
 # =============================================================================
 
@@ -177,15 +177,16 @@ CMD ["uvicorn", "api.crawler_app:app", "--host", "0.0.0.0", "--port", "8001", \
 
 
 # -----------------------------------------------------------------------------
-# 目标 2：data 服务（数据增删改查 + 配置 + S3 + 前端静态页 + 服务名网关）
+# 目标 2：library 服务（内容库：帖子/评论/媒体/标签/菜谱 + 配置 + S3
+#                    + 前端静态页 + 服务名网关）
 #
-#   对外路径 /data/api/**；同时把 /crawler/** 按服务名转发给 crawler 服务。
+#   对外路径 /library/api/**；同时把 /crawler/** 按服务名转发给 crawler 服务。
 #   这是**对外唯一入口**（浏览器只访问它）。
 # -----------------------------------------------------------------------------
-FROM runtime AS data
+FROM runtime AS library
 
-ENV APP_ROLE=data \
-    SERVICE_NAME=mediacrawler-data \
+ENV APP_ROLE=library \
+    SERVICE_NAME=mediacrawler-library \
     SERVICE_PORT=8081 \
     PORT=8081 \
     WORKER_ENABLED=0 \
@@ -194,9 +195,9 @@ ENV APP_ROLE=data \
 EXPOSE 8081
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
-    CMD curl -fsS "http://127.0.0.1:${PORT}/data/health" || exit 1
+    CMD curl -fsS "http://127.0.0.1:${PORT}/library/health" || exit 1
 
-CMD ["uvicorn", "api.data_app:app", "--host", "0.0.0.0", "--port", "8081", \
+CMD ["uvicorn", "api.library_app:app", "--host", "0.0.0.0", "--port", "8081", \
      "--proxy-headers", "--forwarded-allow-ips", "*"]
 
 

@@ -295,13 +295,13 @@ app.include_router(media_router, prefix="/api")
 app.include_router(app_config_router, prefix="/api")
 
 # 服务名路由兼容（2026-11-04 拆分后）：
-# 前端现在按服务名调用 `/crawler/api/**` 与 `/data/api/**`。单体进程把同一批
+# 前端现在按服务名调用 `/crawler/api/**` 与 `/library/api/**`。单体进程把同一批
 # 路由**再挂一遍**到这两个前缀下，这样本地开发（单进程）和线上（两服务 + 网关）
-# 用的是同一份前端，不需要区分。真正的拆分入口见 api/crawler_app.py / api/data_app.py。
+# 用的是同一份前端，不需要区分。真正的拆分入口见 api/crawler_app.py / api/library_app.py。
 for _prefix, _routers in (
     ("/crawler/api", (crawler_router, scheduler_router, accounts_router,
                       config_router, websocket_router)),
-    ("/data/api", (story_router, data_router, discover_router, export_router,
+    ("/library/api", (story_router, data_router, discover_router, export_router,
                    stance_tags_router, s3_backup_router, recipe_router,
                    media_router, app_config_router)),
 ):
@@ -311,7 +311,7 @@ for _prefix, _routers in (
 try:  # 服务间内部接口（crawler -> data），单体进程里也提供，便于本地联调
     from .routers.internal import router as _internal_router
 
-    app.include_router(_internal_router, prefix="/data/api")
+    app.include_router(_internal_router, prefix="/library/api")
 except Exception:
     pass
 

@@ -38,8 +38,8 @@ jobs:
           - service: crawler
             target: crawler
             port: 8001
-          - service: data
-            target: data
+          - service: library
+            target: library
             port: 8081
     steps:
       - name: Checkout

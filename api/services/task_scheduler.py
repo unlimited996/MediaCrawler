@@ -985,16 +985,16 @@ class TaskScheduler:
                     task.next_run_at = self._compute_next(task)
                 await session.commit()
                 await self._trim_runs(session, task_id)
-                self._notify_data_service(task_id, run_id, summary)
+                self._notify_library_service(task_id, run_id, summary)
         except Exception as e:
             self.last_error = f"写运行记录失败: {e}"
 
     @staticmethod
-    def _notify_data_service(task_id: int, run_id: Optional[int],
+    def _notify_library_service(task_id: int, run_id: Optional[int],
                              summary: Dict[str, Any]) -> None:
-        """把「一轮跑完」的事件推给 data 服务（跨服务调用，走 Nacos 发现）。
+        """把「一轮跑完」的事件推给内容库服务（跨服务调用，走 Nacos 发现）。
 
-        设计成**旁路**：data 服务没起、Nacos 没配，都只打一行日志，
+        设计成**旁路**：内容库没起、Nacos 没配，都只打一行日志，
         绝不影响抓取本身；放到线程里跑，避免阻塞事件循环。
         """
         async def _bg() -> None:
@@ -1002,7 +1002,7 @@ class TaskScheduler:
                 from . import discovery
 
                 await asyncio.to_thread(
-                    discovery.notify_data_service, "run_finished", {
+                    discovery.notify_library_service, "run_finished", {
                         "task_id": task_id,
                         "run_id": run_id,
                         "status": summary.get("status"),

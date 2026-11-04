@@ -24,7 +24,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
-router = APIRouter(prefix="/data", tags=["data"])
+router = APIRouter(prefix="/assets", tags=["assets"])
 
 # Data directory
 DATA_DIR = Path(__file__).parent.parent.parent / "data"

@@ -23,6 +23,8 @@ from database.models_v2 import (
     StoryChapter, StoryEditLog, StoryTag, Tag,
 )
 
+from ..service_paths import asset_url as _asset_url, library_api as _library_api
+
 router = APIRouter(prefix="/stories", tags=["story"])
 
 SORT_FIELDS = {
@@ -114,7 +116,7 @@ async def _load_comment_pictures(session, comment_ids: List[int]
 
     返回 {comment_id: [{url, local_url, backup_url, source}]}。
     URL 解析优先级（与帖子媒体一致）：本地副本 → S3 备份 → 平台远程外链。
-    本地副本走 /api/data/raw/{local_path}（绕 CDN 防盗链 + 签名过期 403）。
+    本地副本走 {LIBRARY_API_PREFIX}/assets/raw/{local_path}（绕 CDN 防盗链 + 签名过期 403）。
     """
     out: Dict[int, List[Dict[str, Any]]] = {}
     if not comment_ids:
@@ -141,7 +143,7 @@ async def _load_comment_pictures(session, comment_ids: List[int]
                 rel = Path(m.local_path).relative_to(DATA_DIR).as_posix()
             except Exception:
                 rel = str(m.local_path).replace("\\", "/")
-            local_url = f"/api/data/raw/{rel}"
+            local_url = _asset_url("raw", rel)
         backup_url = (f"/api/s3-backup/object/{backup_map[m.id]}"
                       if m.id in backup_map else None)
         resolved = local_url or backup_url or (m.source_url or None)
@@ -295,12 +297,12 @@ async def list_stories(
                     continue
                 try:
                     rel = Path(lp).resolve().relative_to(_DATA_DIR.resolve())
-                    # 二进制直出走 /api/data/raw/（/files/ 是文本预览，图片会 400）
-                    cover_local[sid] = f"/api/data/raw/{rel.as_posix()}"
+                    # 二进制直出走 assets/raw/（/files/ 是文本预览，图片会 400）
+                    cover_local[sid] = _asset_url("raw", rel.as_posix())
                 except Exception:
                     p = Path(lp)
                     cover_local[sid] = (
-                        f"/api/data/media/{site_codes.get(site_id) or ''}/"
+                        f"{_library_api()}/assets/media/{site_codes.get(site_id) or ''}/"
                         f"{content_id}/{p.name}")
 
         # ---- S3 备份（P4）：封面第三级回退 + 全量备份徽标 ----
@@ -552,7 +554,7 @@ async def get_story(story_id: int):
                 "source_status": m.source_status or "unknown",
                 # 本地已下载的文件走 API 路由吐出（CDN 防盗链，浏览器直连 403）
                 "local_url": (
-                    f"/api/data/media/{platform_code}/"
+                    f"{_library_api()}/assets/media/{platform_code}/"
                     f"{Path(m.local_path).parent.name}/"
                     f"{Path(m.local_path).name}"
                     if m.local_path else None

@@ -87,8 +87,8 @@ def _static_base(service: str) -> str:
     """Nacos 不可用时的静态兜底地址。"""
     if service == getattr(config, "CRAWLER_SERVICE_NAME", "mediacrawler-crawler"):
         return getattr(config, "CRAWLER_BASE_URL", "http://127.0.0.1:8001")
-    if service == getattr(config, "DATA_SERVICE_NAME", "mediacrawler-data"):
-        return getattr(config, "DATA_BASE_URL", "http://127.0.0.1:8081")
+    if service == getattr(config, "LIBRARY_SERVICE_NAME", "mediacrawler-library"):
+        return getattr(config, "LIBRARY_BASE_URL", "http://127.0.0.1:8081")
     return ""
 
 
@@ -174,13 +174,13 @@ def call(service: str, method: str, path: str,
             "error": last_err or "调用失败"}
 
 
-def notify_data_service(event: str, payload: Optional[Dict] = None) -> bool:
-    """抓取侧 -> 数据侧的轻量通知（示例：一轮抓取跑完后让数据侧刷新缓存）。
+def notify_library_service(event: str, payload: Optional[Dict] = None) -> bool:
+    """抓取侧 -> 内容库的轻量通知（一轮抓取跑完后让内容库刷新缓存）。
 
-    数据服务没起 / Nacos 没配 都不影响抓取主流程，只打一条警告。
+    内容库没起 / Nacos 没配 都不影响抓取主流程，只打一条警告。
     """
-    svc = getattr(config, "DATA_SERVICE_NAME", "mediacrawler-data")
-    res = call(svc, "POST", "/data/api/internal/events",
+    svc = getattr(config, "LIBRARY_SERVICE_NAME", "mediacrawler-library")
+    res = call(svc, "POST", "/library/api/internal/events",
                json_body={"event": event, "payload": payload or {},
                           "ts": int(time.time())},
                timeout=5, retry_next=False)

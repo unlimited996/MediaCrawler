@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""服务拆分契约测试（crawler / data 两个独立应用 + 服务名路由）。
+"""服务拆分契约测试（crawler / library 两个独立应用 + 服务名路由）。
 
 只做**静态契约**校验，不触发 startup（不会连库），保证 CI 里能快速跑。
 """
@@ -26,28 +26,42 @@ def test_crawler_app_routes_are_prefixed_by_service_name():
     # 健康检查两个入口都要有（容器 HEALTHCHECK 用带前缀的）
     assert "/crawler/health" in paths
     assert "/health" in paths
-    # 不能把数据接口也挂进来（否则又变成单体）
-    assert not any(p.startswith("/data/api/") for p in paths)
+    # 不能把内容库接口也挂进来（否则又变成单体）
+    assert not any(p.startswith("/library/api/") for p in paths)
 
 
-def test_data_app_routes_are_prefixed_by_service_name():
-    from api.data_app import app
+def test_library_app_routes_are_prefixed_by_service_name():
+    from api.library_app import app
 
     paths = _paths(app)
-    assert "/data/api/stories" in paths
-    assert "/data/api/internal/events" in paths
-    assert "/data/health" in paths
-    # 抓取接口不该出现在 data 应用里（它只做代理）
-    assert "/data/api/scheduler/status" not in paths
+    assert "/library/api/stories" in paths
+    # 文件/媒体资源子路径已从笼统的 /data 改为 /assets
+    assert "/library/api/assets/files" in paths
+    assert "/library/api/assets/media/{platform}/{content_id}/{filename}" in paths
+    assert "/library/api/internal/events" in paths
+    assert "/library/health" in paths
+    # 抓取接口不该出现在内容库里（它只做代理）
+    assert "/library/api/scheduler/status" not in paths
+    # 旧的 /data 前缀必须彻底消失（否则前端还会打到旧地址）
+    assert not any(p.startswith("/data/api") for p in paths)
 
 
 def test_gateway_proxies_crawler_prefix():
-    from api.data_app import app
+    from api.library_app import app
 
     paths = _paths(app)
     assert "/crawler/{path:path}" in paths          # HTTP 代理
     assert "/crawler/api/ws/logs" in paths          # WebSocket 代理
     assert "/gateway/status" in paths
+
+
+def test_media_urls_carry_library_prefix():
+    """story 接口返回给浏览器的媒体链接必须带 /library/api 前缀。"""
+    from api.service_paths import asset_url, library_api, media_url
+
+    assert library_api("assets/raw/a.png") == "/library/api/assets/raw/a.png"
+    assert asset_url("raw", "x/y.png") == "/library/api/assets/raw/x/y.png"
+    assert media_url("xhs", "abc", "1.png") == "/library/api/assets/media/xhs/abc/1.png"
 
 
 def test_discovery_falls_back_to_static_url_without_nacos(monkeypatch):

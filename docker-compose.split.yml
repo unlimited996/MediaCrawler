@@ -1,16 +1,16 @@
 # =============================================================================
-# 拆分部署：crawler 服务 + data 服务（data 同时是网关/唯一对外入口）
+# 拆分部署：crawler 服务 + library 内容库服务（library 同时是网关/唯一对外入口）
 #
 #   docker compose -f docker-compose.split.yml --env-file deploy/.env up -d
 #
-# 对外只有一个端口：data 的 8081
-#   http://host:8081/            前端
-#   http://host:8081/data/api/** 数据增删改查
-#   http://host:8081/crawler/api/** 抓取（按服务名转发给 crawler 容器）
+# 对外只有一个端口：library 的 8081
+#   http://host:8081/                 前端
+#   http://host:8081/library/api/**   内容库（帖子/评论/媒体/标签/菜谱/导出/S3）
+#   http://host:8081/crawler/api/**   抓取（按服务名转发给 crawler 容器）
 #
 # 两个容器都从同一批镜像仓库拉取，日志与环境变量文件全部挂到宿主机：
 #   ./logs/          应用日志（worker.out.log / *.console.log / scheduler_live.jsonl）
-#   ./deploy/.env    启动环境变量（数据库、Nacos、时区等），改完 restart 生效
+#   ./deploy/.env    启动环境变量（数据库、Nacos、时区等），改完 up -d 生效
 #   ./browser_data/  浏览器登录态（必须持久化，否则每轮都要重新扫码）
 #   ./data/          抓取产物
 # =============================================================================
@@ -34,7 +34,7 @@ services:
       - ./browser_data:/app/browser_data
       - ./database:/app/database
       - ./deploy:/app/deploy:ro
-    # 只在内网暴露给 data 容器；如需直连调试再打开
+    # 只在内网暴露给 library 容器；如需直连调试再打开
     # ports:
     #   - "8001:8001"
     healthcheck:
@@ -44,9 +44,9 @@ services:
       retries: 5
       start_period: 60s
 
-  data:
-    image: ${IMAGE_DATA:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-unlimited996}/mediacrawler-data:${IMAGE_TAG:-latest}}
-    container_name: mediacrawler-data
+  library:
+    image: ${IMAGE_LIBRARY:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-unlimited996}/mediacrawler-library:${IMAGE_TAG:-latest}}
+    container_name: mediacrawler-library
     restart: unless-stopped
     depends_on:
       crawler:
@@ -54,8 +54,8 @@ services:
     env_file:
       - ./deploy/.env
     environment:
-      APP_ROLE: data
-      SERVICE_NAME: ${DATA_SERVICE_NAME:-mediacrawler-data}
+      APP_ROLE: library
+      SERVICE_NAME: ${LIBRARY_SERVICE_NAME:-mediacrawler-library}
       SERVICE_PORT: "8081"
       PORT: "8081"
       GATEWAY_ENABLED: "1"
@@ -68,9 +68,9 @@ services:
       - ./database:/app/database
       - ./deploy:/app/deploy:ro
     ports:
-      - "${DATA_PORT:-8081}:8081"
+      - "${LIBRARY_PORT:-8081}:8081"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/data/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/library/health"]
       interval: 30s
       timeout: 5s
       retries: 5

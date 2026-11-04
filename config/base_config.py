@@ -225,7 +225,7 @@ WORKER_AUTO_SPAWN = _env_bool("WORKER_AUTO_SPAWN", True)
 # ---------------------------------------------------------------------------
 # 两个独立应用，URL 里的服务名决定打到哪个应用：
 #   /crawler/api/**  -> crawler 服务（抓取 + 调度 + 账号）
-#   /data/api/**     -> data 服务（数据增删改查 + 配置 + S3）
+#   /library/api/**  -> library 内容库（帖子/评论/媒体/标签/菜谱 + 配置 + S3）
 # 每个进程用 SERVICE_NAME 表明自己是谁，启动时注册到 Nacos。
 SERVICE_NAME = _env_str("SERVICE_NAME", "mediacrawler")
 # 本进程监听端口（容器内/宿主端口由部署决定）
@@ -243,11 +243,14 @@ NACOS_PASSWORD = _env_str("NACOS_PASSWORD", "")
 
 # 两个服务的注册名（Nacos 里的 serviceName），也是网关路由的目标
 CRAWLER_SERVICE_NAME = _env_str("CRAWLER_SERVICE_NAME", "mediacrawler-crawler")
-DATA_SERVICE_NAME = _env_str("DATA_SERVICE_NAME", "mediacrawler-data")
+LIBRARY_SERVICE_NAME = _env_str("LIBRARY_SERVICE_NAME", "mediacrawler-library")
 
 # Nacos 不可用时的静态兜底地址（本地开发/单机起两个进程最常用）
 CRAWLER_BASE_URL = _env_str("CRAWLER_BASE_URL", "http://127.0.0.1:8001")
-DATA_BASE_URL = _env_str("DATA_BASE_URL", "http://127.0.0.1:8081")
+LIBRARY_BASE_URL = _env_str("LIBRARY_BASE_URL", "http://127.0.0.1:8081")
+# 内容库的 API 前缀。story.py 拼「媒体/原始文件」链接时必须用同一份前缀，
+# 否则拆分部署下前端拿到的还是老的 /api/data/... → 404。
+LIBRARY_API_PREFIX = _env_str("LIBRARY_API_PREFIX", "/library/api")
 # 网关（服务名路由 + 静态页）是否随 data 服务一起启动
 GATEWAY_ENABLED = _env_bool("GATEWAY_ENABLED", True)
 # 跨服务调用/代理的超时（秒）

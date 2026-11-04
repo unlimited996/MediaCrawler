@@ -1,4 +1,4 @@
-# 拆分部署指南（crawler / data 两个独立应用 + Nacos）
+# 拆分部署指南（crawler / library 两个独立应用 + Nacos）
 
 > 2026-11-04：把原来「爬虫 + 数据增删改查」混在一个 FastAPI 应用里的结构，
 > 拆成两个可独立部署、独立重启的服务，用 **URL 里的服务名**路由，
@@ -13,11 +13,11 @@
                             │
         ┌───────────────────┴────────────────────┐
         │  http://host:8081/crawler/api/...      │  ← 服务名在 URL 里
-        │  http://host:8081/data/api/...         │
+        │  http://host:8081/library/api/...      │
         ▼
 ┌──────────────────────────────────────────────┐
-│ data 服务（8081）                             │
-│  /data/api/**   本地处理（数据增删改查）        │
+│ library 内容库服务（8081）                     │
+│  /library/api/** 本地处理（内容查询/增删改查）  │
 │  /crawler/**    按服务名转发 → crawler 服务    │──┐
 │  /              前端静态页                     │  │ Nacos 发现
 └──────────────────────────────────────────────┘  │
@@ -34,12 +34,12 @@
 
 | 服务 | 端口 | 职责 | 路径前缀 |
 |---|---|---|---|
-| `mediacrawler-data` | 8081 | 数据增删改查、配置、S3、菜谱、前端静态页、**网关** | `/data/api/**` |
+| `mediacrawler-library` | 8081 | 内容库：帖子/评论/媒体/标签/菜谱、配置、S3、前端静态页、**网关** | `/library/api/**` |
 | `mediacrawler-crawler` | 8001 | 抓取、定时调度、账号池、抓取配置、日志 WS | `/crawler/api/**` |
 
 两个服务**共享同一个数据库**；跨服务只做两类通信：
 - 网关按服务名转发（同步 HTTP / WebSocket）
-- crawler 跑完一轮 → POST `data` 的 `/data/api/internal/events`（异步、可丢）
+- crawler 跑完一轮 → POST `data` 的 `/library/api/internal/events`（异步、可丢）
 
 服务名、路径前缀、端口都可以用环境变量改，见 `deploy/.env.example`。
 
@@ -52,7 +52,7 @@ Nacos 部署在 `www.joyeuse.cn:8085`。两个服务启动时会自动注册：
 | 注册名 | 说明 |
 |---|---|
 | `mediacrawler-crawler` | crawler 服务实例 |
-| `mediacrawler-data` | data 服务实例 |
+| `mediacrawler-library` | 内容库服务实例 |
 
 验证：
 
@@ -83,8 +83,8 @@ Nacos 控制台：`http://www.joyeuse.cn:8085/nacos`（默认 nacos/nacos）。
 ```
 ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
 ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:sha-<7位>
-ccr.ccs.tencentyun.com/unlimited996/mediacrawler-data:latest
-ccr.ccs.tencentyun.com/unlimited996/mediacrawler-data:sha-<7位>
+ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:latest
+ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:sha-<7位>
 ```
 
 ### 3.1 配置密钥（必须）
@@ -113,7 +113,7 @@ docker login ccr.ccs.tencentyun.com -u 1000xxxxxxx
 
 # 2) 拉取（tag 用 latest 或具体的 sha-xxxxxxx）
 docker pull ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
-docker pull ccr.ccs.tencentyun.com/unlimited996/mediacrawler-data:latest
+docker pull ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:latest
 ```
 
 ---
@@ -135,7 +135,7 @@ docker compose -f docker-compose.split.yml --env-file deploy/.env up -d
 
 # 3) 看状态
 docker compose -f docker-compose.split.yml ps
-curl -fsS http://127.0.0.1:8081/data/health
+curl -fsS http://127.0.0.1:8081/library/health
 curl -fsS http://127.0.0.1:8081/crawler/health
 
 # 4) 看日志
@@ -162,7 +162,7 @@ docker compose -f docker-compose.split.yml logs -f --tail=100
 ### 5.2 只重启其中一个（这就是拆分的目的）
 
 ```bash
-docker compose -f docker-compose.split.yml restart data      # 接口重启，抓取不受影响
+docker compose -f docker-compose.split.yml restart library   # 接口重启，抓取不受影响
 docker compose -f docker-compose.split.yml restart crawler   # 抓取重启，接口不掉线
 ```
 
@@ -170,11 +170,11 @@ docker compose -f docker-compose.split.yml restart crawler   # 抓取重启，�
 
 ```bash
 docker compose -f docker-compose.split.yml pull
-docker compose -f docker-compose.split.yml up -d --no-deps data     # 只换 data
+docker compose -f docker-compose.split.yml up -d --no-deps library   # 只换 library
 docker compose -f docker-compose.split.yml up -d --no-deps crawler  # 只换 crawler
 ```
 
-`--no-deps` 是关键：换 data 时不会顺带重启 crawler（正在跑的抓取不中断）。
+`--no-deps` 是关键：换 library 时不会顺带重启 crawler（正在跑的抓取不中断）。
 
 ---
 
@@ -207,9 +207,9 @@ worker 有文件锁（`logs/.worker.lock`），多起不会重复执行；跨主
 
 | 现象 | 先看什么 |
 |---|---|
-| 页面打开空白 / 404 | `data` 容器是否起了；`curl :8081/` 是否 200 |
+| 页面打开空白 / 404 | `library` 容器是否起了；`curl :8081/` 是否 200 |
 | `/crawler/api/**` 返回 503 | 网关没发现实例：`curl :8081/gateway/status`；看 `NACOS_SERVER` 与 `CRAWLER_BASE_URL` |
-| 接口 500 | `logs/data.console.log` 尾部 traceback |
+| 接口 500 | `logs/library.console.log` 尾部 traceback |
 | 抓取不动 | `logs/worker.console.log`、`logs/worker.out.log`；`curl :8081/crawler/health` 看 `worker_alive` |
 | 定时任务一直 `queued` | worker 不在线（`worker_alive=false`）或 `SCHEDULER_ENABLED=0` |
 | Nacos 里看不到实例 | 容器网络到 8085 不通；`SERVICE_IP` 需手工指定时设成宿主机可达 IP |
@@ -218,7 +218,7 @@ worker 有文件锁（`logs/.worker.lock`），多起不会重复执行；跨主
 健康检查：
 
 ```bash
-curl -fsS :8081/data/health      # data + 网关
+curl -fsS :8081/library/health      # data + 网关
 curl -fsS :8081/crawler/health   # 经网关看 crawler
 curl -fsS :8081/gateway/status   # 路由表 + Nacos 发现结果
 ```
@@ -233,18 +233,18 @@ SERVICE_NAME=mediacrawler-crawler SERVICE_PORT=8001 \
   ./.venv/Scripts/python.exe -m uvicorn api.crawler_app:app --port 8001
 
 # 终端 2：data + 网关
-SERVICE_NAME=mediacrawler-data SERVICE_PORT=8081 \
+SERVICE_NAME=mediacrawler-library SERVICE_PORT=8081 \
   CRAWLER_BASE_URL=http://127.0.0.1:8001 \
-  ./.venv/Scripts/python.exe -m uvicorn api.data_app:app --port 8081
+  ./.venv/Scripts/python.exe -m uvicorn api.library_app:app --port 8081
 
 # 终端 3：抓取执行器（可选，crawler 会自动拉起）
 ./.venv/Scripts/python.exe -m worker
 ```
 
-只想跑一个进程时用一体化入口（同时挂 `/api`、`/crawler/api`、`/data/api`）：
+只想跑一个进程时用一体化入口（同时挂 `/api`、`/crawler/api`、`/library/api`）：
 
 ```bash
 ./.venv/Scripts/python.exe -m uvicorn api.main:app --port 8081
 ```
 
-前端构建：`cd webui && npm run build`（产物 `api/webui/`，由 data 服务托管）。
+前端构建：`cd webui && npm run build`（产物 `api/webui/`，由 library 服务托管）。
