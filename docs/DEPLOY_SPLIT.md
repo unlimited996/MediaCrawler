@@ -134,6 +134,16 @@ SKIP_WEBUI_BUILD=1 docker compose -f docker-compose.split.yml build   # 跳过�
 镜像名与 CI 一致（`ccr.ccs.tencentyun.com/unlimited996/mediacrawler-{crawler,library}:latest`），
 所以构建完 `docker compose up -d` 起的本地镜像、和服务器 `docker compose pull` 拉的镜像完全同源。
 
+一键构建并推送（GitHub Actions 暂时不可用时的兜底）：
+
+```bash
+export TENCENT_REGISTRY_USERNAME=1000xxxxxxx
+export TENCENT_REGISTRY_PASSWORD=********
+./deploy/build-push.sh                 # 构建 + 推 latest 与 sha-xxxxxxx
+TAG=v1.0.0 ./deploy/build-push.sh      # 额外打版本 tag
+PUSH=0 ./deploy/build-push.sh          # 只构建不推送
+```
+
 ## 4. 镜像发布（在服务器上）
 
 ```bash
