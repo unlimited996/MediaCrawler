@@ -5,6 +5,19 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-04] 变更 前端纳入 compose 构建；CI 改为一个 job 顺序产出两个镜像
+
+### 变更
+- **compose 可直接构建**：`docker-compose.split.yml` 两个服务都加了 `build:` 段
+  （`target: crawler` / `target: library`，参数 `NPM_REGISTRY`、`SKIP_WEBUI_BUILD`）。
+  `docker compose build` 会先跑 Stage 1 的 `npm run build`（前端 → `api/webui/`）再打进镜像，
+  镜像名与 CI 一致，本地构建的镜像和服务器拉取的镜像同源。
+- `env_file` 改为可选（`required: false`）：没建 `deploy/.env` 时也能 `config` / `build`。
+- **CI 由矩阵双 job 改为单 job 顺序构建**：前端只 `npm build` 一次，第二张镜像命中
+  同一 GHA cache scope（apt/pip/playwright 层只装一次），两张镜像必然来自同一份前端 + 同一份代码，
+  且在同一次运行里一起推送。新增 digest 汇总到 Job Summary。
+- `deploy/.env.example`、`docs/DEPLOY_SPLIT.md` 补充构建参数与「fork 仓库需先启用 Actions」说明。
+
 ## [2026-11-04] 变更 data 服务更名为 library（内容库），并把 /data 子路径改为 /assets
 
 ### 背景

@@ -1,7 +1,12 @@
 # =============================================================================
 # 拆分部署：crawler 服务 + library 内容库服务（library 同时是网关/唯一对外入口）
 #
+# 构建（本地，会先 npm build 前端再打进两个镜像；前端只编一次）：
+#   docker compose -f docker-compose.split.yml build
+# 启动（用本地刚构建的镜像）：
 #   docker compose -f docker-compose.split.yml --env-file deploy/.env up -d
+# 只拉远端镜像、不本地构建：
+#   docker compose -f docker-compose.split.yml pull
 #
 # 对外只有一个端口：library 的 8081
 #   http://host:8081/                 前端
@@ -18,10 +23,18 @@
 services:
   crawler:
     image: ${IMAGE_CRAWLER:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-unlimited996}/mediacrawler-crawler:${IMAGE_TAG:-latest}}
+    build:
+      context: .
+      target: crawler
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        SKIP_WEBUI_BUILD: ${SKIP_WEBUI_BUILD:-0}
     container_name: mediacrawler-crawler
     restart: unless-stopped
     env_file:
-      - ./deploy/.env
+      # required:false -> 没建 deploy/.env 时 compose 仍可 config/build（只是变量为空）
+      - path: ./deploy/.env
+        required: false
     environment:
       APP_ROLE: crawler
       SERVICE_NAME: ${CRAWLER_SERVICE_NAME:-mediacrawler-crawler}
@@ -46,13 +59,21 @@ services:
 
   library:
     image: ${IMAGE_LIBRARY:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-unlimited996}/mediacrawler-library:${IMAGE_TAG:-latest}}
+    build:
+      context: .
+      target: library
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        SKIP_WEBUI_BUILD: ${SKIP_WEBUI_BUILD:-0}
     container_name: mediacrawler-library
     restart: unless-stopped
     depends_on:
       crawler:
         condition: service_started
     env_file:
-      - ./deploy/.env
+      # required:false -> 没建 deploy/.env 时 compose 仍可 config/build（只是变量为空）
+      - path: ./deploy/.env
+        required: false
     environment:
       APP_ROLE: library
       SERVICE_NAME: ${LIBRARY_SERVICE_NAME:-mediacrawler-library}

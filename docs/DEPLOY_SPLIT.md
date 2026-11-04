@@ -74,6 +74,18 @@ Nacos 控制台：`http://www.joyeuse.cn:8085/nacos`（默认 nacos/nacos）。
 
 ## 3. GitHub Actions 流水线
 
+> **fork 仓库必须先手动启用一次 Actions**：GitHub 对 fork 默认**不运行任何工作流**，
+> 表现就是 Actions 页面一直显示 "There are no workflow runs yet"（即使 workflow
+> 文件存在、状态是 active，push 也不会触发）。
+>
+> 开启方法（二选一）：
+> 1. 打开 https://github.com/unlimited996/MediaCrawler/actions ，点页面上的绿色按钮
+>    **"I understand my workflows, go ahead and enable them"**；
+> 2. 或进 Settings → Actions → General → 选 **Allow all actions and reusable workflows** → Save。
+>
+> 开启**不会补跑历史提交**，开启后需要再产生一次 push，或在 Actions 页面点
+> `build-and-push` → **Run workflow** 手动触发一次。
+
 文件：`.github/workflows/build-push.yml`
 
 **触发**：push 到 `main`、push `v*` tag、或手动 Run workflow。
@@ -86,6 +98,10 @@ ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:sha-<7位>
 ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:latest
 ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:sha-<7位>
 ```
+
+**构建内容**：两张镜像都在 Stage 1 用 Node 构建前端（`webui/` → `api/webui/`），
+所以镜像自带界面，不依赖宿主机是否跑过 `npm run build`。一个 job 顺序构建两张镜像，
+前端只编一次、apt/pip/playwright 层共用 GHA 缓存。
 
 ### 3.1 配置密钥（必须）
 
@@ -104,6 +120,19 @@ ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:sha-<7位>
 Actions → `build-and-push` → Run workflow（可填 `extra_tag`，例如 `v1.0.0`）。
 
 ---
+
+## 3.3 本地构建（不打 CI 时）
+
+`docker-compose.split.yml` 里两个服务都带 `build:` 段，可以直接本地构建（会先 npm build 前端）：
+
+```bash
+docker compose -f docker-compose.split.yml build          # 两张镜像，前端只编一次
+docker compose -f docker-compose.split.yml build crawler  # 只构建抓取服务
+SKIP_WEBUI_BUILD=1 docker compose -f docker-compose.split.yml build   # 跳过前端重编
+```
+
+镜像名与 CI 一致（`ccr.ccs.tencentyun.com/unlimited996/mediacrawler-{crawler,library}:latest`），
+所以构建完 `docker compose up -d` 起的本地镜像、和服务器 `docker compose pull` 拉的镜像完全同源。
 
 ## 4. 镜像发布（在服务器上）
 
