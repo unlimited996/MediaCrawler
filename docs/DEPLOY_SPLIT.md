@@ -81,10 +81,10 @@ Nacos 控制台：`http://www.joyeuse.cn:8085/nacos`（默认 nacos/nacos）。
 **产物**（矩阵并行构建两个镜像）：
 
 ```
-ccr.ccs.tencentyun.com/<namespace>/mediacrawler-crawler:latest
-ccr.ccs.tencentyun.com/<namespace>/mediacrawler-crawler:sha-<7位>
-ccr.ccs.tencentyun.com/<namespace>/mediacrawler-data:latest
-ccr.ccs.tencentyun.com/<namespace>/mediacrawler-data:sha-<7位>
+ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
+ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:sha-<7位>
+ccr.ccs.tencentyun.com/unlimited996/mediacrawler-data:latest
+ccr.ccs.tencentyun.com/unlimited996/mediacrawler-data:sha-<7位>
 ```
 
 ### 3.1 配置密钥（必须）
@@ -95,7 +95,7 @@ ccr.ccs.tencentyun.com/<namespace>/mediacrawler-data:sha-<7位>
 |---|---|---|
 | Secret | `TENCENT_REGISTRY_USERNAME` | 腾讯云镜像仓库用户名（`1000xxxxxxx`） |
 | Secret | `TENCENT_REGISTRY_PASSWORD` | 镜像仓库密码 / 临时 token |
-| Variable | `TENCENT_NAMESPACE` | 镜像仓库命名空间，默认 `media` |
+| Variable | `TENCENT_NAMESPACE` | 镜像仓库命名空间，默认 `unlimited996` |
 
 > 未配置密钥时流水线**只构建不推送**（不会红），页面上会提示缺哪两个 secret。
 
@@ -112,8 +112,8 @@ Actions → `build-and-push` → Run workflow（可填 `extra_tag`，例如 `v1.
 docker login ccr.ccs.tencentyun.com -u 1000xxxxxxx
 
 # 2) 拉取（tag 用 latest 或具体的 sha-xxxxxxx）
-docker pull ccr.ccs.tencentyun.com/media/mediacrawler-crawler:latest
-docker pull ccr.ccs.tencentyun.com/media/mediacrawler-data:latest
+docker pull ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
+docker pull ccr.ccs.tencentyun.com/unlimited996/mediacrawler-data:latest
 ```
 
 ---
@@ -189,13 +189,13 @@ docker run -d --name mc-crawler-api \
   -e APP_ROLE=crawler -e WORKER_ENABLED=0 -e PORT=8001 \
   -v $PWD/logs:/app/logs -v $PWD/browser_data:/app/browser_data \
   -p 8001:8001 \
-  ccr.ccs.tencentyun.com/media/mediacrawler-crawler:latest
+  ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
 
 # 独立 worker 容器（同镜像，换命令）
 docker run -d --name mc-worker \
   --env-file deploy/.env -e APP_ROLE=worker \
   -v $PWD/logs:/app/logs -v $PWD/browser_data:/app/browser_data \
-  ccr.ccs.tencentyun.com/media/mediacrawler-crawler:latest python -m worker
+  ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest python -m worker
 ```
 
 worker 有文件锁（`logs/.worker.lock`），多起不会重复执行；跨主机部署时锁不共享，

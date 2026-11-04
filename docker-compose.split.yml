@@ -17,7 +17,7 @@
 
 services:
   crawler:
-    image: ${IMAGE_CRAWLER:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-media}/mediacrawler-crawler:${IMAGE_TAG:-latest}}
+    image: ${IMAGE_CRAWLER:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-unlimited996}/mediacrawler-crawler:${IMAGE_TAG:-latest}}
     container_name: mediacrawler-crawler
     restart: unless-stopped
     env_file:
@@ -45,7 +45,7 @@ services:
       start_period: 60s
 
   data:
-    image: ${IMAGE_DATA:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-media}/mediacrawler-data:${IMAGE_TAG:-latest}}
+    image: ${IMAGE_DATA:-ccr.ccs.tencentyun.com/${TENCENT_NAMESPACE:-unlimited996}/mediacrawler-data:${IMAGE_TAG:-latest}}
     container_name: mediacrawler-data
     restart: unless-stopped
     depends_on:

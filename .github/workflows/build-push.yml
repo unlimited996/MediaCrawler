@@ -26,9 +26,6 @@ concurrency:
 env:
   # 腾讯云容器镜像服务（个人版/企业版都适用）
   REGISTRY: ccr.ccs.tencentyun.com
-  NAMESPACE: ${{ vars.TENCENT_NAMESPACE || 'media' }}
-  # 没有配置密钥时只构建不推送，保证流水线本身可用来验证代码能不能打包
-  FORCE_PUSH: ${{ vars.FORCE_PUSH_IMAGE || '0' }}
 
 jobs:
   build:
@@ -53,6 +50,9 @@ jobs:
 
       - name: 计算镜像名与 tag
         id: meta
+        env:
+          # 命名空间用仓库变量覆盖；未配置时用默认值
+          NAMESPACE: ${{ vars.TENCENT_NAMESPACE || 'unlimited996' }}
         run: |
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           IMAGE="${REGISTRY}/${NAMESPACE}/mediacrawler-${{ matrix.service }}"
