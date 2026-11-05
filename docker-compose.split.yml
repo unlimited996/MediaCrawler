@@ -31,6 +31,8 @@ services:
         SKIP_WEBUI_BUILD: ${SKIP_WEBUI_BUILD:-0}
         # 默认完整 chromium；跨境推送慢时可设 chromium-headless-shell 省约 600MB
         PLAYWRIGHT_BROWSER: ${PLAYWRIGHT_BROWSER:-chromium}
+        # 国内构建换 apt 源（CI 不经过 compose，仍用 Dockerfile 默认的官方源）
+        APT_MIRROR: ${APT_MIRROR:-mirrors.ustc.edu.cn}
     container_name: mediacrawler-crawler
     restart: unless-stopped
     env_file:
@@ -69,6 +71,8 @@ services:
         SKIP_WEBUI_BUILD: ${SKIP_WEBUI_BUILD:-0}
         # 默认完整 chromium；跨境推送慢时可设 chromium-headless-shell 省约 600MB
         PLAYWRIGHT_BROWSER: ${PLAYWRIGHT_BROWSER:-chromium}
+        # 国内构建换 apt 源（CI 不经过 compose，仍用 Dockerfile 默认的官方源）
+        APT_MIRROR: ${APT_MIRROR:-mirrors.ustc.edu.cn}
     container_name: mediacrawler-library
     restart: unless-stopped
     depends_on:

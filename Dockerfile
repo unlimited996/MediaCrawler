@@ -91,7 +91,18 @@ WORKDIR /app
 #                    缺了 node 会在 import media_platform.douyin.help 时直接崩
 #    libgl1 等     : opencv-python / matplotlib 运行时动态库
 #    fonts-wqy-*   : 词云与图表里的中文不变成方块
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+#    国内服务器构建时 deb.debian.org 会卡死（实测 apt-get 挂 23 分钟无进展），
+#    用 --build-arg APT_MIRROR=mirrors.ustc.edu.cn 换国内源；CI 在海外不传、
+#    保持官方源。compose 里默认就是国内源。
+ARG APT_MIRROR=deb.debian.org
+RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+        sed -i "s|http://deb.debian.org|http://${APT_MIRROR}|g" \
+            /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+        sed -i "s|http://deb.debian.org|http://${APT_MIRROR}|g" \
+            /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
         nodejs \
         bash \
         curl \
