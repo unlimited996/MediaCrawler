@@ -263,6 +263,46 @@ crawler 通过 `ws://browser:9222` 连接，镜像就只剩 Python 运行时。�
 
 ---
 
+## 3.6 服务器一键脚本（国内构建 + 推送，绕开 Actions 跨境）
+
+GitHub runner 在海外，跨境推 CCR 极慢；国内服务器到 CCR 往返约 0.1s，
+所以在服务器上构建推送更稳。
+
+```bash
+# 首次（脚本随仓库一起 clone 下来）
+mkdir -p /opt && cd /opt
+git clone https://github.com/unlimited996/MediaCrawler.git mediacrawler
+cp /opt/mediacrawler/deploy/.env.example /opt/mediacrawler/deploy/.env
+chmod 600 /opt/mediacrawler/deploy/.env
+vi /opt/mediacrawler/deploy/.env     # 填 TENCENT_REGISTRY_USERNAME / PASSWORD
+
+# 固定入口（一次性）
+printf '#!/usr/bin/env bash\nexec bash /opt/mediacrawler/deploy/server-update.sh "$@"\n' \
+  > /usr/local/bin/mc-update
+chmod +x /usr/local/bin/mc-update
+
+# 以后每次只要一条
+mc-update
+```
+
+`deploy/server-update.sh` 流程：`git pull --ff-only` → 构建 crawler/library
+两张镜像（前端 npm build 只编一次）→ 打 `latest` + `sha-xxxxxxx` → 登录 CCR
+→ 推送 → 可选本机 `up -d`。
+
+| 环境变量 | 默认 | 用途 |
+|---|---|---|
+| `SKIP_PUSH=1` | 0 | 只构建验证，不登录/不推送 |
+| `APPLY_LOCAL=1` | 0 | 推完顺带把本机容器换成新镜像 |
+| `WEBUI_BUILD=0` | 1 | 跳过前端重编（仅当 `api/webui` 已有产物） |
+
+凭据优先读 `deploy/.env`，其次复用 `~/.docker/config.json` 里已保存的
+`docker login`；**构建前就检查**，没凭据不会白跑 20 分钟。`deploy/.env` 已在
+`.gitignore` 里，脚本自身不含任何密码。
+
+> 脚本会先 `git pull`，若自身被更新会自动 `exec` 重新执行，保证用新逻辑。
+
+---
+
 ## 4. 镜像发布（在服务器上）
 
 ```bash

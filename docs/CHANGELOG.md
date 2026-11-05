@@ -5,6 +5,25 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-05] 新增服务器一键构建推送脚本（绕开 Actions 跨境）
+
+### 背景
+- GitHub runner 跨境推 CCR 反复超时；国内服务器到 CCR 往返约 0.1s，
+  改在服务器（Ubuntu 24.04 / Docker 29 / Compose v5）上拉代码构建推送。
+
+### 新增
+- `deploy/server-update.sh`：`git pull --ff-only` → `docker compose build`
+  两张镜像 → 打 `latest` + `sha-<7>` → 登录 CCR → `docker push` →
+  可选 `APPLY_LOCAL=1` 本机 `up -d`。
+  * 凭据从 `deploy/.env` 读（或复用已保存的 `docker login`），**构建前先校验**，
+    缺凭据直接 fail fast，不白构建；脚本自身不含密码。
+  * 脚本先 `git pull`，若自身被更新则 `exec` 重新执行，保证用新逻辑。
+  * 开关：`SKIP_PUSH=1`（只构建验证）、`APPLY_LOCAL=1`、`WEBUI_BUILD=0`。
+- `deploy/.env.example`：补 `TENCENT_REGISTRY_USERNAME` /
+  `TENCENT_REGISTRY_PASSWORD` 占位与 `PLAYWRIGHT_BROWSER=chromium-headless-shell`。
+- `docs/DEPLOY_SPLIT.md` 3.6：首次 clone / 建 `/usr/local/bin/mc-update`
+  固定入口 / 以后一条 `mc-update`。
+
 ## [2026-11-05] 镜像瘦身：library 不再带浏览器、crawler 改无头内核
 
 ### 现象 / 追问
