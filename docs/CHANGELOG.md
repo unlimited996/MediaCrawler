@@ -5,6 +5,46 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-05] 修复定时任务状态不同步、抓取日志不滚动，新增「停止当前抓取」
+
+### 现象
+- 定时任务页顶部显示「未启动」，但执行记录 / 任务卡片明明显示「正在执行」。
+- 抓取页面打开后日志不滚动，看不到独立执行器（worker）里正在跑的抓取输出。
+- 页面上没有手段终止一轮正在跑的抓取，只能等它跑完或去手工杀进程。
+
+### 根因
+1. 拆分部署后调度跑在独立 worker 进程里，API 进程内
+   `task_scheduler.started` 恒为 `false`、`_states` 恒为空：
+   - 顶部徽章只读 `started` → 永远「未启动」；
+   - `/scheduler/status` 的 `running_tasks` 只数内存 `_states` → 恒为 0，
+     前端据此禁用「停止抓取」按钮，状态一滞后按钮就点不了。
+2. 实时日志原本只走 crawler 进程的内存队列（手动抓取用），worker 的日志
+   写在 `logs/scheduler_live.jsonl`，WS 通道没有读它 → 定时任务跑起来页面无输出。
+
+### 修复
+- **状态**：`get_status()` 在内存计数为 0 时改从 DB 统计
+  `ScheduledTaskRun.status='running'`；前端徽章改为 `started || worker_alive`，
+  并展示 `mode` / `queued_runs` 徽标。
+- **日志桥**：新增 `_live_log_tailer()` 每秒增量 tail `scheduler_live.jsonl`
+  并广播；WS 连接时补发最近 100 条；crawler 启动即拉起该 tailer，
+  不再等第一个连接。实测补发 100 条 + 新日志 1 秒内推送成功。
+- **停止抓取**：新增 `tools/crawl_stop.py`（共享目录信号文件 + 120s TTL），
+  `api/services/crawl_control.py` 统一入口；`POST /crawler/stop` 与
+  `POST /scheduler/stop` 都走它；worker 侧 `execute_task` 加每秒看门狗，
+  命中即杀抓取子进程树、把本轮记为 `stopped`（不自动重试、进度保留）；
+  新一轮开始先 `clear_stop()` 避免残留信号误杀。
+- **前端**：定时任务页新增「停止抓取」按钮（不再依赖可能滞后的 `hasRunning`
+  做禁用，后端幂等：没任务在跑返回 `stopped:false` + 提示）；
+  `RunStatus` 增加 `stopped`，中英文 i18n 补齐 `actions.stop` / `queuedRuns`。
+
+### 验收
+- 后端 `py_compile` 全通过；`npm run build` 产出 `index-Cxu9a5ga.js`。
+- 重启后 8001 / 8081 均监听，Nacos 注册 `mediacrawler-crawler` /
+  `mediacrawler-library` 成功；`/crawler/api/scheduler/status` 经网关返回
+  `worker_alive=true`、`mode=worker`。
+- WS 自检：连接补发 100 条历史，追加一行后 1 秒内收到广播。
+- `POST /crawler/api/scheduler/stop` 返回 200 且结构完整。
+
 ## [2026-11-05] 修复 Nacos 3.x 注册失败（v1 接口已移除 / 无 beat 接口 / 端口填错）
 
 ### 现象

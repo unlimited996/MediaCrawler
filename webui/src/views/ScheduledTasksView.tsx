@@ -13,6 +13,7 @@ import { Badge } from '@/components/ui/badge'
 import {
   useSchedulerTasks, useSchedulerStatus, useSchedulerRuns, useSchedulerDimensions,
   useCreateTask, useUpdateTask, useDeleteTask, useToggleTask, useRunTask,
+  useStopScheduler,
 } from '@/hooks/useScheduler'
 import type { ScheduledTask, ScheduledTaskPayload, TaskType, TaskDimension,
               RunStatus, RunStatsItem } from '@/types/scheduler'
@@ -137,6 +138,7 @@ export function ScheduledTasksView() {
   const deleteM = useDeleteTask()
   const toggleM = useToggleTask()
   const runM = useRunTask()
+  const stopM = useStopScheduler()
 
   const [editing, setEditing] = useState<ScheduledTask | null>(null)
   const [showForm, setShowForm] = useState(false)
@@ -151,7 +153,15 @@ export function ScheduledTasksView() {
   const dimensions = dimensionsQ.data
   const accounts = dimensions?.accounts || []
   const busy = createM.isPending || updateM.isPending || deleteM.isPending
-    || toggleM.isPending || runM.isPending
+    || toggleM.isPending || runM.isPending || stopM.isPending
+
+  // 拆分部署后调度器跑在独立 worker 进程里，本进程的 started 永远是 false，
+  // 所以「运行中」要同时看 worker_alive，否则顶部会显示"未启动"但任务明明在跑
+  const schedulerLive = Boolean(status?.started || status?.worker_alive)
+  const hasRunning = useMemo(
+    () => (status?.running_tasks || 0) > 0 || tasks.some((x) => x.status === 'running'),
+    [status?.running_tasks, tasks],
+  )
 
   const filteredTasks = useMemo(
     () => (dimFilter === 'all' ? tasks : tasks.filter((x) => dimensionOf(x) === dimFilter)),
@@ -240,9 +250,19 @@ export function ScheduledTasksView() {
         <div className="flex items-center gap-2 flex-wrap">
           {status && (
             <>
-              <Badge variant="outline" className={`text-[10px] font-mono ${status.started ? 'border-cyber-neon-green/40 text-cyber-neon-green' : 'border-cyber-neon-pink/40 text-cyber-neon-pink'}`}>
-                {status.started ? t('statusRunning') : t('statusStopped')}
+              <Badge
+                variant="outline"
+                title={status.mode === 'worker'
+                  ? `执行器独立运行${status.worker?.pid ? `（pid ${status.worker.pid}）` : ''}`
+                  : undefined}
+                className={`text-[10px] font-mono ${schedulerLive ? 'border-cyber-neon-green/40 text-cyber-neon-green' : 'border-cyber-neon-pink/40 text-cyber-neon-pink'}`}>
+                {schedulerLive ? t('statusRunning') : t('statusStopped')}
               </Badge>
+              {(status.queued_runs || 0) > 0 && (
+                <Badge variant="outline" className="text-[10px] font-mono border-cyber-neon-orange/40 text-cyber-neon-orange">
+                  {t('queuedRuns', { count: status.queued_runs })}
+                </Badge>
+              )}
               <Badge variant="outline" className="text-[10px] font-mono border-cyber-border-subtle text-cyber-text-secondary">
                 {t('enabledTasks', { count: status.enabled_tasks })}
               </Badge>
@@ -257,6 +277,24 @@ export function ScheduledTasksView() {
               </Badge>
             </>
           )}
+          {/* 不用 hasRunning 禁用：worker 模式下状态可能滞后（正是本次要修的
+              「状态不同步」），一旦判错按钮就点不了。后端 /scheduler/stop 是幂等
+              的，此刻没任务在跑也返回 200 + stopped:false，点了只是提示一句，
+              没有副作用。hasRunning 仅用于提示文案。 */}
+          <Button
+            onClick={() => stopM.mutate()}
+            variant="outline" size="sm"
+            disabled={stopM.isPending}
+            title={hasRunning
+              ? '停止正在执行的抓取（含执行器里的定时任务）'
+              : '停止当前抓取；若此刻没有任务在执行会提示「当前没有正在执行的抓取」'}
+            className="h-8 border-cyber-border-DEFAULT font-mono text-[11px] hover:border-cyber-neon-pink/50 hover:text-cyber-neon-pink disabled:opacity-40"
+          >
+            {stopM.isPending
+              ? <Loader2 className="w-3 h-3 animate-spin" />
+              : <Square className="w-3 h-3" />}
+            {t('actions.stop')}
+          </Button>
           <Button
             onClick={() => { tasksQ.refetch(); runsQ.refetch(); statusQ.refetch() }}
             variant="outline" size="sm"

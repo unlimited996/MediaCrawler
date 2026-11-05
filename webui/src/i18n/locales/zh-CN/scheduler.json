@@ -78,7 +78,8 @@
     "cancel": "取消",
     "create": "创建",
     "viewRuns": "执行记录",
-    "refresh": "刷新"
+    "refresh": "刷新",
+    "stop": "停止抓取"
   },
   "runStatus": {
     "success": "成功",
@@ -117,5 +118,6 @@
     "runSkipped": "该任务正在执行中，已跳过本次触发（幂等保护）",
     "runFailed": "执行失败：{{msg}}",
     "confirmDelete": "确定删除任务「{{name}}」？执行记录会一并删除。"
-  }
+  },
+  "queuedRuns": "排队 {{count}}"
 }

@@ -78,7 +78,8 @@
     "cancel": "Cancel",
     "create": "Create",
     "viewRuns": "Run history",
-    "refresh": "Refresh"
+    "refresh": "Refresh",
+    "stop": "Stop crawl"
   },
   "runStatus": {
     "success": "Success",
@@ -117,5 +118,6 @@
     "runSkipped": "Task is already running; this trigger was skipped (idempotency)",
     "runFailed": "Execution failed: {{msg}}",
     "confirmDelete": "Delete task \"{{name}}\"? Run history will be removed too."
-  }
+  },
+  "queuedRuns": "Queued {{count}}"
 }

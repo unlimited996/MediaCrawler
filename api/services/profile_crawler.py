@@ -422,6 +422,15 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
     if on_log:
         on_log(f"启动抓取：{' '.join(cmd[:6])} ...", "info")
 
+    # 新一轮开始：清掉可能残留的「停止当前抓取」标记，
+    # 否则上一轮点过停止、人走开了，本轮刚起来就会被误杀
+    try:
+        from tools.crawl_stop import clear_stop
+
+        clear_stop()
+    except Exception:
+        pass
+
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     try:
         proc = subprocess.Popen(
@@ -439,6 +448,8 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
     # 4) 流式读输出 + 超时控制
     lines: List[str] = []
     timed_out = False
+    #: 用户点「停止抓取」后置位（跨进程信号文件，见 tools/crawl_stop.py）
+    stop_state: Dict[str, Any] = {"hit": False, "reason": ""}
 
     async def _pump() -> None:
         loop = asyncio.get_running_loop()
@@ -455,6 +466,26 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
             if on_log:
                 on_log(line, "info")
 
+    async def _stop_watchdog() -> None:
+        """每秒看一次「停止抓取」信号；命中就杀掉整棵子进程树。
+
+        单独开协程而不是塞进 _pump：爬虫可能几十秒不输出一行，
+        靠 readline 的回调兜不住，停止按钮会显得"点了没反应"。
+        """
+        from tools.crawl_stop import stop_requested
+
+        while proc.poll() is None:
+            info = stop_requested()
+            if info:
+                stop_state["hit"] = True
+                stop_state["reason"] = str(info.get("reason") or "用户手动停止")
+                if on_log:
+                    on_log(f"收到停止请求（{stop_state['reason']}），正在终止抓取…", "warning")
+                _kill_tree(proc)
+                return
+            await asyncio.sleep(1)
+
+    watchdog = asyncio.create_task(_stop_watchdog())
     try:
         await asyncio.wait_for(_pump(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -463,6 +494,12 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
         try:
             await asyncio.wait_for(proc.wait(), timeout=20)
         except Exception:
+            pass
+    finally:
+        watchdog.cancel()
+        try:
+            await watchdog
+        except (asyncio.CancelledError, Exception):
             pass
 
     # stdout EOF 只代表管道关闭，进程可能还没被 reap，poll() 会返回 None。
@@ -522,7 +559,18 @@ async def _run_once(task: Dict[str, Any], busy_wait_sec: int,
     # 这种情况必须报失败——否则任务显示 success，用户只看得到「帖子进来了、
     # 评论是空的」，还无从判断是没评论还是被风控了。
     risk_line = next((l for l in lines if RISK_ABORT_MARKER in l), "")
-    if timed_out:
+    if stop_state["hit"]:
+        try:
+            from tools.crawl_stop import clear_stop
+
+            clear_stop()          # 消费掉信号，别影响下一轮
+        except Exception:
+            pass
+        res.status = "stopped"
+        res.error = f"{stop_state['reason']}（已终止本轮抓取，进度已保留）"
+        if on_log:
+            on_log(res.error, "warning")
+    elif timed_out:
         res.status = "timeout"
         res.error = f"执行超过 {timeout}s 已终止"
     elif risk_line:
@@ -583,6 +631,11 @@ async def execute_task(task: Dict[str, Any], busy_wait_sec: int = 300,
             break
         if result.status == "skipped":
             break  # 通道被占不是任务的错，重试没有意义
+        if result.status == "stopped":
+            # 用户主动停止：绝不能自动重试，否则等于跟用户对着干
+            if on_log:
+                on_log("本轮已被用户停止，不自动重试", "warning")
+            break
         # 风控熔断不重试：被平台验证码/限流整批拦下后 60s 就再打一轮，
         # 只会把账号越推越死（熔断的意义本来就是踩刹车）。等下一轮排期，
         # 留出冷却/人工过验证码的时间。

@@ -1073,6 +1073,10 @@ class TaskScheduler:
     # ---------- 状态 ----------
 
     async def get_status(self) -> Dict[str, Any]:
+        # 本进程内存里的运行数只在 inline 兼容模式有效。拆分部署后调度跑在独立
+        # worker 进程里，API 进程的 _states 恒为空 → running_tasks 永远返回 0，
+        # 前端「执行中」徽章和「停止抓取」按钮就会拿不到真实状态。所以内存计数
+        # 为 0 时再从 DB 读一次 running 记录（worker 每次开跑都会写库）。
         running = sum(1 for s in self._states.values() if s.running)
         queued = 0
         try:
@@ -1089,6 +1093,10 @@ class TaskScheduler:
                     queued = (await session.execute(
                         select(func.count()).select_from(ScheduledTaskRun)
                         .where(ScheduledTaskRun.status == "queued"))).scalar() or 0
+                    if not running:
+                        running = int((await session.execute(
+                            select(func.count()).select_from(ScheduledTaskRun)
+                            .where(ScheduledTaskRun.status == "running"))).scalar() or 0)
         except Exception:
             total = enabled = 0
 

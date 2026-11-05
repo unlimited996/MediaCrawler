@@ -7,7 +7,7 @@ export type TaskDimension = 'author' | 'note' | 'account'
 export type BehaviorSource = 'likes' | 'collects'
 export type TaskMode = 'full' | 'incremental'
 export type ScheduleType = 'interval' | 'cron'
-export type RunStatus = 'running' | 'success' | 'failed' | 'timeout' | 'skipped'
+export type RunStatus = 'running' | 'success' | 'failed' | 'timeout' | 'skipped' | 'stopped'
 export type TriggerType = 'schedule' | 'manual'
 
 export interface TaskOptions {
@@ -98,7 +98,15 @@ export interface RunStats {
 }
 
 export interface SchedulerStatus {
+  /** 本进程是否在跑调度（拆分后 API 进程永远是 false，真正在跑的是 worker） */
   started: boolean
+  /** 抓取执行位置：worker=独立执行器 / inline=进程内兼容模式 / offline=执行器未运行 */
+  mode?: 'worker' | 'inline' | 'offline'
+  /** 执行器存活信息 */
+  worker_alive?: boolean
+  worker?: { alive: boolean; pid: number | null; started_at: string | null }
+  /** 排队中（等执行器拾取）的手动触发数 */
+  queued_runs?: number
   enabled: boolean
   max_concurrency: number
   tick_sec: number

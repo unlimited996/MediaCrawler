@@ -79,11 +79,96 @@ async def log_broadcaster():
 _broadcaster_task: Optional[asyncio.Task] = None
 
 
+# ---------------------------------------------------------------------------
+# 跨进程日志桥：worker（定时任务执行器）把日志写进 logs/scheduler_live.jsonl，
+# 这里把它「增量 tail 出来」推给前端。
+#
+# 为什么必须这么做：拆分后定时任务跑在 worker 进程里，它的日志不在本进程的
+# crawler_manager 内存队列中，只靠内存队列的话，页面上定时任务跑起来是"没日志"的
+# （用户反馈的「抓取页面未滚动显示日志」就是这个原因）。
+# ---------------------------------------------------------------------------
+
+#: live 日志条目的 id 从这里开始，避免和 crawler_manager 的自增 id 撞号
+_LIVE_ID_BASE = 1_000_000
+_live_seq = 0
+_tailer_task: Optional[asyncio.Task] = None
+
+
+def _live_entry(item: dict) -> dict:
+    """把 JSONL 的一行转成前端认的 LogEntry 结构。"""
+    global _live_seq
+    _live_seq += 1
+    return {
+        "id": _LIVE_ID_BASE + _live_seq,
+        "timestamp": item.get("ts") or "",
+        "level": item.get("level") or "info",
+        "message": item.get("msg") or "",
+    }
+
+
+def _read_live_tail(limit: int = 100) -> list:
+    """读最近 N 条 worker 日志（新连接进来时补历史，避免页面空白）。"""
+    try:
+        from ..services.worker_control import tail_live
+
+        return [_live_entry(e) for e in tail_live(limit)]
+    except Exception:
+        return []
+
+
+async def _live_log_tailer() -> None:
+    """每秒检查一次 live 日志文件，把新增行广播给所有连接。"""
+    import os as _os
+
+    try:
+        from ..services.worker_control import LIVE_LOG
+    except Exception:
+        return
+
+    pos = 0
+    try:
+        if _os.path.exists(LIVE_LOG):
+            pos = _os.path.getsize(LIVE_LOG)   # 只推启动之后的新增，历史由连接时补发
+    except Exception:
+        pos = 0
+
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            if not _os.path.exists(LIVE_LOG):
+                continue
+            size = _os.path.getsize(LIVE_LOG)
+            if size < pos:      # 文件被裁剪/轮转
+                pos = 0
+            if size == pos:
+                continue
+            import json as _json
+
+            with open(LIVE_LOG, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(pos)
+                chunk = fh.read()
+                pos = fh.tell()
+            for line in chunk.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = _json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(item, dict) and item.get("msg"):
+                    await manager.broadcast(_live_entry(item))
+        except Exception:
+            continue
+
+
 def start_broadcaster():
     """Start broadcast task"""
-    global _broadcaster_task
+    global _broadcaster_task, _tailer_task
     if _broadcaster_task is None or _broadcaster_task.done():
         _broadcaster_task = asyncio.create_task(log_broadcaster())
+    if _tailer_task is None or _tailer_task.done():
+        _tailer_task = asyncio.create_task(_live_log_tailer())
 
 
 @router.websocket("/ws/logs")
@@ -98,12 +183,19 @@ async def websocket_logs(websocket: WebSocket):
         await manager.connect(websocket)
         print(f"[WS] Connected, active connections: {len(manager.active_connections)}")
 
-        # Send existing logs
+        # Send existing logs（本进程内存：手动抓取）
         for log in crawler_manager.logs:
             try:
                 await websocket.send_json(log.model_dump())
             except Exception as e:
                 print(f"[WS] Error sending existing log: {e}")
+                break
+
+        # 补发 worker（定时任务）最近的日志，否则新开页面看不到定时任务在干什么
+        for entry in _read_live_tail(100):
+            try:
+                await websocket.send_json(entry)
+            except Exception:
                 break
 
         print(f"[WS] Sent {len(crawler_manager.logs)} existing logs, entering main loop")

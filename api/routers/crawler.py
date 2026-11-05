@@ -81,15 +81,18 @@ async def start_crawler(request: CrawlerStartRequest):
 
 @router.post("/stop")
 async def stop_crawler():
-    """Stop crawler task"""
-    success = await crawler_manager.stop()
-    if not success:
-        # Handle concurrent/duplicate requests: if process already exited/doesn't exist, return 400 instead of 500
-        if not crawler_manager.process or crawler_manager.process.poll() is not None:
-            raise HTTPException(status_code=400, detail="No crawler is running")
-        raise HTTPException(status_code=500, detail="Failed to stop crawler")
+    """停止当前抓取（手动抓取 + 执行器里的定时任务都覆盖）。
 
-    return {"status": "ok", "message": "Crawler stopped successfully"}
+    拆分成两个服务后，定时任务跑在独立 worker 进程里，crawler 进程够不着，
+    所以这里除了停本地子进程，还会往共享目录投一个停止信号（见
+    tools/crawl_stop.py），由 worker 自己把子进程杀掉。
+
+    没有在跑时也返回 200（`stopped: false`），避免前端把"本来就没在跑"
+    当成失败弹窗。
+    """
+    from ..services.crawl_control import stop_current_crawl
+
+    return await stop_current_crawl()
 
 
 @router.get("/status", response_model=CrawlerStatusResponse)

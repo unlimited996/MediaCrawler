@@ -104,6 +104,20 @@ function enabledLabel() {
   return '任务状态已更新'
 }
 
+export function useStopScheduler() {
+  const invalidate = useInvalidate()
+  return useMutation({
+    mutationFn: () => schedulerApi.stop(),
+    onSuccess: (res) => {
+      const d = res.data
+      if (d.stopped) toast.success(d.message || '已停止当前抓取')
+      else toast.info(d.message || '当前没有正在执行的抓取')
+      invalidate()
+    },
+    onError: (e: Error) => toast.error(`停止失败: ${e.message}`),
+  })
+}
+
 export function useRunTask() {
   const invalidate = useInvalidate()
   return useMutation({

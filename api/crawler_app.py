@@ -89,6 +89,14 @@ async def _on_startup() -> None:
     discovery.register_self()
     # 抓取运行时：默认交给独立 worker；SCHEDULER_IN_API=1 时在本进程内跑
     boot_tasks.start_crawler_runtime()
+    # 实时日志桥：服务一启动就增量 tail worker 的 scheduler_live.jsonl，
+    # 不必等第一个 WS 连上来才启动（WS 连接时 start_broadcaster 也是幂等的）。
+    try:
+        from .routers.websocket import start_broadcaster
+
+        start_broadcaster()
+    except Exception as e:
+        print(f"[crawler] 日志桥启动失败（不影响服务）：{e}", flush=True)
     print(f"[crawler] 服务已启动：{SERVICE_PREFIX}/api/**  "
           f"worker={os.getpid()}", flush=True)
 

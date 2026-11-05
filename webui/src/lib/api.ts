@@ -451,6 +451,10 @@ export const schedulerApi = {
     api.post<{ status: string; reason?: string; message?: string; new_count?: number;
                 updated_count?: number; run_id?: number; error?: string }>(
       `/scheduler/tasks/${id}/run`),
+  /** 停止当前正在执行的抓取（执行器里的定时任务也会被停掉，约 1~2 秒生效） */
+  stop: () =>
+    api.post<{ status: string; stopped: boolean; message: string;
+               local_crawl_stopped: boolean; worker_alive: boolean }>('/scheduler/stop'),
   listRuns: (taskId?: number, limit = 50) =>
     api.get<ScheduledTaskRun[]>('/scheduler/runs', {
       params: { task_id: taskId, limit },

@@ -171,6 +171,18 @@ async def run_task(task_id: int):
     return result
 
 
+@router.post("/stop")
+async def stop_current_run():
+    """停止当前正在执行的抓取（定时任务页的「停止抓取」按钮）。
+
+    与 `/crawler/stop` 是同一套逻辑：定时任务实际跑在独立 worker 进程里，
+    本接口只负责投递停止信号，真正的终止由 worker 侧完成（约 1~2 秒）。
+    """
+    from ..services.crawl_control import stop_current_crawl
+
+    return await stop_current_crawl(reason="用户在定时任务页手动停止")
+
+
 @router.get("/tasks/{task_id}/runs", response_model=List[ScheduledTaskRunOut])
 async def list_task_runs(task_id: int, limit: int = 50):
     """某个任务的执行记录。"""
