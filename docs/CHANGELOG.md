@@ -12,7 +12,12 @@
   改在服务器（Ubuntu 24.04 / Docker 29 / Compose v5）上拉代码构建推送。
 
 ### 新增
-- `deploy/server-update.sh`：`git pull --ff-only` → `docker compose build`
+- **网络适配**：实测国内服务器 `github.com:443` 常年超时（`git clone` /
+  `git ls-remote` 均失败），但 `api.github.com` 0.75s、`codeload.github.com`
+  19MB/22s 可用 → 脚本改用「API 取 commit sha + codeload tarball + rsync 覆盖」
+  拉代码，服务器不需要 `.git`，不依赖 GitHub 主站。
+- `deploy/server-update.sh`：取 sha → 下 tarball → `rsync --delete` 覆盖（保留
+  `deploy/.env`/日志/数据/浏览器登录态）→ `docker compose build`
   两张镜像 → 打 `latest` + `sha-<7>` → 登录 CCR → `docker push` →
   可选 `APPLY_LOCAL=1` 本机 `up -d`。
   * 凭据从 `deploy/.env` 读（或复用已保存的 `docker login`），**构建前先校验**，

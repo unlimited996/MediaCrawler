@@ -268,13 +268,18 @@ crawler 通过 `ws://browser:9222` 连接，镜像就只剩 Python 运行时。�
 GitHub runner 在海外，跨境推 CCR 极慢；国内服务器到 CCR 往返约 0.1s，
 所以在服务器上构建推送更稳。
 
+> ⚠️ 国内服务器到 `github.com:443` 常年超时，**`git clone` / `git pull` 不可用**；
+> 但 `api.github.com`（取 commit sha）和 `codeload.github.com`（下源码 tarball）
+> 稳定。脚本走这两条通道，服务器**不需要 .git**。
+
 ```bash
-# 首次（脚本随仓库一起 clone 下来）
-mkdir -p /opt && cd /opt
-git clone https://github.com/unlimited996/MediaCrawler.git mediacrawler
-cp /opt/mediacrawler/deploy/.env.example /opt/mediacrawler/deploy/.env
-chmod 600 /opt/mediacrawler/deploy/.env
-vi /opt/mediacrawler/deploy/.env     # 填 TENCENT_REGISTRY_USERNAME / PASSWORD
+# 首次：codeload 拉代码（不是 git clone）
+mkdir -p /opt/mediacrawler && cd /opt/mediacrawler
+SHA=$(curl -fsSL https://api.github.com/repos/unlimited996/MediaCrawler/commits/main | jq -r .sha)
+curl -fsSL "https://codeload.github.com/unlimited996/MediaCrawler/tar.gz/$SHA" \
+  | tar xz --strip-components=1
+cp deploy/.env.example deploy/.env && chmod 600 deploy/.env
+vi deploy/.env     # 填 TENCENT_REGISTRY_USERNAME / TENCENT_REGISTRY_PASSWORD
 
 # 固定入口（一次性）
 printf '#!/usr/bin/env bash\nexec bash /opt/mediacrawler/deploy/server-update.sh "$@"\n' \
@@ -285,9 +290,10 @@ chmod +x /usr/local/bin/mc-update
 mc-update
 ```
 
-`deploy/server-update.sh` 流程：`git pull --ff-only` → 构建 crawler/library
-两张镜像（前端 npm build 只编一次）→ 打 `latest` + `sha-xxxxxxx` → 登录 CCR
-→ 推送 → 可选本机 `up -d`。
+`deploy/server-update.sh` 流程：API 取 sha → codeload 下 tarball →
+`rsync --delete` 覆盖代码（保留 `deploy/.env`、日志、数据、浏览器登录态）→
+构建 crawler/library 两张镜像（前端 npm build 只编一次）→ 打 `latest` +
+`sha-xxxxxxx` → 登录 CCR → 推送 → 可选本机 `up -d`。
 
 | 环境变量 | 默认 | 用途 |
 |---|---|---|

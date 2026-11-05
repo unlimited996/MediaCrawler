@@ -3,13 +3,18 @@
 # 服务器一键更新：拉取代码 -> 构建 crawler/library 两张镜像 -> 打 tag
 #                 -> 登录腾讯云 CCR -> 推送 -> （可选）本机重启容器
 #
+# 为什么不用 git clone：国内服务器到 github.com:443 极不稳定（git ls-remote
+# 常年超时），但 api.github.com 与 codeload.github.com 稳定可达。
+# 所以这里用「API 取 commit sha + codeload 下 tarball + rsync 覆盖」拉代码，
+# 服务器不需要 .git，也不依赖 GitHub 主站。
+#
 # 用法（在服务器上）：
 #   mc-update                          # 完整流程
-#   SKIP_PUSH=1 mc-update              # 只构建验证，不推送（首次排障用）
+#   SKIP_PUSH=1 mc-update              # 只构建验证，不登录/不推送
 #   APPLY_LOCAL=1 mc-update            # 推完顺便把本机容器换成新镜像
 #   WEBUI_BUILD=0 mc-update            # 跳过前端重编（仅当 api/webui 已有产物）
 #
-# 凭据：从 deploy/.env 读取 TENCENT_REGISTRY_USERNAME / TENCENT_REGISTRY_PASSWORD；
+# 凭据：从 deploy/.env 读 TENCENT_REGISTRY_USERNAME / TENCENT_REGISTRY_PASSWORD；
 #       也可先手工 `docker login ccr.ccs.tencentyun.com`，脚本会复用已存凭据。
 #       **不要把密码写进本脚本或提交到仓库。**
 # =============================================================================
@@ -20,6 +25,8 @@ REPO_DIR="$(pwd)"
 SELF="$(readlink -f "$0")"
 COMPOSE_FILE="docker-compose.split.yml"
 
+GITHUB_REPO="${GITHUB_REPO:-unlimited996/MediaCrawler}"
+BRANCH="${BRANCH:-main}"
 REGISTRY="${REGISTRY:-ccr.ccs.tencentyun.com}"
 SKIP_PUSH="${SKIP_PUSH:-0}"
 APPLY_LOCAL="${APPLY_LOCAL:-0}"
@@ -29,16 +36,50 @@ log() { echo "[$(date '+%F %T')] $*"; }
 die() { echo "[$(date '+%F %T')] !! $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 1) 拉代码。脚本自身若被更新，重新执行一遍，避免用旧逻辑跑新代码。
+# 1) 拉代码：api.github.com 取 sha -> codeload 下 tarball -> rsync 覆盖
+#    运行时文件（.env / 日志 / 数据 / 浏览器登录态 / 已构建前端）不删。
 # ---------------------------------------------------------------------------
-log "拉取最新代码：git pull --ff-only ($REPO_DIR)"
-BEFORE="$(md5sum "$SELF" | cut -d' ' -f1)"
-git fetch --all --prune
-git pull --ff-only || die "git pull 失败（服务器上有本地改动？先 git status 检查，别覆盖）"
-AFTER="$(md5sum "$SELF" | cut -d' ' -f1)"
-if [ "$BEFORE" != "$AFTER" ]; then
-    log "脚本已被更新，重新执行"
-    exec bash "$SELF" "$@"
+if [ "${_MC_UPDATED:-0}" != "1" ]; then
+    log "取 ${GITHUB_REPO}@${BRANCH} 最新 commit"
+    SHA="$(curl -fsSL --max-time 30 \
+        "https://api.github.com/repos/${GITHUB_REPO}/commits/${BRANCH}" \
+        | jq -r '.sha // empty')"
+    [ -n "$SHA" ] || die "取不到最新 commit sha（api.github.com 不通？）"
+    SHORT_SHA="${SHA:0:7}"
+    log "目标提交 ${SHORT_SHA}"
+
+    BEFORE="$(md5sum "$SELF" | cut -d' ' -f1)"
+    TMP="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$TMP'" EXIT
+    log "下载源码 tarball"
+    curl -fsSL --max-time 300 \
+        "https://codeload.github.com/${GITHUB_REPO}/tar.gz/${SHA}" \
+        -o "$TMP/src.tar.gz" || die "codeload 下载失败"
+    tar xzf "$TMP/src.tar.gz" -C "$TMP"
+    SRC="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)"
+    [ -n "$SRC" ] || die "tarball 解压失败"
+
+    log "同步到 ${REPO_DIR}"
+    rsync -a --delete \
+        --exclude 'deploy/.env' \
+        --exclude 'logs/' --exclude 'data/' --exclude 'browser_data/' \
+        --exclude 'database/' --exclude 'api/webui/' \
+        "$SRC/" "$REPO_DIR/"
+    chmod +x "$REPO_DIR/deploy/server-update.sh" \
+             "$REPO_DIR/deploy/build-push.sh" 2>/dev/null || true
+    rm -rf "$TMP"
+    trap - EXIT
+
+    # 脚本自身被更新 -> 用新脚本重跑（_MC_UPDATED 防止重复下载）
+    AFTER="$(md5sum "$SELF" | cut -d' ' -f1)"
+    if [ "$BEFORE" != "$AFTER" ]; then
+        log "脚本已更新，重新执行"
+        export _MC_UPDATED=1 MC_SHORT_SHA="$SHORT_SHA"
+        exec bash "$SELF" "$@"
+    fi
+else
+    SHORT_SHA="${MC_SHORT_SHA:-$(date +%y%m%d%H%M)}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -53,7 +94,6 @@ set -a
 # shellcheck disable=SC1091
 . deploy/.env
 set +a
-# 脚本推送统一用 :latest + :sha-xxx，避免 .env 里 IMAGE_TAG 覆盖造成 tag 漂移
 export IMAGE_TAG=latest
 NAMESPACE="${TENCENT_NAMESPACE:-unlimited996}"
 
@@ -63,7 +103,7 @@ NAMESPACE="${TENCENT_NAMESPACE:-unlimited996}"
 if [ "$SKIP_PUSH" != "1" ]; then
     if [ -z "${TENCENT_REGISTRY_USERNAME:-}" ] || [ -z "${TENCENT_REGISTRY_PASSWORD:-}" ]; then
         if ! grep -q "$REGISTRY" "${HOME}/.docker/config.json" 2>/dev/null; then
-            die "缺少 CCR 凭据：请在 deploy/.env 填 TENCENT_REGISTRY_USERNAME / TENCENT_REGISTRY_PASSWORD，或先 docker login $REGISTRY；只想构建验证用 SKIP_PUSH=1"
+            die "缺少 CCR 凭据：在 deploy/.env 填 TENCENT_REGISTRY_USERNAME / TENCENT_REGISTRY_PASSWORD，或先 docker login ${REGISTRY}；只想构建验证用 SKIP_PUSH=1"
         fi
         log "复用已保存的 docker login 凭据"
     fi
@@ -72,11 +112,10 @@ fi
 # ---------------------------------------------------------------------------
 # 4) 构建（前端 npm build 在 Dockerfile Stage 1，只编一次，两张镜像共用）
 # ---------------------------------------------------------------------------
-log "构建 crawler + library 镜像（PLAYWRIGHT_BROWSER=${PLAYWRIGHT_BROWSER:-chromium}）"
+log "构建 crawler + library（PLAYWRIGHT_BROWSER=${PLAYWRIGHT_BROWSER:-chromium}）"
 SKIP_WEBUI_BUILD=$([ "$WEBUI_BUILD" = "1" ] && echo 0 || echo 1) \
     docker compose -f "$COMPOSE_FILE" --env-file deploy/.env build
 
-SHORT_SHA="$(git rev-parse --short=7 HEAD)"
 CRAWLER="${REGISTRY}/${NAMESPACE}/mediacrawler-crawler"
 LIBRARY="${REGISTRY}/${NAMESPACE}/mediacrawler-library"
 
