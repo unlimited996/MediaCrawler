@@ -218,6 +218,51 @@ PLAYWRIGHT_BROWSER=chromium-headless-shell ./deploy/build-push.sh
 
 ---
 
+## 3.5 为什么镜像里要带浏览器，以及怎么把体积降下来
+
+### 为什么不能用「打开前端页面的用户浏览器」
+
+WebUI 只是控制面板：`POST /crawler/start` 发完指令，抓取由服务端后台进程
+（worker / crawler 容器里的 Playwright）执行，用户关掉页面也要继续跑几小时。
+浏览器沙箱里的前端 JS 做不到这件事：
+
+- **跨域**：小红书 / 抖音接口不允许第三方源 AJAX，前端拿不到数据；
+- **签名与登录态**：平台签名脚本、Cookie、指纹、代理都在服务端统一维护，
+  凭证属于账号池，不能下发到每个客户端；
+- **控制权**：Playwright 要通过 CDP 协议驱动一个受控浏览器进程，网页 JS
+  既不能启动本地进程，也不能连调试端口；
+- **可复现**：定时任务的抓取结果不能依赖某个人电脑上 Chrome 的版本和插件。
+
+> 项目确实有 `ENABLE_CDP_MODE` / `CDP_CONNECT_EXISTING=True`，可以连「用户本地
+> 已开远程调试的 Chrome」，但那指的是**运行爬虫的那台机器**上的 Chrome
+> （本机开发模式），不是访问 WebUI 的人的浏览器；容器里没有，默认关闭。
+
+### 真正多余的浏览器
+
+`runtime` stage 早先装了完整 Chromium，`crawler` / `library` / `all` 都
+`FROM runtime` → **library（内容库 + 网关 + 前端静态页）也白背了约 770MB
+浏览器，而它一行浏览器代码都不执行**。两张镜像各推一遍，跨境上传约 3GB，
+这是 CI 30~45 分钟超时的主因。
+
+### 已做的拆分（2026-11-05）
+
+- `Dockerfile` 新增 `browser-runtime` stage：只有 `crawler` / `all` 从它派生，
+  `library` 仍 `FROM runtime`，**镜像里彻底没有浏览器**。
+- CI 的 `build-args` 加 `PLAYWRIGHT_BROWSER=chromium-headless-shell`：容器内
+  `HEADLESS=true`、无 X server，只需无头内核，比完整 Chromium 省约 600MB。
+- 两张镜像总上传量约 3GB → 1.3GB；step 超时 45 分钟、job 100 分钟。
+- 本地 `docker compose build` 默认仍是完整 chromium（兼容性最好）；想和 CI
+  产物一致就设 `PLAYWRIGHT_BROWSER=chromium-headless-shell`。
+
+### 想让浏览器完全不进镜像（架构改造，未实施）
+
+可用项目自带的 CDP 模式连一个独立浏览器容器（如 `browserless/chrome`），
+crawler 通过 `ws://browser:9222` 连接，镜像就只剩 Python 运行时。代价：需要改
+`tools/cdp_browser.py` 的连接分支（当前 `CDP_CONNECT_EXISTING` 只连 localhost）
+并新增一个常驻浏览器服务，风控指纹 / 登录态要另做持久化。
+
+---
+
 ## 4. 镜像发布（在服务器上）
 
 ```bash

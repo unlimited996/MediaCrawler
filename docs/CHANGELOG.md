@@ -5,6 +5,40 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-05] 镜像瘦身：library 不再带浏览器、crawler 改无头内核
+
+### 现象 / 追问
+- 加了 `provenance: false` 和 30 分钟超时后，run `41958984216` 的
+  「构建并推送 crawler」**正好 30.0 分钟被超时砍掉**（不是构建错误，是跨境
+  1.5GB 没传完）。
+- 用户质疑：为什么把浏览器内核封进镜像，不能用打开前端页面的用户浏览器？
+
+### 结论
+- 抓取得用**服务端无头浏览器**：WebUI 只是控制面板，抓取是关掉页面也要继续跑的
+  后台任务；跨域限制、平台签名 JS、Cookie/指纹、CDP 进程控制都不可能由浏览器
+  沙箱里的前端 JS 完成。项目自带的 `ENABLE_CDP_MODE` /
+  `CDP_CONNECT_EXISTING` 连的是**运行爬虫那台机器**的 Chrome，不是访客浏览器。
+- 但质疑戳中了真正的浪费：`runtime` 装了完整 Chromium，`library` 也
+  `FROM runtime` → 内容库/网关镜像白背约 770MB 浏览器，一行浏览器代码都不跑。
+
+### 修复
+- `Dockerfile`：新增 `browser-runtime` stage（只有它 `playwright install`）；
+  `crawler` / `all` 改 `FROM browser-runtime`，`library` 保持 `FROM runtime`
+  → library 镜像彻底不含浏览器。
+- `.github/workflows/build-push.yml`：两个 build step 的 `build-args` 加
+  `PLAYWRIGHT_BROWSER=chromium-headless-shell`（容器 `HEADLESS=true`、无 X
+  server，比完整 Chromium 省约 600MB）；step 超时 30→45、job 70→100。
+- 总上传量约 3GB → 1.3GB。本地 compose 默认仍是完整 chromium，兼容性不变。
+- `docs/DEPLOY_SPLIT.md` 新增 3.5 节解释架构原因与「浏览器完全不进镜像」的
+  CDP 改造方向（未实施）。
+
+### 验收
+- 静态解析 Dockerfile stage 链：`crawler`/`all` 含浏览器、`library` 不含，
+  `runtime` 自身不再执行 `playwright install`。
+- PyYAML 校验 workflow：两个 step 均 `timeout=45` / `provenance=false` /
+  build-args 含 headless-shell；job `timeout=100`。
+- 本机 Docker Desktop 守护进程未运行，无法实构建；由 CI 新 run 验证。
+
 ## [2026-11-05] 修复 CI 构建卡在 exporting to image（CCR attestation + 跨境大镜像）
 
 ### 现象

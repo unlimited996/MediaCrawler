@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     # 跨境推 CCR 可能很慢，但绝不能让 job 无限挂到 6 小时默认值；
     # 到点失败并给出明确结论，配合下面的兜底指引走国内推送脚本。
-    timeout-minutes: 70
+    timeout-minutes: 100
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -110,7 +110,7 @@ jobs:
         id: crawler
         uses: docker/build-push-action@v6
         # step 级超时（不能写进 with:，否则被当成 action 的未知输入直接忽略）
-        timeout-minutes: 30
+        timeout-minutes: 45
         with:
           context: .
           target: crawler
@@ -128,15 +128,18 @@ jobs:
             org.opencontainers.image.title=mediacrawler-crawler
           cache-from: type=gha,scope=mediacrawler
           cache-to: type=gha,mode=max,scope=mediacrawler
+          # 容器内 HEADLESS=true、无 X server，只需 headless shell；
+          # library 目标不经过 browser-runtime，这个 arg 对它是空操作。
           build-args: |
             NPM_REGISTRY=https://registry.npmmirror.com
+            PLAYWRIGHT_BROWSER=chromium-headless-shell
 
       # ---- 镜像 2：library（内容库 + 网关 + 前端静态页）----
       - name: 构建并推送 library
         id: library
         uses: docker/build-push-action@v6
         # step 级超时（不能写进 with:，否则被当成 action 的未知输入直接忽略）
-        timeout-minutes: 30
+        timeout-minutes: 45
         with:
           context: .
           target: library
@@ -155,8 +158,11 @@ jobs:
           # 同一个 scope：前端 npm build 与 python 依赖层直接命中第一张镜像的缓存
           cache-from: type=gha,scope=mediacrawler
           cache-to: type=gha,mode=max,scope=mediacrawler
+          # 容器内 HEADLESS=true、无 X server，只需 headless shell；
+          # library 目标不经过 browser-runtime，这个 arg 对它是空操作。
           build-args: |
             NPM_REGISTRY=https://registry.npmmirror.com
+            PLAYWRIGHT_BROWSER=chromium-headless-shell
 
       - name: 记录结果
         # 构建/推送失败时前面的 step 会跳过，这里必须总是执行才能把兜底指引写出来

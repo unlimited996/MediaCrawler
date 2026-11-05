@@ -127,26 +127,16 @@ RUN PIP_ARGS="--no-cache-dir --retries 10 --timeout 120"; \
     if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS -i $PIP_INDEX_URL"; fi; \
     pip install $PIP_ARGS -r requirements.txt
 
-# 3) Playwright 浏览器
-#    --with-deps 补齐 Chromium 缺的系统库；默认仍是完整 chromium（兼容 CDP
-#    及各类启动方式）。若跨境推 CCR 太慢，可加
-#      --build-arg PLAYWRIGHT_BROWSER=chromium-headless-shell
-#    只装 headless shell（省约 600MB）：容器内 HEADLESS=true、没有 X server，
-#    抓取行为一致。compose 里对应 ${PLAYWRIGHT_BROWSER:-chromium}。
-ARG PLAYWRIGHT_BROWSER=chromium
-RUN playwright install --with-deps "${PLAYWRIGHT_BROWSER}" \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
-
-# 4) 应用源码
+# 3) 应用源码
 COPY . /app
 
-# 5) 前端产物：步骤 4 已带上宿主机构建结果，这里用 Stage 1 的产物覆盖，
+# 4) 前端产物：步骤 3 已带上宿主机构建结果，这里用 Stage 1 的产物覆盖，
 #    保证镜像自包含（不依赖宿主机有没有跑过 npm run build）。
 #    SKIP_WEBUI_BUILD=1 时 Stage 1 只是个空目录，COPY 会合并而非清空，
 #    所以宿主机的 api/webui 仍然生效。
 COPY --from=webui-builder /app/api/webui/ /app/api/webui/
 
-# 6) 运行时目录
+# 5) 运行时目录
 #    /app/logs          -> 应用日志（worker.out.log / scheduler_live.jsonl /
 #                          crawler.console.log），建议挂出来排障
 #    /app/data          -> 抓取产物
@@ -160,12 +150,33 @@ ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
 
 # -----------------------------------------------------------------------------
+# 浏览器层：只有真正跑爬虫的目标（crawler / all）才需要。
+#
+# library 是内容库 + 网关 + 前端静态页，一行浏览器代码都不执行；以前它
+# FROM runtime 白背了约 770MB Chromium，两张镜像各推一遍 ≈ 跨境上传 3GB，
+# CI 30 分钟超时。拆成独立 stage 后 library 镜像完全不含浏览器。
+#
+# 浏览器必须用服务端无头实例：WebUI 只是发指令的控制面板，抓取是后台任务
+# （关掉页面也要跑完），且平台签名 JS / Cookie / 指纹 / CDP 控制都不可能
+# 由浏览器沙箱里的前端 JS 完成。
+# -----------------------------------------------------------------------------
+FROM runtime AS browser-runtime
+
+# --with-deps 补齐 Chromium 缺的系统库。默认完整 chromium（兼容 CDP 等场景），
+# 可加 --build-arg PLAYWRIGHT_BROWSER=chromium-headless-shell 只装 headless
+# shell（省约 600MB）：容器内 HEADLESS=true、无 X server，抓取行为一致。
+ARG PLAYWRIGHT_BROWSER=chromium
+RUN playwright install --with-deps "${PLAYWRIGHT_BROWSER}" \
+    && rm -rf /var/lib/apt/lists/* /tmp/*
+
+
+# -----------------------------------------------------------------------------
 # 目标 1：crawler 服务（抓取 + 调度 + 账号池 + 抓取配置）
 #
 #   对外路径 /crawler/api/**；容器内同时拉起抓取执行器 worker
 #   （WORKER_ENABLED=0 可关闭，改用独立 worker 容器）
 # -----------------------------------------------------------------------------
-FROM runtime AS crawler
+FROM browser-runtime AS crawler
 
 ENV APP_ROLE=crawler \
     SERVICE_NAME=mediacrawler-crawler \
@@ -210,7 +221,7 @@ CMD ["uvicorn", "api.library_app:app", "--host", "0.0.0.0", "--port", "8081", \
 # -----------------------------------------------------------------------------
 # 目标 3：一体化（旧行为；放在最后 = `docker build .` 的默认目标）
 # -----------------------------------------------------------------------------
-FROM runtime AS all
+FROM browser-runtime AS all
 
 ENV APP_ROLE=all \
     SERVICE_NAME=mediacrawler-all \
