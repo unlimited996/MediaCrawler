@@ -135,12 +135,14 @@ if [ -n "${TENCENT_REGISTRY_USERNAME:-}" ] && [ -n "${TENCENT_REGISTRY_PASSWORD:
 fi
 
 # CCR 偶尔对大 blob 返回 502 Bad Gateway，且 docker push 会挂住不再输出。
-# 加单次超时 + 重试：已推过的层命中 "Layer already exists"，重试成本很低。
+# 单次上限给到 60 分钟：小带宽机器上光是 873MB 的 Python 依赖层就要传
+# 20~30 分钟，设太短会在传完前掐断，重试又从头开始，永远推不上去。
+# 已推过的层会命中 "Layer already exists"，重试成本很低。
 push_with_retry() {
     local ref="$1"
     for attempt in 1 2 3; do
         log "push ${ref}（第 ${attempt}/3 次）"
-        if timeout 900 docker push "${ref}"; then
+        if timeout 3600 docker push "${ref}"; then
             return 0
         fi
         sleep 10

@@ -325,6 +325,12 @@ tail -f /var/log/mc-update.log         # 看进度
 > 代码走 `api.github.com` + `codeload.github.com`（`github.com` 主站不通）。
 > compose 已默认前三个，CI 不经过 compose，仍用官方源。
 
+**小带宽服务器推 CCR**：镜像含 873MB（Python 依赖）+ 376MB（浏览器）两个
+大层，并发上传时 CCR 网关容易返回 502。在 `/etc/docker/daemon.json` 加
+`"max-concurrent-uploads": 1` 后 `systemctl reload docker`（不会重启容器），
+让大层独占带宽；脚本的 `push_with_retry` 单次超时给到 60 分钟并重试 3 次，
+避免上传没结束就被掐断、重试又从头开始。
+
 ---
 
 ## 4. 镜像发布（在服务器上）
