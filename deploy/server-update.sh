@@ -134,12 +134,24 @@ if [ -n "${TENCENT_REGISTRY_USERNAME:-}" ] && [ -n "${TENCENT_REGISTRY_PASSWORD:
         --username "${TENCENT_REGISTRY_USERNAME}" --password-stdin >/dev/null
 fi
 
+# CCR 偶尔对大 blob 返回 502 Bad Gateway，且 docker push 会挂住不再输出。
+# 加单次超时 + 重试：已推过的层命中 "Layer already exists"，重试成本很低。
+push_with_retry() {
+    local ref="$1"
+    for attempt in 1 2 3; do
+        log "push ${ref}（第 ${attempt}/3 次）"
+        if timeout 900 docker push "${ref}"; then
+            return 0
+        fi
+        sleep 10
+    done
+    die "推送失败（重试 3 次）：${ref}"
+}
+
 for img in "${CRAWLER}" "${LIBRARY}"; do
     docker tag "${img}:latest" "${img}:sha-${SHORT_SHA}"
-    log "push ${img}:latest"
-    docker push "${img}:latest"
-    log "push ${img}:sha-${SHORT_SHA}"
-    docker push "${img}:sha-${SHORT_SHA}"
+    push_with_retry "${img}:latest"
+    push_with_retry "${img}:sha-${SHORT_SHA}"
 done
 
 # ---------------------------------------------------------------------------
