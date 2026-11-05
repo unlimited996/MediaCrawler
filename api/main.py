@@ -399,20 +399,11 @@ async def check_environment():
         }
 
 
-@app.get("/api/config/platforms")
-async def get_platforms():
-    """Get list of supported platforms"""
-    return {
-        "platforms": [
-            {"value": "xhs", "label": "Xiaohongshu", "icon": "book-open"},
-            {"value": "dy", "label": "Douyin", "icon": "music"},
-            {"value": "ks", "label": "Kuaishou", "icon": "video"},
-            {"value": "bili", "label": "Bilibili", "icon": "tv"},
-            {"value": "wb", "label": "Weibo", "icon": "message-circle"},
-            {"value": "tieba", "label": "Baidu Tieba", "icon": "messages-square"},
-            {"value": "zhihu", "label": "Zhihu", "icon": "help-circle"},
-        ]
-    }
+# 平台列表端点已统一到 config_router 的 GET /config/platforms（见
+# api/routers/config_admin.py）。单体进程通过 include_router(config_router,
+# prefix="/api") 和双前缀挂载自动拥有 /api/config/platforms 与
+# /crawler/api/config/platforms；拆分后的 crawler 服务同样自带该路由。
+# 这里不再重复定义，避免两条同名路由造成行为分叉。
 
 
 # Mount static resources - must be placed after all routes

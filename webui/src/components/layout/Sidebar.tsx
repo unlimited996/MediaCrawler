@@ -10,6 +10,19 @@ import { ThemeToggle } from './ThemeToggle'
 
 export type MainView = 'crawl' | 'discover' | 'data' | 'browser' | 'tasks' | 'stance' | 'backup' | 'config' | 'guest'
 
+/** 后端 /config/platforms 暂时不可用时的兜底：
+ *  拆分部署后该端点一度只存在于单体进程，crawler 服务返回 404，
+ *  顶部「数据管理」旁边的快捷平台标签会整排消失且没有任何报错提示。 */
+const FALLBACK_PLATFORMS: { value: string; label: string }[] = [
+  { value: 'xhs', label: '小红书' },
+  { value: 'dy', label: '抖音' },
+  { value: 'ks', label: '快手' },
+  { value: 'bili', label: '哔哩哔哩' },
+  { value: 'wb', label: '微博' },
+  { value: 'tieba', label: '百度贴吧' },
+  { value: 'zhihu', label: '知乎' },
+]
+
 interface SidebarProps {
   view: MainView
   onViewChange: (view: MainView, platform?: string) => void
@@ -26,7 +39,10 @@ export function Sidebar({ view, onViewChange, dataPlatform }: SidebarProps) {
   useCrawlerStatus()
 
   const isRunning = status === 'running'
-  const list = (platforms || []) as { value: string; label: string }[]
+  // 空数组 / 请求失败都退回静态列表，保证快捷标签始终可见
+  const list = (platforms && platforms.length
+    ? platforms
+    : FALLBACK_PLATFORMS) as { value: string; label: string }[]
 
   return (
     <header className="flex-shrink-0 glass-panel border-b border-cyber-border-subtle relative z-10">

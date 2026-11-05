@@ -5,6 +5,41 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-05] 修复顶部「数据管理」快捷平台标签消失，补群晖 / 域名部署说明
+
+### 现象
+- 拆分部署（或只起 crawler 服务）后，顶部「数据管理」旁边的快捷平台标签
+  （小红书 / 抖音 / 快手 / B站 / 微博 / 贴吧 / 知乎）整排不见了，
+  只剩「数据管理」一个按钮，且没有任何报错提示。
+
+### 根因
+- 平台列表端点 `GET /api/config/platforms` 当初是**直接写在单体 `api/main.py`**
+  上的，没有进 `config_router`。拆分后 crawler 服务只挂载 `config_router`，
+  于是前端 `/crawler/api/config/platforms` 返回 404 → `usePlatforms()` 拿到空数组
+  → `Sidebar` 里 `list.map()` 什么都不渲染。
+- 前端也没有兜底：接口一失败快捷标签就整体消失。
+
+### 修复
+- 把端点与 `SUPPORTED_PLATFORMS` 常量统一挪到 `api/routers/config_admin.py`：
+  单体的 `/api/config/platforms` 与 `/crawler/api/config/platforms`、拆分后的
+  crawler `/crawler/api/config/platforms` 都由 `include_router` 自动拥有；
+  删掉 `api/main.py` 里的重复定义（避免两条同名路由行为分叉）。
+- `webui/src/components/layout/Sidebar.tsx` 加静态兜底 `FALLBACK_PLATFORMS`：
+  接口 404 / 服务未就绪时快捷标签仍然显示。
+- 前端 `npm run build` 产物 `index-zkZA07uK.js`。
+
+### 文档 / 配置
+- `docs/DEPLOY_SPLIT.md` 新增 5.3：明确 **9000 是 Nacos OpenAPI 端口、不是业务
+  网关**；统一入口是 library 的 8081；给出 crawler/library 两个正确 URL、
+  群晖反向代理规则、GUI 单容器起服务时 `SERVICE_IP` / `CRAWLER_BASE_URL` 的填法。
+- `deploy/.env.example` 把 `SERVICE_IP` 的三种场景（compose / 本地双进程 / 群晖）
+  与「别填 127.0.0.1」的坑写进注释。
+
+### 验收
+- ASGI 内存调用（不需要起服务）：`/crawler/api/config/platforms`（crawler_app）、
+  `/api/config/platforms` 与 `/crawler/api/config/platforms`（main）均 200，
+  返回 7 个平台；`py_compile` 通过；前端构建通过。
+
 ## [2026-11-05] 修复定时任务状态不同步、抓取日志不滚动，新增「停止当前抓取」
 
 ### 现象

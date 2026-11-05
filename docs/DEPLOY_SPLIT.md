@@ -244,6 +244,66 @@ docker compose -f docker-compose.split.yml up -d --no-deps crawler  # 只换 cra
 
 ---
 
+### 5.3 用域名访问 / 群晖 Docker：9000 不是业务网关
+
+> **常见误区**：`www.joyeuse.cn:9000` 是 **Nacos 的 OpenAPI 端口**（容器内 8848
+> → 宿主 9000），它只提供 `/nacos/v3/client/ns/**` 这类注册/发现接口，**不是
+> HTTP 业务网关**，不会转发 `/crawler/api/**` 或 `/library/api/**`。
+> 直接请求 `http://www.joyeuse.cn:9000/crawler/api/crawler/status` 只会拿到
+> Nacos 的 404/501 错误，永远拿不到 crawler 的状态。
+>
+> Nacos 在这里只是「地址簿」：crawler 启动时把自己的 `ip:port` 注册进去，
+> **library 服务内置的网关**去查这个地址簿，再把请求转发给 crawler。
+> 业务流量不经过 Nacos。
+
+**统一入口是 library 的 8081**（compose 里 `ports: "${LIBRARY_PORT:-8081}:8081"`，
+crawler 不对外暴露）：
+
+| 想调的服务 | 正确 URL |
+|---|---|
+| crawler 抓取状态（经网关转发） | `http://www.joyeuse.cn:8081/crawler/api/crawler/status` |
+| library 数据列表（本地处理） | `http://www.joyeuse.cn:8081/library/api/stories?sort=publish&page=1&page_size=20` |
+| 前端页面 | `http://www.joyeuse.cn:8081/` |
+
+`sort=publish`（发布时间倒序）是合法值，另外还支持 `heat` / `time` / `like` / `comment`。
+
+#### 想用 `http://www.joyeuse.cn/`（不带端口）
+
+在群晖「控制面板 → 应用程序 → 反向代理」（或 Nginx）加一条规则：
+
+```
+来源： http://www.joyeuse.cn/          （80 / 443）
+目标： http://<群晖内网IP>:8081/
+```
+
+之后即可用 `http://www.joyeuse.cn/crawler/api/crawler/status` 与
+`http://www.joyeuse.cn/library/api/stories?sort=publish&page=1&page_size=20`。
+
+> **不要把 9000 当业务端口**：9000 已被 Nacos 占用（9001 是 gRPC）。硬要复用就得
+> 先把 Nacos 挪到别的宿主端口，再让反代/业务监听 9000 —— 注册中心与业务混在
+> 同一端口，后续排障会很痛，不建议。
+
+#### 群晖 Docker GUI 单独起两个容器（不用 compose）时必改
+
+compose 里的 `http://crawler:8001` 依赖 compose 服务名，GUI 起容器时不存在：
+
+1. `SERVICE_IP` 填 **群晖宿主机 LAN IP**（如 `192.168.1.10`），并给 crawler 容器
+   映射 `8001:8001`。**别填 `127.0.0.1`**（指向容器自己，library 网关从另一个容器
+   连不上 → `/crawler/api/**` 全部 502）；留空探测到的是容器内网 IP，跨主机或
+   Nacos 在宿主机/公网时同样不可达。
+2. `CRAWLER_BASE_URL` 改成 `http://<宿主IP>:8001`（Nacos 挂掉时的静态兜底）。
+3. 两个容器加入同一个自定义 docker 网络，或直接用宿主 IP 互联。
+4. 只把 library 的 `8081` 映射到宿主并做反代；crawler 不必对外暴露。
+5. 两个容器共享同一个 PostgreSQL（`deploy/.env` 里的数据库配置保持一致）。
+
+#### 如果确实要「按服务名 + Nacos」做独立网关
+
+现有 `api/gateway.py` 是 **library 内置**网关，不是独立组件。若要在 Nacos 前放一层
+按路径转发的独立网关（Nginx / Traefik / Spring Cloud Gateway），需要新增该组件并
+让两个服务都注册到 Nacos；这属于新增基础设施，当前架构不需要，也没有改代码的必要。
+
+---
+
 ## 6. 单独跑 worker（可选）
 
 crawler 容器默认「API + worker」同容器。想拆得更开（抓取与接口彻底分开扩缩）：

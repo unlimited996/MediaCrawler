@@ -159,6 +159,28 @@ async def _get_engine():
 # --------------------------------------------------------------------------
 # 查询
 # --------------------------------------------------------------------------
+
+#: 平台列表。拆分部署前这个端点只写在单体 api/main.py 里，crawler 服务并没有
+#: 这个路由 → 前端请求 /crawler/api/config/platforms 得到 404 → 顶部「数据管理」
+#: 旁边的快捷平台标签拿到空数组、整排消失。统一挪到 config_router，单体进程
+#: 与拆分后的 crawler 服务都通过 include_router 自动拥有它。
+SUPPORTED_PLATFORMS = [
+    {"value": "xhs", "label": "Xiaohongshu", "icon": "book-open"},
+    {"value": "dy", "label": "Douyin", "icon": "music"},
+    {"value": "ks", "label": "Kuaishou", "icon": "video"},
+    {"value": "bili", "label": "Bilibili", "icon": "tv"},
+    {"value": "wb", "label": "Weibo", "icon": "message-circle"},
+    {"value": "tieba", "label": "Baidu Tieba", "icon": "messages-square"},
+    {"value": "zhihu", "label": "Zhihu", "icon": "help-circle"},
+]
+
+
+@router.get("/platforms")
+async def get_platforms():
+    """支持的平台列表（顶部快捷平台标签 / 抓取表单下拉共用）。"""
+    return {"platforms": SUPPORTED_PLATFORMS}
+
+
 @router.get("/version")
 async def config_version():
     """轻量轮询接口：只返回全局版本号。"""
