@@ -47,24 +47,51 @@
 
 ## 2. Nacos 准备（一次性）
 
-Nacos 部署在 `www.joyeuse.cn:8085`。两个服务启动时会自动注册：
+当前部署是 **Nacos v3.2.4**（容器端口映射：`8080→8085` 控制台、`8848→9000` OpenAPI、`9848→9001` gRPC）。
+
+> ⚠️ **最容易踩的坑**：`NACOS_SERVER` 要填 **OpenAPI 端口 9000**，不是控制台 8085。
+> 填 8085 会一直注册失败（那是 3.x 新拆出来的控制台 Web 端口）。
+
+两个服务启动时自动注册：
 
 | 注册名 | 说明 |
 |---|---|
 | `mediacrawler-crawler` | crawler 服务实例 |
 | `mediacrawler-library` | 内容库服务实例 |
 
-验证：
+验证（v3 客户端 API，不需要鉴权）：
 
 ```bash
-# 服务列表应能看到两个服务
-curl "http://www.joyeuse.cn:8085/nacos/v1/ns/service/list?pageNo=1&pageSize=50"
-
-# 实例列表（应返回容器 IP:端口）
-curl "http://www.joyeuse.cn:8085/nacos/v1/ns/instance/list?serviceName=mediacrawler-crawler"
+B=http://www.joyeuse.cn:9000/nacos/v3/client/ns/instance/list
+curl "$B?serviceName=mediacrawler-crawler&groupName=DEFAULT_GROUP&namespaceId=public"
+curl "$B?serviceName=mediacrawler-library&groupName=DEFAULT_GROUP&namespaceId=public"
+# 期望：{"code":0,"message":"success","data":[{"ip":"...","port":8001,"healthy":true,...}]}
 ```
 
-Nacos 控制台：`http://www.joyeuse.cn:8085/nacos`（默认 nacos/nacos）。
+控制台：`http://www.joyeuse.cn:8085/`（3.x 控制台，登录后可在「服务管理 → 服务列表」里看到两个服务）。
+
+### 2.1 API 版本差异（已在客户端里适配）
+
+| | Nacos 1.x / 2.x | **Nacos 3.x（当前）** |
+|---|---|---|
+| 注册/摘除 | `/nacos/v1/ns/instance` | `/nacos/v3/client/ns/instance` |
+| 实例查询 | `/nacos/v1/ns/instance/list` | `/nacos/v3/client/ns/instance/list` |
+| 心跳 | `PUT /instance/beat` | **没有 beat 接口**（实测 501） |
+| 保活方式 | 每 5s 心跳 | **每 5s 重新注册一次**（实测 5s 稳定保活；停 15s 变 unhealthy、30s 被摘除） |
+| 鉴权 | 可选 | 客户端 API **不需要**；`/nacos/v3/admin/**`（服务列表等）需要 |
+
+`tools/nacos_client.py` 会自动探测（`NACOS_API=auto`），也可以强制 `v3` / `v1`。
+
+### 2.2 注册 IP 必须可达（本地开发注意）
+
+注册到 Nacos 的 IP 由 `SERVICE_IP` 决定，留空则自动探测（容器里就是容器 IP，正确）。
+
+**本地开发**时如果服务只监听 `127.0.0.1`，就一定要设 `SERVICE_IP=127.0.0.1`；
+否则会注册成局域网 IP（如 `192.168.x.x`），网关拿到后连不上 → `/crawler/**` 返回 **502**。
+
+```bash
+SERVICE_IP=127.0.0.1 SERVICE_PORT=8001 uvicorn api.crawler_app:app --host 127.0.0.1 --port 8001
+```
 
 > **Nacos 挂了会怎样？** 服务照常启动（注册失败只打日志），网关自动回退到
 > 静态地址 `CRAWLER_BASE_URL`（compose 里是 `http://crawler:8001`）。
@@ -247,11 +274,12 @@ worker 有文件锁（`logs/.worker.lock`），多起不会重复执行；跨主
 | 现象 | 先看什么 |
 |---|---|
 | 页面打开空白 / 404 | `library` 容器是否起了；`curl :8081/` 是否 200 |
-| `/crawler/api/**` 返回 503 | 网关没发现实例：`curl :8081/gateway/status`；看 `NACOS_SERVER` 与 `CRAWLER_BASE_URL` |
+| `/crawler/api/**` 返回 503 | 网关没发现实例：`curl :8081/gateway/status`；看 `NACOS_SERVER`（要 9000 不是 8085）与 `CRAWLER_BASE_URL` |
+| `/crawler/api/**` 返回 502 | Nacos 里有实例但连不上：多半是 `SERVICE_IP` 注册成了不可达 IP（本地开发设成 `127.0.0.1`） |
 | 接口 500 | `logs/library.console.log` 尾部 traceback |
 | 抓取不动 | `logs/worker.console.log`、`logs/worker.out.log`；`curl :8081/crawler/health` 看 `worker_alive` |
 | 定时任务一直 `queued` | worker 不在线（`worker_alive=false`）或 `SCHEDULER_ENABLED=0` |
-| Nacos 里看不到实例 | 容器网络到 8085 不通；`SERVICE_IP` 需手工指定时设成宿主机可达 IP |
+| Nacos 里看不到实例 | 容器网络到 **9000**（OpenAPI）不通；`SERVICE_IP` 手工指定时要填对端可达 IP |
 | 想改配置但不想改库 | 改 `deploy/.env` 后 `up -d`（启动类参数），页面可调的参数在「配置管理」里 |
 
 健康检查：

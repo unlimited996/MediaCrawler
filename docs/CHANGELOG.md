@@ -5,6 +5,43 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-05] 修复 Nacos 3.x 注册失败（v1 接口已移除 / 无 beat 接口 / 端口填错）
+
+### 现象
+- 服务启动打印 `注册失败 mediacrawler-crawler -> ...（Nacos 不可达或参数被拒）`，
+  Nacos 控制台看不到实例，网关只能走静态地址。
+
+### 根因（实测 Nacos v3.2.4）
+1. **端口填错**：`NACOS_SERVER` 默认写的是 `8085`，那是 3.x 的**控制台**端口；
+   OpenAPI 在 8848（宿主映射 **9000**）。
+2. **v1 接口已移除**：`/nacos/v1/ns/service/list` 返回 `501 no such api`，
+   v2 返回 404。命名服务改到 **`/nacos/v3/client/ns/**`**（客户端 API，无需鉴权），
+   admin 接口 `/nacos/v3/admin/**` 才需要登录。
+3. **没有 beat 接口**：`PUT/POST /nacos/v3/client/ns/instance/beat` 均 501。
+   实测：临时实例注册后 **15s 不续期变 unhealthy，30s 被摘除**。
+
+### 修复
+- `tools/nacos_client.py` 重写为 **v3/v1 自适应**（`NACOS_API=auto`，也支持强制）：
+  * 写操作 `POST/DELETE /instance`（v3 与 v1 参数一致）；
+  * 发现 `GET /instance/list`，兼容 v3 `{code,data}` 与 v1 `{hosts}` 两种响应；
+  * **保活**：v3 下每 `NACOS_HEARTBEAT_SEC`（默认 5s）重新注册一次（实测可稳定保持
+    healthy），v1 仍走 beat；注册/摘除/发现均做了失败降级。
+  * 新增 admin 服务列表（需要账号密码时才用），拿不到就返回空。
+- `config/base_config.py`：`NACOS_SERVER` 默认改 **`www.joyeuse.cn:9000`**，
+  新增 `NACOS_API`、`NACOS_HEARTBEAT_SEC`，并注明「9000 是 API、8085 是控制台」。
+- `deploy/.env.example`、`docs/DEPLOY_SPLIT.md` 同步端口与版本差异说明；
+  排障表新增「502 = 注册 IP 不可达（本地开发要设 `SERVICE_IP=127.0.0.1`）」。
+
+### 另外
+- `.github/workflows/deploy.yml`（VitePress → Pages）改为**仅手动触发**：
+  本仓库是 fork、未开 Pages，push 触发每次都失败（`Get Pages site failed`），
+  与镜像流水线无关却把 Actions 页面刷红。
+
+### 实测
+- 本机起两个服务 → Nacos 里 `mediacrawler-crawler(8001)`、`mediacrawler-library(8081)`
+  均为 `healthy: true`，5s 保活生效；网关 `gateway/status` 显示从 Nacos 解析到
+  `http://127.0.0.1:8001`，`/crawler/api/*`、`/library/api/*` 均 200。
+
 ## [2026-11-04] 变更 前端纳入 compose 构建；CI 改为一个 job 顺序产出两个镜像
 
 ### 变更

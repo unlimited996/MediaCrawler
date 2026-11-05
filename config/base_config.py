@@ -235,7 +235,14 @@ SERVICE_IP = _env_str("SERVICE_IP", "")
 
 # Nacos 开关与地址（注册/发现都走它；关掉则退化为静态地址）
 NACOS_ENABLED = _env_bool("NACOS_ENABLED", True)
-NACOS_SERVER = _env_str("NACOS_SERVER", "www.joyeuse.cn:8085")
+# ⚠️ 这里填 **OpenAPI 端口**（Nacos 的 8848，宿主映射 9000），不是控制台端口。
+# Nacos 3.x 的控制台在 8080（宿主 8085），把它填进来会注册失败。
+NACOS_SERVER = _env_str("NACOS_SERVER", "www.joyeuse.cn:9000")
+# 客户端 API 版本：auto（默认，自动探测）/ v3 / v1
+NACOS_API = _env_str("NACOS_API", "auto")
+# 保活间隔（秒）：Nacos 3.x 没有 beat 接口，靠「定时重新注册」续期；
+# 实测 5s 一次可稳定保持 healthy（>15s 变 unhealthy，>30s 被摘除）
+NACOS_HEARTBEAT_SEC = _env_float("NACOS_HEARTBEAT_SEC", 5)
 NACOS_NAMESPACE = _env_str("NACOS_NAMESPACE", "public")
 NACOS_GROUP = _env_str("NACOS_GROUP", "DEFAULT_GROUP")
 NACOS_USERNAME = _env_str("NACOS_USERNAME", "")

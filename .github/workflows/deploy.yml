@@ -3,11 +3,13 @@
 name: Deploy VitePress site to Pages
 
 on:
-  # 在针对 `main` 分支的推送上运行。如果你
-  # 使用 `master` 分支作为默认分支，请将其更改为 `master`
-  push:
-    branches: [main]
-
+  # 本仓库是 fork，没有开启 GitHub Pages，push 触发只会每次都红一次
+  # （actions/configure-pages 报 "Get Pages site failed"），因此改为**手动触发**。
+  # 真要用文档站时：Settings → Pages → Source 选 "GitHub Actions"，再手动运行。
+  # 原触发条件（保留备查）：
+  #   push:
+  #     branches: [main]
+  #
   # 允许你从 Actions 选项卡手动运行此工作流程
   workflow_dispatch:
 
