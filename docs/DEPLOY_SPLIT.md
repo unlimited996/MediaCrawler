@@ -266,7 +266,8 @@ crawler 通过 `ws://browser:9222` 连接，镜像就只剩 Python 运行时。�
 ## 3.6 服务器一键脚本（国内构建 + 推送，绕开 Actions 跨境）
 
 GitHub runner 在海外，跨境推 CCR 极慢；国内服务器到 CCR 往返约 0.1s，
-所以在服务器上构建推送更稳。
+所以在服务器上构建推送更稳。因此 `.github/workflows/build-push.yml` 已**去掉
+`on.push`**，只剩 Actions 页面手动触发；日常构建推送都走这里的 `mc-update`。
 
 > ⚠️ 国内服务器到 `github.com:443` 常年超时，**`git clone` / `git pull` 不可用**；
 > 但 `api.github.com`（取 commit sha）和 `codeload.github.com`（下源码 tarball）

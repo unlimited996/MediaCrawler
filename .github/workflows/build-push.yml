@@ -1,17 +1,9 @@
 name: build-and-push
 
-# 触发条件：
-#   * push 到 main（改代码/改 Dockerfile/改前端都算）
-#   * 手动触发（Actions 页面 Run workflow），可指定额外 tag
-#   * 打 tag（v1.2.3）时额外打一个版本 tag
+# 触发条件：**仅手动触发**（Actions 页面 Run workflow）。
+# push 触发已移除：GitHub runner 在海外，跨境推 CCR 反复超时；
+# 构建/推送统一走国内服务器上的 deploy/server-update.sh（mc-update）。
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
-      - ".workbuddy/**"
   workflow_dispatch:
     inputs:
       extra_tag:

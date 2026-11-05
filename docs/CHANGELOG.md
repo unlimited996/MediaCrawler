@@ -5,6 +5,28 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-05] 移除 push 自动构建 + 生产镜像零风险瘦身
+
+### 变更
+- `.github/workflows/build-push.yml`：去掉 `on.push`，**只剩 `workflow_dispatch`
+  手动触发**。GitHub runner 跨境推 CCR 反复超时，构建/推送统一走国内服务器
+  `mc-update`；`deploy.yml` 之前已改手动触发，现在两个 workflow 都不会被 push 触发。
+- `requirements.txt`：
+  * `opencv-python` → `opencv-python-headless`：容器无图形界面，`cv2` API 完全一致，
+    去掉 Qt/GUI 动态库（`opencv_python.libs` 约 116MB）；
+  * `pytest` / `pytest-asyncio` 移到新增 `requirements-dev.txt`，生产镜像不装测试依赖。
+- `Dockerfile`：apt 层 `apt-get clean` + 清 `/usr/share/{doc,man,info,locale}`、
+  `/var/cache/apt`；pip 层清 `__pycache__` / `tests` / `*.pyi` / `*.pyc`（运行时不读，
+  镜像已设 `PYTHONDONTWRITEBYTECODE=1`）；浏览器层同样清 apt 文档缓存。
+- **没有拆依赖集合**：在完整镜像里实测 `from api.library_app import app` 确实会加载
+  `cv2` / `playwright` / `numpy` / `PIL` / `sqlalchemy`（共享 `tools/` 的顶层 import），
+  拆 requirements 会让 library 启动即 ImportError，所以只做「删运行时垃圾 +
+  换等价轻量包」，功能零影响。
+
+### 基线（瘦身前，服务器实测）
+- crawler 2.41GB / library 1.87GB；
+- 分层：873MB(pip) + 380MB(apt) + 376MB(浏览器) + 基础镜像。
+
 ## [2026-11-05] 修复国内服务器构建 apt-get 卡死
 
 ### 现象

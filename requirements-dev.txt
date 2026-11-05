@@ -1,0 +1,4 @@
+# 本地开发/测试专用依赖 —— 不会打进生产镜像（Dockerfile 只装 requirements.txt）
+-r requirements.txt
+pytest>=7.4.0
+pytest-asyncio>=0.21.0

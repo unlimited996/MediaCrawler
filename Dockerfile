@@ -127,16 +127,28 @@ RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
         libasound2 \
         libatspi2.0-0 \
         fonts-wqy-zenhei \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
+              /usr/share/doc/* /usr/share/man/* /usr/share/info/* \
+              /usr/share/locale/* /tmp/*
 
 # 2) Python 依赖
 #    --retries/--timeout：pandas(13M)、opencv(~65M)、playwright(~40M) 这些大轮子
 #    在弱网下会被掐断连接，默认重试 5 次不够，这里放宽。
+#    opencv 用 -headless 版：容器没有图形界面，cv2 API 完全一致，去掉 Qt 动态库。
+#    装完清掉运行时用不到的测试代码/类型存根/字节码（镜像 ENV 已设
+#    PYTHONDONTWRITEBYTECODE=1，不会再生成 pyc），纯省体积、不影响功能。
 COPY requirements.txt ./
 ARG PIP_INDEX_URL=
 RUN PIP_ARGS="--no-cache-dir --retries 10 --timeout 120"; \
     if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS -i $PIP_INDEX_URL"; fi; \
-    pip install $PIP_ARGS -r requirements.txt
+    pip install $PIP_ARGS -r requirements.txt \
+    && (find /usr/local/lib/python3.11/site-packages -type d \
+            \( -name '__pycache__' -o -name 'tests' -o -name 'test' \) \
+            -prune -exec rm -rf {} + 2>/dev/null || true) \
+    && (find /usr/local/lib/python3.11/site-packages \
+            \( -name '*.pyi' -o -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true) \
+    && rm -rf /root/.cache /tmp/*
 
 # 3) 应用源码
 COPY . /app
@@ -182,7 +194,9 @@ ARG PLAYWRIGHT_BROWSER=chromium
 ARG PLAYWRIGHT_DOWNLOAD_HOST=
 RUN if [ -n "$PLAYWRIGHT_DOWNLOAD_HOST" ]; then export PLAYWRIGHT_DOWNLOAD_HOST; fi; \
     playwright install --with-deps "${PLAYWRIGHT_BROWSER}" \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
+              /usr/share/doc/* /usr/share/man/* /usr/share/info/* /tmp/*
 
 
 # -----------------------------------------------------------------------------
