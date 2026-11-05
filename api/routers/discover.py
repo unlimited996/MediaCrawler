@@ -34,12 +34,13 @@ MAX_DAY_SPAN = 3          # 最多展示前几天的历史（含今天）
 
 async def _session():
     from config.db_config import resolve_config_db_type
-    from database.db_session import get_async_engine
+    from database.db_session import SharedEngineHandle, get_async_engine
 
     engine = get_async_engine(resolve_config_db_type())
     if engine is None:
         return None, None
-    return engine, AsyncSession(engine, expire_on_commit=False)
+    # 同 story._session：包一层薄壳，避免 endpoint 里的 dispose() 拆掉全局连接池
+    return SharedEngineHandle(engine), AsyncSession(engine, expire_on_commit=False)
 
 
 @router.get("/boards")

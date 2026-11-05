@@ -40,12 +40,14 @@ SORT_FIELDS = {
 
 async def _session():
     from config.db_config import resolve_config_db_type
-    from database.db_session import get_async_engine
+    from database.db_session import SharedEngineHandle, get_async_engine
 
     engine = get_async_engine(resolve_config_db_type())
     if engine is None:
         return None, None
-    return engine, AsyncSession(engine, expire_on_commit=False)
+    # 返回共享引擎的薄壳：endpoint 的 finally 里会调 engine.dispose()，
+    # 直接给真引擎会把全局连接池拆掉，下个请求就得重连远端库（几百毫秒）。
+    return SharedEngineHandle(engine), AsyncSession(engine, expire_on_commit=False)
 
 
 TAG_NAME_BY_CODE: Dict[str, Any] = {}

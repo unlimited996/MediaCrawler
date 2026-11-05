@@ -119,6 +119,46 @@ def get_async_engine(db_type: str = None):
     return engine
 
 
+class SharedEngineHandle:
+    """包住进程级缓存的引擎，只把 ``dispose()`` 变成空操作。
+
+    ``api/routers/*`` 里每个 endpoint 的 finally 都写着 ``await engine.dispose()``，
+    原意是「释放资源」，但 get_async_engine 返回的是**全局共享**实例：dispose 会把
+    连接池整个销毁，下一个请求就得重新解析域名 + TCP + 认证（远端库走公网时是
+    几百毫秒），表面现象就是「一条 LIMIT 1 的 SQL 也要几秒」。
+
+    ``AsyncEngine.dispose`` 是只读属性，没法在实例上打补丁，所以用这个薄壳：
+    routers 拿它调 ``dispose()`` 无副作用，其余属性/方法原样透传给真引擎。
+    池子的生命周期交给进程本身。
+    """
+
+    __slots__ = ("_engine",)
+
+    def __init__(self, engine):
+        self._engine = engine
+
+    def __getattr__(self, item):
+        return getattr(self._engine, item)
+
+    async def dispose(self, close: bool = True) -> None:  # noqa: ARG002
+        return None
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"SharedEngineHandle({self._engine!r})"
+
+
+async def dispose_all() -> None:
+    """真正关闭所有缓存的引擎（仅用于进程退出/测试收尾）。"""
+    for db_type in list(_engines.keys()):
+        eng = _engines.pop(db_type, None)
+        if eng is None:
+            continue
+        try:
+            await eng.dispose()
+        except Exception:
+            pass
+
+
 async def create_tables(db_type: str = None):
     if db_type is None:
         db_type = config.SAVE_DATA_OPTION
