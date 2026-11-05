@@ -18,6 +18,10 @@ on:
         description: "额外镜像 tag（留空则只用 latest + sha）"
         required: false
         default: ""
+      push_images:
+        description: "推送镜像到 CCR（填 false 则只构建验证，用于快速排障）"
+        required: false
+        default: "true"
 
 concurrency:
   group: build-${{ github.ref }}
@@ -35,6 +39,9 @@ jobs:
   build:
     name: build crawler + library
     runs-on: ubuntu-latest
+    # 跨境推 CCR 可能很慢，但绝不能让 job 无限挂到 6 小时默认值；
+    # 到点失败并给出明确结论，配合下面的兜底指引走国内推送脚本。
+    timeout-minutes: 70
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -102,10 +109,18 @@ jobs:
       - name: 构建并推送 crawler
         id: crawler
         uses: docker/build-push-action@v6
+        # step 级超时（不能写进 with:，否则被当成 action 的未知输入直接忽略）
+        timeout-minutes: 30
         with:
           context: .
           target: crawler
-          push: ${{ steps.creds.outputs.has == 'true' }}
+          push: ${{ steps.creds.outputs.has == 'true' && github.event.inputs.push_images != 'false' }}
+          # build-push-action@v6 默认会生成 provenance attestation（mode=max），
+          # 即 --attest type=provenance,mode=max。腾讯云 CCR 对 OCI 1.1
+          # attestation manifest 支持不完善，实测会卡在 "exporting to image"
+          # 不动（认证已过、GHA cache 已导出完成，只剩最后这个 manifest）。
+          # 关掉它只推普通镜像，同时给单步加超时避免无限挂起。
+          provenance: false
           tags: ${{ steps.meta.outputs.crawler_tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -120,10 +135,18 @@ jobs:
       - name: 构建并推送 library
         id: library
         uses: docker/build-push-action@v6
+        # step 级超时（不能写进 with:，否则被当成 action 的未知输入直接忽略）
+        timeout-minutes: 30
         with:
           context: .
           target: library
-          push: ${{ steps.creds.outputs.has == 'true' }}
+          push: ${{ steps.creds.outputs.has == 'true' && github.event.inputs.push_images != 'false' }}
+          # build-push-action@v6 默认会生成 provenance attestation（mode=max），
+          # 即 --attest type=provenance,mode=max。腾讯云 CCR 对 OCI 1.1
+          # attestation manifest 支持不完善，实测会卡在 "exporting to image"
+          # 不动（认证已过、GHA cache 已导出完成，只剩最后这个 manifest）。
+          # 关掉它只推普通镜像，同时给单步加超时避免无限挂起。
+          provenance: false
           tags: ${{ steps.meta.outputs.library_tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -136,6 +159,8 @@ jobs:
             NPM_REGISTRY=https://registry.npmmirror.com
 
       - name: 记录结果
+        # 构建/推送失败时前面的 step 会跳过，这里必须总是执行才能把兜底指引写出来
+        if: always()
         run: |
           {
             echo ""
@@ -153,6 +178,21 @@ jobs:
               echo "- \`TENCENT_REGISTRY_PASSWORD\`"
               echo ""
               echo "然后在 Actions 里 Re-run 本工作流即可推送。"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "${{ job.status }}" != "success" ]; then
+            {
+              echo ""
+              echo "### ⚠️ 构建 / 推送未完成"
+              echo ""
+              echo "- 卡在 \`exporting to image\` 或超时：通常是 GitHub 海外 runner 跨境推"
+              echo "  大镜像到 \`ccr.ccs.tencentyun.com\` 太慢，或 registry 不接受 attestation。"
+              echo "- 本工作流已关闭 provenance、单步 30 分钟超时；仍失败时可："
+              echo "  1) Actions 手动 **Run workflow**，把 \`push_images\` 填 \`false\` 只构建验证（几分钟出结果）；"
+              echo "  2) 在国内网络跑 \`deploy/build-push.sh\` 直接推 CCR；"
+              echo "  3) 按 \`docs/DEPLOY_SPLIT.md\` 3.4 构建轻量浏览器镜像减小体积。"
+              echo "- 本 job 已开 \`cancel-in-progress\`：再次 push 会自动取消卡住的旧 run。"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           docker images | head -6 || true

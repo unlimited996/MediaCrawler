@@ -5,6 +5,38 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-05] 修复 CI 构建卡在 exporting to image（CCR attestation + 跨境大镜像）
+
+### 现象
+- run `41954222099` 的「构建并推送 crawler」停在 `#24 exporting to image`
+  33m+ 无任何进展；而认证 `#25 DONE 0.0s`、GHA 缓存导出 `#26 DONE 5.8s`
+  都已完成 —— 镜像其实早就构建完了，卡的是最后推送到 CCR。
+
+### 根因
+1. `docker/build-push-action@v6` 默认生成 provenance attestation
+   （日志里 `--attest type=provenance,mode=max`），会额外推一个 OCI 1.1
+   attestation manifest；腾讯云 CCR 对它支持不完善，典型表现就是导出阶段挂起。
+2. `runtime` 层装了完整 Chromium（约 770MB），单镜像 1.5GB 量级，
+   GitHub 海外 runner 跨境推 `ccr.ccs.tencentyun.com` 极慢。
+3. job 和 step 都没有超时，会一直挂到 Actions 默认的 6 小时。
+
+### 修复
+- `.github/workflows/build-push.yml`：两个 build step 加 `provenance: false`、
+  `timeout-minutes: 30`（step 级，不能写进 `with:`）；job `timeout-minutes: 70`；
+  `记录结果` 改 `if: always()` 并在失败时输出兜底指引；`workflow_dispatch`
+  新增 `push_images` 输入（`false` = 只构建验证，几分钟出结果）。
+- `Dockerfile`：新增 `ARG PLAYWRIGHT_BROWSER=chromium`（**默认行为不变**），
+  可切 `chromium-headless-shell` 省约 600MB；`docker-compose.split.yml` 与
+  `deploy/build-push.sh` 透传该变量。
+- `docs/DEPLOY_SPLIT.md` 新增 3.4 节：诊断思路、只构建验证、Cancel 卡住的 run、
+  国内 `deploy/build-push.sh` 兜底、轻量镜像用法。
+
+### 验收
+- PyYAML 解析 workflow：`provenance=false`、step 级 `timeout-minutes=30`、
+  job `70`、dispatch inputs 含 `push_images`、`记录结果` 带 `always()`，
+  且 `with:` 中没有误放的 `timeout-minutes`。
+- `concurrency.cancel-in-progress=true`：本次 push 会自动取消卡住的旧 run。
+
 ## [2026-11-05] 修复顶部「数据管理」快捷平台标签消失，补群晖 / 域名部署说明
 
 ### 现象

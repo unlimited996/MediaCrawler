@@ -171,6 +171,53 @@ TAG=v1.0.0 ./deploy/build-push.sh      # 额外打版本 tag
 PUSH=0 ./deploy/build-push.sh          # 只构建不推送
 ```
 
+## 3.4 构建卡在 `exporting to image` 的处置
+
+**现象**：CI 的「构建并推送 crawler」跑 30+ 分钟不动，日志停在：
+
+```
+#25 [auth] ... pull,push token for ccr.ccs.tencentyun.com     #25 DONE 0.0s
+#26 exporting to GitHub Actions Cache                          #26 DONE 5.8s
+#24 exporting to image                                        ← 卡在这里
+```
+
+认证已过、GHA 缓存导出也已完成，说明**镜像早就构建完了**，卡的是 `--push`
+把最终镜像推到 CCR。两个叠加原因：
+
+1. `docker/build-push-action@v6` 默认带 `--attest type=provenance,mode=max`，
+   会额外推一个 OCI 1.1 attestation manifest；腾讯云 CCR 对它支持不完善，
+   典型表现就是卡在导出阶段不返回。→ 工作流已加 `provenance: false`。
+2. `runtime` 层含完整 Chromium（约 770MB），加 Python 依赖后单镜像 1.5GB
+   量级；GitHub runner 在海外，跨境推国内 CCR 极慢。
+   → 单步 `timeout-minutes: 30`、job `timeout-minutes: 70`，到点给明确结论，
+   不再无限挂到 6 小时默认值。
+
+**已落地的修复**（`.github/workflows/build-push.yml`）：关闭 provenance、两级超时、
+`记录结果` 改 `if: always()` 输出兜底指引、手动触发新增 `push_images` 输入
+（填 `false` 只构建验证，几分钟出结果）。job 开了 `cancel-in-progress`，
+**再次 push 会自动取消卡住的旧 run**。
+
+**仍然推不动时**（按优先级）：
+
+```bash
+# 1) 国内网络直接推，绕开跨境（最快）
+export TENCENT_REGISTRY_USERNAME=1000xxxxxxx
+export TENCENT_REGISTRY_PASSWORD=********
+./deploy/build-push.sh
+
+# 2) 或推轻量镜像：只装 headless shell，省约 600MB
+PLAYWRIGHT_BROWSER=chromium-headless-shell ./deploy/build-push.sh
+```
+
+容器内 `HEADLESS=true` 且没有 X server，headless shell 与完整 Chromium 抓取行为
+一致；`Dockerfile` 的 `ARG PLAYWRIGHT_BROWSER` 和 compose 的
+`${PLAYWRIGHT_BROWSER:-chromium}` 默认仍是完整 chromium，兼容性不变。
+
+> 想确认是不是「单纯慢」：Actions 手动 Run workflow 并把 `push_images` 填
+> `false`，只构建不推送应在几分钟内完成。
+
+---
+
 ## 4. 镜像发布（在服务器上）
 
 ```bash

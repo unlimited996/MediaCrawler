@@ -127,8 +127,14 @@ RUN PIP_ARGS="--no-cache-dir --retries 10 --timeout 120"; \
     if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS -i $PIP_INDEX_URL"; fi; \
     pip install $PIP_ARGS -r requirements.txt
 
-# 3) Playwright 浏览器（--with-deps 会补齐 Chromium 缺的系统库）
-RUN playwright install --with-deps chromium \
+# 3) Playwright 浏览器
+#    --with-deps 补齐 Chromium 缺的系统库；默认仍是完整 chromium（兼容 CDP
+#    及各类启动方式）。若跨境推 CCR 太慢，可加
+#      --build-arg PLAYWRIGHT_BROWSER=chromium-headless-shell
+#    只装 headless shell（省约 600MB）：容器内 HEADLESS=true、没有 X server，
+#    抓取行为一致。compose 里对应 ${PLAYWRIGHT_BROWSER:-chromium}。
+ARG PLAYWRIGHT_BROWSER=chromium
+RUN playwright install --with-deps "${PLAYWRIGHT_BROWSER}" \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 
 # 4) 应用源码

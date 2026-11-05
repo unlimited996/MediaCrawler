@@ -7,6 +7,8 @@
 #   ./deploy/build-push.sh                 # 构建 + 推送 latest 与 sha-xxxxxxx
 #   TAG=v1.0.0 ./deploy/build-push.sh      # 额外打版本 tag
 #   PUSH=0 ./deploy/build-push.sh          # 只构建不推送
+#   PLAYWRIGHT_BROWSER=chromium-headless-shell ./deploy/build-push.sh
+#                                          # 轻量镜像（省约 600MB，跨境推送慢时用）
 #
 # 说明：构建会走 Dockerfile 的 Stage 1（npm build 前端），所以镜像自带界面；
 #       两张镜像共用同一份前端与依赖层，第二次构建几乎全命中缓存。

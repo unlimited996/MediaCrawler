@@ -29,6 +29,8 @@ services:
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         SKIP_WEBUI_BUILD: ${SKIP_WEBUI_BUILD:-0}
+        # 默认完整 chromium；跨境推送慢时可设 chromium-headless-shell 省约 600MB
+        PLAYWRIGHT_BROWSER: ${PLAYWRIGHT_BROWSER:-chromium}
     container_name: mediacrawler-crawler
     restart: unless-stopped
     env_file:
@@ -65,6 +67,8 @@ services:
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         SKIP_WEBUI_BUILD: ${SKIP_WEBUI_BUILD:-0}
+        # 默认完整 chromium；跨境推送慢时可设 chromium-headless-shell 省约 600MB
+        PLAYWRIGHT_BROWSER: ${PLAYWRIGHT_BROWSER:-chromium}
     container_name: mediacrawler-library
     restart: unless-stopped
     depends_on:
