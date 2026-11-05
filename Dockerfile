@@ -177,7 +177,11 @@ FROM runtime AS browser-runtime
 # 可加 --build-arg PLAYWRIGHT_BROWSER=chromium-headless-shell 只装 headless
 # shell（省约 600MB）：容器内 HEADLESS=true、无 X server，抓取行为一致。
 ARG PLAYWRIGHT_BROWSER=chromium
-RUN playwright install --with-deps "${PLAYWRIGHT_BROWSER}" \
+# 国内构建若 playwright CDN 也慢，可传
+# --build-arg PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright/
+ARG PLAYWRIGHT_DOWNLOAD_HOST=
+RUN if [ -n "$PLAYWRIGHT_DOWNLOAD_HOST" ]; then export PLAYWRIGHT_DOWNLOAD_HOST; fi; \
+    playwright install --with-deps "${PLAYWRIGHT_BROWSER}" \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 
 

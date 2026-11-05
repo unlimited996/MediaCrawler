@@ -5,6 +5,28 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-05] 修复国内服务器构建 apt-get 卡死
+
+### 现象
+- 服务器 `SKIP_PUSH=1 mc-update` 跑到 `apt-get` 后挂 **23 分钟**、CPU 0.1%、
+  Docker 构建缓存 13 分钟没有任何增长 —— 卡在 Debian 官方源。
+
+### 根因 / 修复
+- 实测 `deb.debian.org` 3.7s 且连接会挂住；`mirrors.ustc.edu.cn` 0.085s、
+  `mirrors.aliyun.com` HTTPS 0.126s。
+- `Dockerfile` 新增 `ARG APT_MIRROR=deb.debian.org`：非默认值时 sed 把
+  `/etc/apt/sources.list.d/debian.sources`（兼容旧的 sources.list）里的
+  `http://deb.debian.org` 换成国内镜像；CI 在海外不传该参数，仍用官方源。
+- `docker-compose.split.yml` 两个服务 `build.args` 加
+  `APT_MIRROR: ${APT_MIRROR:-mirrors.ustc.edu.cn}`（CI 不经过 compose，不受影响）。
+- `deploy/.env.example` 补说明；commit `3bb5179`。
+- 同一轮又发现 `pip install` 卡在 `files.pythonhosted.org`（`jieba` 读超时）：
+  实测 pypi.org 超时、阿里云源 0.078s。compose 两个服务补
+  `PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}`；
+  `Dockerfile` 另加可选 `PLAYWRIGHT_DOWNLOAD_HOST`（默认空=官方 CDN，
+  CDN 慢时可在 `.env` 设 npmmirror 镜像，无需再改代码）。
+  CI 不经过 compose，pip/Playwright 仍用官方源。
+
 ## [2026-11-05] 新增服务器一键构建推送脚本（绕开 Actions 跨境）
 
 ### 背景
