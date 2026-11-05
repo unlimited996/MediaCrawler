@@ -305,7 +305,25 @@ mc-update
 `docker login`；**构建前就检查**，没凭据不会白跑 20 分钟。`deploy/.env` 已在
 `.gitignore` 里，脚本自身不含任何密码。
 
-> 脚本会先 `git pull`，若自身被更新会自动 `exec` 重新执行，保证用新逻辑。
+> 脚本会先拉 tarball，若自身被更新会自动 `exec` 重新执行，保证用新逻辑。
+
+**长构建建议后台跑**：全量构建 20~30 分钟，SSH 长连接可能被中间网络断开并
+带走进程（实测 `nohup/setsid` 在这台机器上仍会被会话清理）。用 systemd
+transient service 最稳：
+
+```bash
+systemctl reset-failed mc-update.service 2>/dev/null || true
+systemd-run --unit=mc-update --description="MediaCrawler build and push" \
+  /bin/bash -c 'cd /opt/mediacrawler && exec mc-update > /var/log/mc-update.log 2>&1'
+
+systemctl status mc-update.service     # 看是否还在跑
+tail -f /var/log/mc-update.log         # 看进度
+```
+
+> 三个国内源是这台服务器能构建成功的关键：apt → `mirrors.ustc.edu.cn`、
+> pip → `mirrors.aliyun.com/pypi/simple`、npm → `registry.npmmirror.com`；
+> 代码走 `api.github.com` + `codeload.github.com`（`github.com` 主站不通）。
+> compose 已默认前三个，CI 不经过 compose，仍用官方源。
 
 ---
 
