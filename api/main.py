@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse
 
 import config as config_module
 
-from .routers import (crawler_router, data_router, websocket_router, export_router,
+from .routers import (crawler_router, data_router, websocket_router, export_router, env_router,
                       config_router, story_router, discover_router, accounts_router,
                       scheduler_router, stance_tags_router, s3_backup_router,
                       recipe_router, media_router, app_config_router)
@@ -293,6 +293,7 @@ app.include_router(s3_backup_router, prefix="/api")
 app.include_router(recipe_router, prefix="/api")
 app.include_router(media_router, prefix="/api")
 app.include_router(app_config_router, prefix="/api")
+app.include_router(env_router, prefix="/api")
 
 # 服务名路由兼容（2026-11-04 拆分后）：
 # 前端现在按服务名调用 `/crawler/api/**` 与 `/library/api/**`。单体进程把同一批
@@ -335,68 +336,9 @@ async def health_check():
     return {"status": "ok"}
 
 
-@app.get("/api/env/check")
-async def check_environment():
-    """Check if MediaCrawler environment is configured correctly"""
-    try:
-        # Run main.py --help with the current interpreter to check environment.
-        # 用当前 Python 解释器（通常是项目 venv），不依赖 uv：
-        # `uv run` 会重新解析/同步整个依赖，在无 uv 缓存的环境里会卡满超时。
-        # Use PROJECT_ROOT so it works regardless of where uvicorn was started
-        if sys.platform == "win32":
-            loop = asyncio.get_running_loop()
-            process = await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    [sys.executable, "main.py", "--help"],
-                    capture_output=True,
-                    timeout=30.0,
-                    cwd=str(PROJECT_ROOT)
-                )
-            )
-            stdout, stderr = process.stdout, process.stderr  # bytes
-        else:
-            process = await asyncio.create_subprocess_exec(
-                sys.executable, "main.py", "--help",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(PROJECT_ROOT)  # Project root directory
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=30.0  # 30 seconds timeout
-            )
-        if process.returncode == 0:
-            return {
-                "success": True,
-                "message": "MediaCrawler environment configured correctly",
-                "output": stdout.decode("utf-8", errors="ignore")[:500]  # Truncate to first 500 characters
-            }
-        else:
-            error_msg = stderr.decode("utf-8", errors="ignore") or stdout.decode("utf-8", errors="ignore")
-            return {
-                "success": False,
-                "message": "Environment check failed",
-                "error": error_msg[:500]
-            }
-    except asyncio.TimeoutError:
-        return {
-            "success": False,
-            "message": "Environment check timeout",
-            "error": "Command execution exceeded 30 seconds"
-        }
-    except FileNotFoundError:
-        return {
-            "success": False,
-            "message": "python interpreter not found",
-            "error": "Please ensure the Python interpreter used by the API server is available"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "message": "Environment check error",
-            "error": f"{type(e).__name__}: {str(e) or 'Unknown'}"
-        }
+# 环境自检已迁移到 api/routers/env.py（env_router）：单体、crawler、library
+# 三个应用共用同一实现。原来这里跑 `python main.py --help`，拆分后 library
+# 镜像没装爬虫依赖，必然失败，前端就误报「无法连接到 API 服务器」。
 
 
 # 平台列表端点已统一到 config_router 的 GET /config/platforms（见

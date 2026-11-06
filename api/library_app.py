@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import config
 from .gateway import router as gateway_router
 from .routers import (accounts_router, app_config_router, config_router,
-                      data_router, discover_router, export_router,
+                      data_router, discover_router, env_router, export_router,
                       media_router, recipe_router, s3_backup_router,
                       scheduler_router, stance_tags_router, story_router,
                       websocket_router)
@@ -83,6 +83,7 @@ app.include_router(accounts_router, prefix=API_PREFIX)
 # 实时日志/统计：日志桥 tail 的是挂载进来的 ./logs/scheduler_live.jsonl，
 # 两个容器看到的是同一个文件，所以 library 也能提供同一条 WS 通道。
 app.include_router(websocket_router, prefix=API_PREFIX)
+app.include_router(env_router, prefix=API_PREFIX)
 
 
 @app.get(f"{SERVICE_PREFIX}/health", tags=["health"])

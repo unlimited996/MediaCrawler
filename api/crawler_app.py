@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
-from .routers import (accounts_router, config_router, crawler_router,
+from .routers import (accounts_router, config_router, crawler_router, env_router,
                       scheduler_router, websocket_router)
 from .services import boot_tasks, discovery
 
@@ -51,6 +51,7 @@ app.include_router(scheduler_router, prefix=API_PREFIX)
 app.include_router(accounts_router, prefix=API_PREFIX)
 app.include_router(config_router, prefix=API_PREFIX)
 app.include_router(websocket_router, prefix=API_PREFIX)
+app.include_router(env_router, prefix=API_PREFIX)
 
 
 @app.get(f"{SERVICE_PREFIX}/health", tags=["health"])

@@ -65,7 +65,10 @@ export function LicenseDisclaimer({ onAccept }: LicenseDisclaimerProps) {
 
   return (
     <div className="fixed inset-0 bg-black/95 backdrop-blur-sm flex items-center justify-center z-[100] overflow-y-auto py-8">
-      <div className="bg-cyber-bg-panel border-2 border-cyber-neon-pink rounded-lg shadow-cyber-card p-6 max-w-2xl w-full mx-4 relative">
+      {/* 遮罩是全黑的，所以弹窗内一律用**固定浅色文字**：
+          以前内容框是 bg-black/50 + text-cyber-text-primary，
+          浅色主题下后者是近黑色，落在半透明黑底上等于「字消失」。 */}
+      <div className="bg-[#161b22] border-2 border-cyber-neon-pink rounded-lg shadow-cyber-card p-6 max-w-2xl w-full mx-4 relative text-[#c9d1d9]">
         {/* Corner decorations - Pink/Red theme for seriousness */}
         <div className="absolute top-0 left-0 w-6 h-6 border-t-2 border-l-2 border-cyber-neon-pink" />
         <div className="absolute top-0 right-0 w-6 h-6 border-t-2 border-r-2 border-cyber-neon-pink" />
@@ -74,37 +77,37 @@ export function LicenseDisclaimer({ onAccept }: LicenseDisclaimerProps) {
 
         {/* Header with warning icon */}
         <div className="flex items-center justify-center gap-3 mb-4">
-          <ShieldAlert className="w-8 h-8 text-cyber-neon-pink animate-pulse" />
-          <h2 className="text-xl font-mono font-bold text-cyber-neon-pink">
+          <ShieldAlert className="w-8 h-8 text-[#ff7b72] animate-pulse" />
+          <h2 className="text-xl font-mono font-bold text-[#ff7b72]">
             {t('title')}
           </h2>
         </div>
 
         {/* Warning subtitle */}
         <div className="text-center mb-4">
-          <span className="text-base font-mono text-cyber-neon-orange">
+          <span className="text-base font-mono text-[#e3b341]">
             {t('warning')}
           </span>
         </div>
 
         {/* Content box */}
-        <div className="bg-black/50 border border-cyber-neon-pink/30 rounded-lg p-4 mb-4">
+        <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-4 mb-4">
           <ul className="space-y-2 text-sm font-mono">
             <li className="flex items-start gap-2">
-              <span className="text-cyber-neon-pink font-bold">1.</span>
-              <span className="text-cyber-text-primary">{t('content.line1')}</span>
+              <span className="text-[#ff7b72] font-bold">1.</span>
+              <span className="text-[#c9d1d9]">{t('content.line1')}</span>
             </li>
             <li className="flex items-start gap-2">
-              <span className="text-cyber-neon-pink font-bold">2.</span>
-              <span className="text-cyber-text-primary">{t('content.line2')}</span>
+              <span className="text-[#ff7b72] font-bold">2.</span>
+              <span className="text-[#c9d1d9]">{t('content.line2')}</span>
             </li>
             <li className="flex items-start gap-2">
-              <span className="text-cyber-neon-pink font-bold">3.</span>
-              <span className="text-cyber-text-primary">{t('content.line3')}</span>
+              <span className="text-[#ff7b72] font-bold">3.</span>
+              <span className="text-[#c9d1d9]">{t('content.line3')}</span>
             </li>
             <li className="flex items-start gap-2">
-              <span className="text-cyber-neon-pink font-bold">4.</span>
-              <span className="text-cyber-text-primary">{t('content.line4')}</span>
+              <span className="text-[#ff7b72] font-bold">4.</span>
+              <span className="text-[#c9d1d9]">{t('content.line4')}</span>
             </li>
           </ul>
         </div>
@@ -115,7 +118,7 @@ export function LicenseDisclaimer({ onAccept }: LicenseDisclaimerProps) {
             href="https://github.com/NanmiCoder/MediaCrawler/blob/main/LICENSE"
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-1.5 text-cyber-neon-cyan hover:underline text-sm font-mono"
+            className="flex items-center gap-1.5 text-[#79c0ff] hover:underline text-sm font-mono"
           >
             <ExternalLink className="w-4 h-4" />
             {t('license')}
@@ -127,13 +130,13 @@ export function LicenseDisclaimer({ onAccept }: LicenseDisclaimerProps) {
           <Button
             onClick={handleDecline}
             variant="outline"
-            className="flex-1 font-mono border-cyber-neon-pink/50 text-cyber-neon-pink hover:bg-cyber-neon-pink/10"
+            className="flex-1 font-mono border-[#ff7b72]/50 text-[#ff7b72] hover:bg-[#ff7b72]/10"
           >
             {t('decline')}
           </Button>
           <Button
             onClick={handleConfirm}
-            className="flex-1 font-mono bg-cyber-neon-green text-black font-bold hover:bg-cyber-neon-green/90"
+            className="flex-1 font-mono bg-[#3fb950] text-black font-bold hover:bg-[#3fb950]/90"
           >
             {t('confirm')}
           </Button>
