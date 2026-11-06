@@ -9,6 +9,7 @@ export function Terminal() {
   const { t } = useTranslation('terminal')
   const [isCollapsed, setIsCollapsed] = useState(false)
   const logs = useCrawlerStore((state) => state.logs)
+  const liveStats = useCrawlerStore((state) => state.liveStats)
   const clearLogs = useCrawlerStore((state) => state.clearLogs)
   const restoreLogs = useCrawlerStore((state) => state.restoreLogs)
   const clearedAfterLogId = useCrawlerStore((state) => state.clearedAfterLogId)
@@ -42,6 +43,16 @@ export function Terminal() {
           {/* Log count & status */}
           <div className="flex items-center gap-3 text-xs font-mono">
             <span className="text-[#8b949e]">{t('header.entries', { count: logs.length })}</span>
+            {liveStats && (
+              <span
+                className="flex items-center gap-2 px-2 py-0.5 rounded border border-[#30363d] bg-[#0d1117]"
+                title={t('header.statsHint')}
+              >
+                <span>{t('header.fetched')} <b className="text-cyber-neon-cyan">{liveStats.fetched}</b></span>
+                <span className="text-[#30363d]">/</span>
+                <span>{t('header.saved')} <b className="text-cyber-neon-green">{liveStats.saved}</b></span>
+              </span>
+            )}
             {status === 'running' && (
               <div className="flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 bg-cyber-neon-green rounded-full shadow-glow-green-sm animate-pulse-fast" />

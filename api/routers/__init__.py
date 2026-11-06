@@ -16,24 +16,42 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
-from .crawler import router as crawler_router
-from .data import router as data_router
-from .websocket import router as websocket_router
-from .export import router as export_router
-from .config_admin import router as config_router
-from .story import router as story_router
-from .discover import router as discover_router
-from .accounts import router as accounts_router
-from .scheduler import router as scheduler_router
-from .stance_tags import router as stance_tags_router
-from .s3_backup import router as s3_backup_router
-from .recipe import (
-    app_config_router, media_router, router as recipe_router,
-)
+"""路由按需导出（PEP 562）。
 
-__all__ = [
-    "crawler_router", "data_router", "websocket_router",
-    "export_router", "config_router", "story_router", "discover_router",
-    "accounts_router", "scheduler_router", "stance_tags_router",
-    "s3_backup_router", "recipe_router", "media_router", "app_config_router",
-]
+拆分成 crawler / library 两个服务后，两个 app 都写 `from .routers import (...)`。
+若这里顶层导入全部 router，library 会顺带加载 scheduler_router →
+task_scheduler → tools.anti_risk → tools.utils → playwright / cv2，
+把整套爬虫依赖拖进「只有数据接口 + 前端」的进程。改为惰性后，
+每个 app 只加载自己真正 include 的路由模块。
+"""
+from importlib import import_module
+
+#: 导出名 -> (子模块, 模块内属性名)
+_ROUTER_EXPORTS = {
+    "crawler_router": ("crawler", "router"),
+    "data_router": ("data", "router"),
+    "websocket_router": ("websocket", "router"),
+    "export_router": ("export", "router"),
+    "config_router": ("config_admin", "router"),
+    "story_router": ("story", "router"),
+    "discover_router": ("discover", "router"),
+    "accounts_router": ("accounts", "router"),
+    "scheduler_router": ("scheduler", "router"),
+    "stance_tags_router": ("stance_tags", "router"),
+    "s3_backup_router": ("s3_backup", "router"),
+    "recipe_router": ("recipe", "router"),
+    "media_router": ("recipe", "media_router"),
+    "app_config_router": ("recipe", "app_config_router"),
+}
+
+
+def __getattr__(name):
+    spec = _ROUTER_EXPORTS.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr = spec
+    module = import_module(f".{module_name}", __name__)
+    return getattr(module, attr)
+
+
+__all__ = list(_ROUTER_EXPORTS)

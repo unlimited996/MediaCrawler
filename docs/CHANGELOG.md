@@ -5,6 +5,44 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-06] 实时抓取/入库统计 + 消除 library 的爬虫依赖导入耦合
+
+### 新增：实时统计（执行记录 + 系统控制台）
+- worker 每轮开始打 `[MC_RUN_BEGIN] run_id=… task_id=…`；
+- crawler API 的日志桥（`_live_log_tailer`）逐行解析并累计：
+  * **抓取** = `[XxxCrawler.xxx]` / `[XxxClient.xxx]` 请求标记
+  * **入库** = `[store.<platform>.<func>]` 落库标记
+- 通过 WS 推 `{"type":"stats"}` 给系统控制台（0.5s 节流，批尾补发最终值），
+  同时随 `/scheduler/status.live_stats` 给执行记录页（原本就 5s 轮询）；
+- WS 新连接补发一次快照；服务重启时从日志尾部（最后一个 `[MC_RUN_BEGIN]`
+  之后）重建计数，避免重启后归零。
+- 新增 `api/services/live_stats.py`；前端 `crawlerStore` 增 `liveStats`，
+  `Terminal` 头部与执行记录面板/运行中条目显示「抓取 N / 入库 M」。
+
+### 变更：导入解耦（为 library 瘦身铺路）
+- `api/services/__init__.py`：`task_scheduler` 改 PEP 562 惰性导出；
+- `api/routers/__init__.py`：所有 router 改惰性导出。
+- 原因：library 只要 `from .routers import …` 就会加载 scheduler_router →
+  task_scheduler → tools.anti_risk → tools.utils → playwright / cv2，
+  把整套爬虫依赖拖进「只有数据接口 + 前端」的进程。
+- 实测：改动后 `from api.library_app import app` **不再加载**
+  cv2/playwright/matplotlib/jieba；三入口路由数不变（library 104 / crawler 42 / main 257）。
+
+### 验证
+- 端到端：WS 连接补发 stats；追加模拟日志后收到
+  `fetched=2 saved=3 run_id=999`，`/scheduler/status.live_stats` 同值，
+  计数按轮重置正常。
+- 前端 `npm run build` 通过（`index-DYDNPNgt.js`）。
+
+### library 镜像 1.61GB 的构成（本次未再减小）
+- pip 671MB + apt 378MB + python:3.11-slim 基础约 141MB。
+- 它 `FROM runtime`，而 runtime 是给 crawler 准备的公共层：33 个 Python 依赖
+  （playwright 140MB / opencv 72MB / pandas 79MB / numpy 73MB / jieba 42MB /
+  matplotlib 35MB…）+ Chromium 系统库 + nodejs + Mesa。
+  本次只切断了**启动时**的导入耦合，依赖包本身仍在镜像里。
+- 要压到 ~700MB 需把 requirements 拆 core/crawler + apt 分层，并把
+  watch / PDF 导出等模块改懒加载后做全接口冒烟 —— 属独立改造，暂未做。
+
 ## [2026-11-05] 移除 push 自动构建 + 生产镜像零风险瘦身
 
 ### 变更

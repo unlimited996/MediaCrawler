@@ -107,7 +107,11 @@
     "statsUpdated": "Refreshed posts ({{count}})",
     "statsGained": "{{count}} comments fetched this run",
     "statsEmpty": "No posts added or refreshed",
-    "statsLogsToggle": "Logs"
+    "statsLogsToggle": "Logs",
+    "liveFetched": "Fetch",
+    "liveSaved": "Saved",
+    "liveStatsHint": "Live counters for the current run: Fetch = platform requests, Saved = rows persisted",
+    "liveProgress": "Live · {{fetched}} fetched / {{saved}} saved"
   },
   "msg": {
     "created": "Task created",

@@ -865,6 +865,10 @@ class TaskScheduler:
                         # （兼容模式），保证 WebUI 控制台手动抓取/定时任务同视图
                         self._emit_log(f"[定时任务#{task_id}] {msg}", level)
 
+                    # 本轮开始标记：API 进程的日志桥据此把实时抓取/入库计数归零
+                    # 并绑定 run_id（见 api/services/live_stats.py）。
+                    _on_log(f"[MC_RUN_BEGIN] run_id={run_id} task_id={task_id}", "info")
+
                     # 同平台 + 同登录态串行：前面还有任务没跑完就排队等。
                     # 明确不做的事：不 kill、不 cancel、不停掉正在运行的任务 ——
                     # 那个任务跑完释放执行权后，排队的才会开跑（2026-10-29）。
@@ -1073,6 +1077,8 @@ class TaskScheduler:
     # ---------- 状态 ----------
 
     async def get_status(self) -> Dict[str, Any]:
+        from .live_stats import snapshot as live_stats_snapshot
+
         # 本进程内存里的运行数只在 inline 兼容模式有效。拆分部署后调度跑在独立
         # worker 进程里，API 进程的 _states 恒为空 → running_tasks 永远返回 0，
         # 前端「执行中」徽章和「停止抓取」按钮就会拿不到真实状态。所以内存计数
@@ -1132,6 +1138,8 @@ class TaskScheduler:
             "enabled_tasks": int(enabled),
             "running_tasks": running,
             "queued_runs": int(queued),
+            # 本轮实时抓取/入库计数（前端执行记录页随 status 5s 轮询拿到）
+            "live_stats": live_stats_snapshot(),
             "last_tick_at": self.last_tick_at.isoformat() if self.last_tick_at else None,
             "last_error": self.last_error,
         }

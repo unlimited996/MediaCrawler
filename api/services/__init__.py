@@ -18,7 +18,23 @@
 
 from .crawler_manager import CrawlerManager, crawler_manager
 from .crawl_queue import CrawlQueue, QueueItem as QueueTask, crawl_queue
-from .task_scheduler import TaskScheduler, task_scheduler
+
+# task_scheduler 不能在包初始化时顶层导入：
+#   library_app → gateway → `from .services import discovery` 会执行本文件，
+#   而 task_scheduler → tools.anti_risk → tools.utils 顶层 import 了
+#   tools.crawler_util(playwright) 与 tools.slider_util(cv2)，
+#   于是「只跑数据接口 + 前端」的 library 进程被迫加载整套爬虫依赖。
+# 项目内所有调用方都是 `from ..services.task_scheduler import task_scheduler`
+# （直接子模块），不依赖这里的再导出；保留 PEP 562 惰性属性以兼容外部写法。
+def __getattr__(name):
+    if name == "TaskScheduler":
+        from .task_scheduler import TaskScheduler
+        return TaskScheduler
+    if name == "task_scheduler":
+        from .task_scheduler import task_scheduler
+        return task_scheduler
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = ["CrawlerManager", "crawler_manager",
            "CrawlQueue", "QueueTask", "crawl_queue",

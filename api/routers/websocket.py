@@ -17,11 +17,15 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import asyncio
+import time
+from pathlib import Path
 from typing import Set, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..services import crawler_manager
+from ..services.live_stats import (feed as stats_feed, rebuild as stats_rebuild,
+                                  snapshot as stats_snapshot)
 
 router = APIRouter(tags=["websocket"])
 
@@ -132,6 +136,10 @@ async def _live_log_tailer() -> None:
     except Exception:
         pos = 0
 
+    # 服务重启后从日志尾部重建当前这一轮的抓取/入库计数
+    stats_rebuild(Path(LIVE_LOG))
+    _last_stats_push = 0.0
+
     while True:
         await asyncio.sleep(1.0)
         try:
@@ -148,6 +156,7 @@ async def _live_log_tailer() -> None:
                 fh.seek(pos)
                 chunk = fh.read()
                 pos = fh.tell()
+            snap = None
             for line in chunk.splitlines():
                 line = line.strip()
                 if not line:
@@ -158,6 +167,16 @@ async def _live_log_tailer() -> None:
                     continue
                 if isinstance(item, dict) and item.get("msg"):
                     await manager.broadcast(_live_entry(item))
+                    snap = stats_feed(item["msg"])
+                    if snap is not None:
+                        # 一条日志一次广播会在补评论时刷屏，节流到 0.5s
+                        now = time.monotonic()
+                        if now - _last_stats_push >= 0.5:
+                            await manager.broadcast(snap)
+                            _last_stats_push = now
+            # 本批结束时补一次最终值，避免节流把最后一次变化吞掉
+            if snap is not None:
+                await manager.broadcast(stats_snapshot())
         except Exception:
             continue
 
@@ -197,6 +216,12 @@ async def websocket_logs(websocket: WebSocket):
                 await websocket.send_json(entry)
             except Exception:
                 break
+
+        # 补发当前实时统计，避免刚连上要等下一条日志才看到数字
+        try:
+            await websocket.send_json(stats_snapshot())
+        except Exception:
+            pass
 
         print(f"[WS] Sent {len(crawler_manager.logs)} existing logs, entering main loop")
 

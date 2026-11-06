@@ -1,4 +1,5 @@
 // 定时拉取任务相关类型（与后端 api/schemas/scheduler.py 对应）
+import type { LiveStats } from './crawler'
 
 export type TaskType = 'profile' | 'note' | 'account'
 /** 任务维度：author=关注的用户 / note=关注的帖子 / account=扫码登录用户 */
@@ -113,6 +114,8 @@ export interface SchedulerStatus {
   total_tasks: number
   enabled_tasks: number
   running_tasks: number
+  /** 本轮实时抓取/入库计数（随 status 每 5s 轮询更新） */
+  live_stats?: LiveStats
   last_tick_at: string | null
   last_error: string
 }

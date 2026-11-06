@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { LogEntry, CrawlerConfig } from '@/types/crawler'
+import type { LogEntry, CrawlerConfig, LiveStats } from '@/types/crawler'
 
 interface CrawlerState {
   // Status
@@ -11,6 +11,8 @@ interface CrawlerState {
   // Logs
   logs: LogEntry[]
   clearedAfterLogId: number | null  // 清除日志后，只显示 id 大于此值的日志
+  /** 本轮实时抓取/入库统计（WS 推送） */
+  liveStats: LiveStats | null
 
   // Config
   config: CrawlerConfig
@@ -19,6 +21,7 @@ interface CrawlerState {
   setStatus: (status: CrawlerState['status']) => void
   setRunningInfo: (platform: string | null, crawlerType: string | null, startedAt: string | null) => void
   addLog: (log: LogEntry) => void
+  setLiveStats: (stats: LiveStats) => void
   setLogs: (logs: LogEntry[]) => void
   clearLogs: () => void
   restoreLogs: () => void
@@ -69,6 +72,7 @@ export const useCrawlerStore = create<CrawlerState>((set, get) => ({
   startedAt: null,
   logs: [],
   clearedAfterLogId: getClearedLogIdFromStorage(), // 从 localStorage 初始化
+  liveStats: null,
   config: defaultConfig,
 
   setStatus: (status) => {
@@ -112,6 +116,8 @@ export const useCrawlerStore = create<CrawlerState>((set, get) => ({
       logs: [...state.logs.slice(-499), log], // Keep last 500 logs
     }))
   },
+
+  setLiveStats: (stats) => set({ liveStats: stats }),
 
   setLogs: (logs) => {
     const { clearedAfterLogId } = get()

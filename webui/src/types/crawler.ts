@@ -71,6 +71,19 @@ export interface LogEntry {
   message: string
 }
 
+/** 本轮实时抓取/入库统计（WS stats 消息 + /scheduler/status 的 live_stats） */
+export interface LiveStats {
+  type: 'stats'
+  /** 抓取动作数（向平台发起的数据请求） */
+  fetched: number
+  /** 落库条目数（store 写入的帖子/评论） */
+  saved: number
+  run_id: number | null
+  task_id: number | null
+  started_at: string | null
+  updated_at: string | null
+}
+
 export interface DataFile {
   name: string
   path: string

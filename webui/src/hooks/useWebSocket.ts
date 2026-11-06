@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useCrawlerStore } from '@/store/crawlerStore'
-import type { LogEntry } from '@/types/crawler'
+import type { LogEntry, LiveStats } from '@/types/crawler'
 
 // 模块级单例，确保全局只有一个 WebSocket 连接
 let globalWs: WebSocket | null = null
@@ -9,12 +9,15 @@ let connectionCount = 0  // 跟踪连接使用者数量
 
 export function useLogWebSocket() {
   const addLog = useCrawlerStore((state) => state.addLog)
+  const setLiveStats = useCrawlerStore((state) => state.setLiveStats)
   const addLogRef = useRef(addLog)
+  const setLiveStatsRef = useRef(setLiveStats)
 
-  // 保持 addLog 引用最新
+  // 保持回调引用最新
   useEffect(() => {
     addLogRef.current = addLog
-  }, [addLog])
+    setLiveStatsRef.current = setLiveStats
+  }, [addLog, setLiveStats])
 
   useEffect(() => {
     connectionCount++
@@ -54,7 +57,13 @@ export function useLogWebSocket() {
         }
 
         try {
-          const log: LogEntry = JSON.parse(event.data)
+          const payload = JSON.parse(event.data)
+          // 实时抓取/入库统计（后端日志桥节流推送，连接时也会补发一次）
+          if (payload?.type === 'stats') {
+            setLiveStatsRef.current(payload as LiveStats)
+            return
+          }
+          const log = payload as LogEntry
           if (log.id && log.message) {
             addLogRef.current(log)
           }

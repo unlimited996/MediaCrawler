@@ -734,6 +734,16 @@ export function ScheduledTasksView() {
           <div className="px-3 py-2 border-b border-cyber-border-subtle/50 flex items-center gap-2 bg-cyber-bg-tertiary/30 flex-shrink-0">
             <ListTree className="h-3.5 w-3.5 text-cyber-neon-purple" />
             <span className="text-xs font-mono font-semibold text-cyber-text-primary">{t('runs.title')}</span>
+            {status?.live_stats && (
+              <span
+                className="ml-auto flex items-center gap-1.5 text-[10px] font-mono text-cyber-text-muted"
+                title={t('runs.liveStatsHint')}
+              >
+                <span>{t('runs.liveFetched')} <b className="text-cyber-neon-cyan">{status.live_stats.fetched}</b></span>
+                <span className="text-cyber-border-subtle">/</span>
+                <span>{t('runs.liveSaved')} <b className="text-cyber-neon-green">{status.live_stats.saved}</b></span>
+              </span>
+            )}
           </div>
           <div className="flex-1 overflow-y-auto min-h-0 divide-y divide-cyber-border-subtle/30">
             {runs.length === 0 && (
@@ -769,6 +779,14 @@ export function ScheduledTasksView() {
                         </>
                       )}
                     </div>
+                    {run.status === 'running' && status?.live_stats && (
+                      <p className="text-[10px] font-mono text-cyber-neon-cyan">
+                        {t('runs.liveProgress', {
+                          fetched: status.live_stats.fetched,
+                          saved: status.live_stats.saved,
+                        })}
+                      </p>
+                    )}
                     {run.error_message && (
                       <p className="text-[10px] text-cyber-neon-pink line-clamp-2">{run.error_message}</p>
                     )}

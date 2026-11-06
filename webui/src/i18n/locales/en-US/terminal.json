@@ -4,7 +4,10 @@
     "entries": "{{count}} entries",
     "active": "ACTIVE",
     "clear": "CLEAR",
-    "restore": "RESTORE ALL LOGS"
+    "restore": "RESTORE ALL LOGS",
+    "fetched": "FETCH",
+    "saved": "SAVED",
+    "statsHint": "Live counters for the current run: FETCH = platform requests, SAVED = rows persisted"
   },
   "banner": {
     "systemInit": "[SYS] System initialized successfully",

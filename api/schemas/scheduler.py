@@ -199,5 +199,7 @@ class SchedulerStatusOut(BaseModel):
     running_tasks: int = 0
     #: 排队中的手动触发（status='queued'），等执行器拾取
     queued_runs: int = 0
+    #: 本轮实时抓取/入库计数（fetched/saved/run_id/...），来自日志桥
+    live_stats: Dict[str, Any] = {}
     last_tick_at: Optional[str] = None
     last_error: str = ""

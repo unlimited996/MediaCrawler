@@ -4,7 +4,10 @@
     "entries": "{{count}} 条记录",
     "active": "活跃",
     "clear": "清除",
-    "restore": "恢复所有日志"
+    "restore": "恢复所有日志",
+    "fetched": "抓取",
+    "saved": "入库",
+    "statsHint": "本轮实时统计：抓取=向平台发起的抓取请求数，入库=落库的帖子/评论条数"
   },
   "banner": {
     "systemInit": "[系统] 系统初始化成功",
