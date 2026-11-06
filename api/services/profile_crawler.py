@@ -283,6 +283,18 @@ async def build_crawler_env(task: Dict[str, Any]) -> Dict[str, str]:
     env["PYTHONUNBUFFERED"] = "1"
     env["MAX_CONCURRENCY_NUM"] = str(int(task.get("max_concurrency") or 1))
     env["CRAWLER_MAX_SLEEP_SEC"] = str(float(task.get("rate_interval_sec") or 3))
+    # 与平台无关的两个参数：子进程是独立 Python 进程，读不到本进程
+    # runtime_config 的内存缓存，必须显式注入环境变量（config 用 _env_* 覆盖）
+    try:
+        import config as _cfg
+        from config.runtime_config import runtime_config as _rc2
+        env["COMMENT_COMPLETENESS_TARGET"] = str(float(
+            _rc2.get_float("comment_completeness_target",
+                           _cfg.COMMENT_COMPLETENESS_TARGET)))
+        env["PAGE_GOTO_TIMEOUT_SEC"] = str(int(
+            _rc2.get_int("page_goto_timeout_sec", _cfg.PAGE_GOTO_TIMEOUT_SEC)))
+    except Exception as e:
+        print(f"[build_crawler_env] 注入通用参数失败，回退常量: {e}")
     # 小红书抓取节奏 / 验证码等待：从配置页读最新值注入子进程 env，
     # 子进程的 config.xhs_config 用 _env_float/_env_int 覆盖默认值。
     if task.get("platform") == "xhs":
@@ -299,6 +311,14 @@ async def build_crawler_env(task: Dict[str, Any]) -> Dict[str, str]:
                 _rc.get_int("xhs_interleave_every_pages", _xc.XHS_INTERLEAVE_EVERY_PAGES)))
             env["XHS_461_INTERLEAVE_RETRIES"] = str(int(
                 _rc.get_int("xhs_461_interleave_retries", _xc.XHS_461_INTERLEAVE_RETRIES)))
+            env["XHS_MAX_CONCURRENCY_NUM"] = str(int(
+                _rc.get_int("xhs_max_concurrency_num", _xc.XHS_MAX_CONCURRENCY_NUM)))
+            env["XHS_BEHAVIOR_EARLY_STOP_PAGES"] = str(int(
+                _rc.get_int("xhs_behavior_early_stop_pages",
+                            _xc.XHS_BEHAVIOR_EARLY_STOP_PAGES)))
+            env["XHS_SUB_COMMENT_MAX_PAGES"] = str(int(
+                _rc.get_int("xhs_sub_comment_max_pages",
+                            _xc.XHS_SUB_COMMENT_MAX_PAGES)))
         except Exception as e:
             print(f"[build_crawler_env] 读取小红书节奏配置失败，回退常量: {e}")
     # 注：2026-11-03 起不再注入 XHS_DETAIL_BUDGET_PER_ROUND /

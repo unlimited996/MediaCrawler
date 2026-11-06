@@ -174,7 +174,8 @@ CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 30
 # 评论完整率目标：已抓评论数 / 原帖显示评论量 达到该比例即视为「抓全了」，
 # 增量任务下次不再重抓；未达标则继续补抓（不再有「最多重试 N 次」的硬上限）。
 # 用途见 tools/v2_sync.get_archived_content_ids()。
-COMMENT_COMPLETENESS_TARGET = 0.9
+# 可用环境变量覆盖（配置页 comment_completeness_target 经 build_crawler_env 注入）
+COMMENT_COMPLETENESS_TARGET = _env_float("COMMENT_COMPLETENESS_TARGET", 0.9)
 
 # Whether to enable the mode of crawling second-level comments. By default, crawling of second-level comments is not enabled.
 # If the old version of the project uses db, you need to refer to schema/tables.sql line 287 to add table fields.
@@ -204,7 +205,7 @@ CRAWLER_MAX_SLEEP_SEC = _env_int("CRAWLER_MAX_SLEEP_SEC", 2)
 # 打开首页的超时时间（秒）。弱网 / 代理环境下小红书首页资源多，
 # Playwright 默认的 30s + wait_until='load' 经常卡死导致整个抓取崩在第一步。
 # 代码里已改成 domcontentloaded 并重试 3 次，这里只控制单次等待上限。
-PAGE_GOTO_TIMEOUT_SEC = 45
+PAGE_GOTO_TIMEOUT_SEC = _env_int("PAGE_GOTO_TIMEOUT_SEC", 45)
 
 # ---------------------------------------------------------------------------
 # 定时拉取任务（api/services/task_scheduler.py）
