@@ -22,6 +22,26 @@ SUPPORTED_SUFFIX = {".json", ".jsonl", ".csv"}
 SAFE_NAME_RE = re.compile(r"^[\w.\-]+\.pdf$")
 
 
+def _require_pdf_engine() -> None:
+    """PDF 导出依赖服务端浏览器内核（Playwright 渲染 HTML）。
+
+    为什么单独检查：library 镜像为了瘦身只装 requirements-core.txt，
+    不含 Playwright。直接让 `import exporters.pdf_exporter` 抛 ImportError
+    会被上层 `except Exception` 吞成 500「PDF export failed: …」，
+    用户完全不知道该怎么办。这里提前给出可执行的处置建议。
+    """
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "当前部署是精简版 library 服务（不装浏览器内核），无法导出 PDF。"
+                "可改用 CSV / JSON 格式导出；若必须导出 PDF，请部署 crawler "
+                "或 all 镜像（含 Playwright）后再执行该操作。"
+            ))
+
+
 class ExportPdfRequest(BaseModel):
     file_path: str = Field(..., description="相对于 data 目录的数据文件路径")
     limit: int = Field(200, ge=1, le=200, description="最多导出多少条记录")
@@ -48,6 +68,8 @@ def _resolve_data_file(file_path: str) -> Path:
 @router.post("/pdf")
 async def export_pdf(req: ExportPdfRequest):
     """把数据文件导出为 PDF"""
+    _require_pdf_engine()
+
     from exporters.pdf_exporter import export_pdf as do_export
 
     source = _resolve_data_file(req.file_path)
@@ -89,6 +111,8 @@ class ExportStoriesRequest(BaseModel):
 @router.post("/stories")
 async def export_stories(req: ExportStoriesRequest):
     """按勾选的条目导出 PDF（数据管理页用）。"""
+    _require_pdf_engine()
+
     from exporters.pdf_exporter import export_stories_pdf as do_export
 
     if not req.ids:

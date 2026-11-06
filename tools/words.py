@@ -24,17 +24,19 @@ import logging
 from collections import Counter
 
 import aiofiles
-import jieba
-import matplotlib.pyplot as plt
-from wordcloud import WordCloud
 
 import config
 from tools import utils
 
+# jieba / matplotlib / wordcloud 只在真正生成词云时才用（约 150MB 的依赖）。
+# 本模块被 tools.async_file_writer 顶层引入，而后者又会被 library 服务的启动链
+# 间接触达；改成函数内延迟导入后，只跑数据接口的 library 镜像不必安装它们。
 plot_lock = asyncio.Lock()
 
 class AsyncWordCloudGenerator:
     def __init__(self):
+        import jieba
+
         logging.getLogger('jieba').setLevel(logging.WARNING)
         self.stop_words_file = config.STOP_WORDS_FILE
         self.lock = asyncio.Lock()
@@ -48,6 +50,8 @@ class AsyncWordCloudGenerator:
             return set(f.read().strip().split('\n'))
 
     async def generate_word_frequency_and_cloud(self, data, save_words_prefix):
+        import jieba
+
         all_text = ' '.join(item['content'] for item in data)
         words = [word for word in jieba.lcut(all_text) if word not in self.stop_words and len(word.strip()) > 0]
         word_freq = Counter(words)
@@ -65,6 +69,12 @@ class AsyncWordCloudGenerator:
         await self.generate_word_cloud(word_freq, save_words_prefix)
 
     async def generate_word_cloud(self, word_freq, save_words_prefix):
+        import matplotlib
+
+        matplotlib.use('Agg')  # 容器/无显示环境：不依赖 X server
+        import matplotlib.pyplot as plt
+        from wordcloud import WordCloud
+
         await plot_lock.acquire()
         top_20_word_freq = {word: freq for word, freq in
                             sorted(word_freq.items(), key=lambda item: item[1], reverse=True)[:20]}

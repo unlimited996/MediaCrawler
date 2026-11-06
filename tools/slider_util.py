@@ -22,13 +22,15 @@
 # @Author  : relakkes@gmail.com
 # @Time    : 2023/12/2 12:55
 # @Desc    : Slider verification utility package
+#
+# 本模块被 tools.utils 用 `import *` 引入，而 tools.utils 又会被 library 服务
+# （数据接口 + 前端，不跑爬虫）的启动链加载。cv2 / numpy 只有滑块验证才用得到，
+# 所以改成方法内延迟导入：crawler 镜像里装了这两个包，行为不变；library 不必装。
 import os
 from typing import List
 from urllib.parse import urlparse
 
-import cv2
 import httpx
-import numpy as np
 
 
 class Slide:
@@ -54,6 +56,9 @@ class Slide:
     @staticmethod
     def check_is_img_path(img, img_type, resize):
         if img.startswith('http'):
+            import cv2
+            import numpy as np
+
             headers = {
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;"
                           "q=0.8,application/signed-exchange;v=b3;q=0.9",
@@ -83,6 +88,8 @@ class Slide:
     @staticmethod
     def clear_white(img):
         """Clear whitespace from image, mainly clearing slider whitespace"""
+        import cv2
+
         img = cv2.imread(img)
         rows, cols, channel = img.shape
         min_x = 255
@@ -106,6 +113,8 @@ class Slide:
         return img1
 
     def template_match(self, tpl, target):
+        import cv2
+
         th, tw = tpl.shape[:2]
         result = cv2.matchTemplate(target, tpl, cv2.TM_CCOEFF_NORMED)
         # Find min and max value positions in matrix
@@ -124,10 +133,14 @@ class Slide:
 
     @staticmethod
     def image_edge_detection(img):
+        import cv2
+
         edges = cv2.Canny(img, 100, 200)
         return edges
 
     def discern(self):
+        import cv2
+
         img1 = self.clear_white(self.gap)
         img1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
         slide = self.image_edge_detection(img1)

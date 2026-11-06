@@ -24,7 +24,7 @@ import pathlib
 from typing import Dict, List
 import aiofiles
 import config
-from tools.utils import utils
+from tools import utils
 from tools.words import AsyncWordCloudGenerator
 
 class AsyncFileWriter:

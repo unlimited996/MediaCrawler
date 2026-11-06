@@ -23,6 +23,14 @@
 # @Time    : 2023/12/2 12:53
 # @Desc    : Crawler utility functions
 
+# 本模块被 tools.utils 用 `import *` 引入，而 tools.utils 又被 api/ 下的数据接口
+# 大量使用（library 服务的启动链会加载它）。所以顶层只允许「轻量」依赖：
+#   * playwright 仅作类型注解  -> TYPE_CHECKING + 延迟求值注解
+#   * PIL 只在 show_qrcode（登录扫码）用 -> 函数内导入
+# 这样「只跑数据接口 + 前端」的 library 镜像不必安装 playwright / pillow 之外的
+# 浏览器依赖；crawler 镜像装了这些包，行为完全不变。
+from __future__ import annotations
+
 import base64
 import json
 import random
@@ -30,19 +38,23 @@ import re
 import urllib
 import urllib.parse
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 import httpx
-from PIL import Image, ImageDraw, ImageShow
-from playwright.async_api import BrowserContext, Cookie, Page
 
-from . import utils
+if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查/IDE
+    from playwright.async_api import BrowserContext, Cookie, Page
+
 from .httpx_util import make_async_client
 
 
 async def find_login_qrcode(page: Page, selector: str) -> str:
     """find login qrcode image from target selector"""
     try:
+        # 延迟导入：tools.utils 在本模块之上 `from .crawler_util import *`，
+        # 顶层互相 import 会让「先 import 谁」决定成败（脆弱）。
+        from . import utils
+
         elements = await page.wait_for_selector(
             selector=selector,
         )
@@ -87,6 +99,9 @@ async def find_qrcode_img_from_canvas(page: Page, canvas_selector: str) -> str:
 
 def show_qrcode(qr_code) -> None:  # type: ignore
     """parse base64 encode qrcode image and show it"""
+    # PIL 只在这里用到：延迟导入，避免 library 服务（不扫码登录）被拖进图片库
+    from PIL import Image, ImageDraw, ImageShow
+
     if "," in qr_code:
         qr_code = qr_code.split(",")[1]
     qr_code = base64.b64decode(qr_code)

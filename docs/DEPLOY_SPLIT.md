@@ -261,6 +261,46 @@ crawler 通过 `ws://browser:9222` 连接，镜像就只剩 Python 运行时。�
 `tools/cdp_browser.py` 的连接分支（当前 `CDP_CONNECT_EXISTING` 只连 localhost）
 并新增一个常驻浏览器服务，风控指纹 / 登录态要另做持久化。
 
+### 依赖按服务分层（2026-11-06）
+
+去掉浏览器只解决了 apt 那一层。**pip 层还有一个更大的浪费**：原来只有一份
+`requirements.txt`，library 一次 `from api.library_app import app` 就会顺带加载
+`playwright / opencv / matplotlib / jieba / wordcloud / pandas / numpy`，
+1.61GB 里有约 700MB 是 library 一辈子用不到的。
+
+现在拆成两层：
+
+| 文件 | 内容 | 谁装 |
+|---|---|---|
+| `requirements-core.txt` | FastAPI / SQLAlchemy / asyncpg / httpx / boto3 / pillow / jieba / openpyxl … | `library`、`crawler` 都装 |
+| `requirements-crawler.txt` | `-r requirements-core.txt` + playwright / opencv / matplotlib / wordcloud / pandas / pyexecjs / xhshow / parsel / pandas … | 只有 `crawler`、`all` |
+| `requirements.txt` | `-r requirements-crawler.txt` | 本地开发、老脚本（装全量，保持兼容） |
+
+`Dockerfile` 的 stage 链也随之变成：
+
+```
+base-runtime    python:3.11-slim + bash/curl/tzdata/libglib2.0-0
+  └ runtime     + requirements-core.txt            ← library 到此为止
+      └ crawler-runtime  + nodejs/libgl1/中文字体 + requirements-crawler.txt
+          └ browser-runtime  + playwright install --with-deps
+```
+
+为了做到这一点，代码里三处「隐式耦合」被改成延迟导入（行为不变）：
+
+- `tools/crawler_util.py`：PIL 只在显示登录二维码时用；playwright 仅作类型注解
+  （改 `TYPE_CHECKING` + `from __future__ import annotations`）。
+- `tools/slider_util.py`：`cv2` / `numpy` 只在滑块识别的方法里用。
+- `tools/words.py`：`jieba` / `matplotlib` / `wordcloud` 只在生成词云时用。
+- 顺带断掉了 `tools.utils` ↔ `tools.crawler_util` 的循环导入（原来靠
+  `import *` 的副作用才能跑通，`from tools.utils import utils` 是笔误，已改成
+  `from tools import utils`）。
+
+**功能影响**：`library` 镜像没有浏览器，`POST /library/api/export/pdf`
+（和 `/export/stories`）会返回 **503 + 明确提示**，而不是之前的 500。
+需要 PDF 就用 `crawler` / `all` 镜像，或改用 CSV/JSON 导出。
+Excel 预览原来是 `pandas`，已改用 `openpyxl` 重写（省 150MB），
+`.xlsx/.xlsm` 行为一致，仅旧版 `.xls` 不再支持（提示另存为 .xlsx）。
+
 ---
 
 ## 3.6 服务器一键脚本（国内构建 + 推送，绕开 Actions 跨境）

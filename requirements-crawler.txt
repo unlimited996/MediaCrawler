@@ -1,0 +1,35 @@
+# =============================================================================
+# crawler 服务（抓取 + 调度 + 账号池）与一体化镜像的依赖
+#
+# = core + 爬虫执行期才需要的包 =
+#
+# library 镜像不装本文件，因此下面这些包不会进入它的体积。
+# 若某个包同时被 library 的接口用到，请放到 requirements-core.txt。
+# =============================================================================
+-r requirements-core.txt
+
+# --- 浏览器自动化（抓取与登录）---
+playwright>=1.61.0
+
+# --- 平台签名 / 响应解析 ---
+# pyexecjs 调用 libs/*.js 做抖音、知乎的签名（需要系统装 nodejs）
+pyexecjs==1.5.1
+xhshow>=0.2.0
+parsel==1.9.1
+pyhumps==3.8.0
+
+# --- 图像与词云（滑块识别、词云图）---
+opencv-python-headless
+matplotlib>=3.11.0
+wordcloud>=1.9.6
+
+# --- 其它 ---
+# pandas 原用于 Excel 预览，library 已改用 openpyxl；crawler 侧保留，
+# 避免用户的二次开发脚本/自定义流程里 import pandas 时缺失。
+pandas==2.2.3
+# 只有贴吧客户端用（media_platform/tieba/client.py）
+requests==2.32.3
+redis~=4.6.0
+typer>=0.12.3
+motor>=3.3.0
+tenacity==8.2.2

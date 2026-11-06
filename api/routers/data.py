@@ -154,20 +154,36 @@ async def get_file_content(file_path: str, preview: bool = True, limit: int = 10
                     f.seek(0)
                     total = sum(1 for _ in f) - 1
                     return {"data": rows, "total": total}
-            elif full_path.suffix.lower() in (".xlsx", ".xls"):
-                import pandas as pd
-                # Read first limit rows
-                df = pd.read_excel(full_path, nrows=limit)
-                # Get total row count (only read first column to save memory)
-                df_count = pd.read_excel(full_path, usecols=[0])
-                total = len(df_count)
-                # Convert to list of dictionaries, handle NaN values
-                rows = df.where(pd.notnull(df), None).to_dict(orient='records')
-                return {
-                    "data": rows,
-                    "total": total,
-                    "columns": list(df.columns)
-                }
+            elif full_path.suffix.lower() in (".xlsx", ".xlsm"):
+                # 用 openpyxl 读，不依赖 pandas/numpy：这两个包合计约 150MB，
+                # 只为「预览 Excel」把它们留在 library 镜像里不划算。
+                # read_only 是流式读，大文件内存占用比 pandas 更低。
+                from openpyxl import load_workbook
+
+                wb = load_workbook(full_path, read_only=True, data_only=True)
+                try:
+                    ws = wb.active
+                    it = ws.iter_rows(values_only=True)
+                    header = next(it, None)
+                    columns = [str(c) if c is not None else f"col{i + 1}"
+                               for i, c in enumerate(header or [])]
+                    rows = []
+                    total = 0
+                    for values in it:
+                        total += 1
+                        if len(rows) < limit:
+                            rows.append({
+                                (columns[i] if i < len(columns) else f"col{i + 1}"): v
+                                for i, v in enumerate(values)
+                            })
+                finally:
+                    wb.close()
+                return {"data": rows, "total": total, "columns": columns}
+            elif full_path.suffix.lower() == ".xls":
+                # 旧版二进制 .xls 只有 pandas+xlrd 能读；精简镜像不装它们。
+                raise HTTPException(
+                    status_code=400,
+                    detail="旧版 .xls 格式不支持预览，请另存为 .xlsx 后再试")
             else:
                 raise HTTPException(status_code=400, detail="Unsupported file type for preview")
         except json.JSONDecodeError:

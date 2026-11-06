@@ -72,13 +72,12 @@ services:
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         SKIP_WEBUI_BUILD: ${SKIP_WEBUI_BUILD:-0}
-        # 默认完整 chromium；跨境推送慢时可设 chromium-headless-shell 省约 600MB
-        PLAYWRIGHT_BROWSER: ${PLAYWRIGHT_BROWSER:-chromium}
+        # library 只装 requirements-core.txt：不含 Playwright / opencv /
+        # matplotlib / pandas / numpy，所以这里没有浏览器相关参数
+        # （target=library 走不到 browser-runtime 那一层）。
         # 国内构建换 apt / pip 源（CI 不经过 compose，仍用 Dockerfile 默认官方源）
         APT_MIRROR: ${APT_MIRROR:-mirrors.ustc.edu.cn}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
-        # 留空走官方 CDN；cdn 慢时可在 .env 设 https://npmmirror.com/mirrors/playwright/
-        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-}
     container_name: mediacrawler-library
     restart: unless-stopped
     depends_on:

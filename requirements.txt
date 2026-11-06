@@ -1,32 +1,11 @@
-httpx==0.28.1
-pillow>=12.2.0
-playwright>=1.61.0
-tenacity==8.2.2
-typer>=0.12.3
-opencv-python-headless
-aiomysql==0.2.0
-redis~=4.6.0
-pydantic>=2.13.4
-aiofiles~=23.2.1
-fastapi==0.110.2
-uvicorn==0.29.0
-python-dotenv==1.0.1
-jieba==0.42.1
-wordcloud>=1.9.6
-matplotlib>=3.11.0
-requests==2.32.3
-parsel==1.9.1
-pyexecjs==1.5.1
-pandas==2.2.3
-aiosqlite==0.21.0
-pyhumps==3.8.0
-cryptography>=45.0.7
-alembic>=1.16.5
-asyncmy>=0.2.10
-sqlalchemy>=2.0.43
-motor>=3.3.0
-openpyxl>=3.1.2
-# 测试依赖不进生产镜像，见 requirements-dev.txt
-xhshow>=0.2.0
-websockets>=15.0.1
-boto3>=1.43.0
+# =============================================================================
+# 全量依赖入口（本地开发 / 一体化 all 镜像）
+#
+# 实际内容已按服务拆成两层：
+#   requirements-core.txt    library 服务（内容库 + 网关 + 前端）
+#   requirements-crawler.txt crawler 服务（= core + 浏览器/签名/图像）
+#
+# `pip install -r requirements.txt` 仍装全量，老脚本与文档无需改动；
+# library 镜像只装 requirements-core.txt，因此不含约 700MB 的爬虫依赖。
+# =============================================================================
+-r requirements-crawler.txt

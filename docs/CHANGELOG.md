@@ -5,6 +5,56 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-06] library 镜像依赖分层：pip 层再砍约 700MB
+
+### 背景
+上一轮只把 Chromium 从 library 镜像里拆掉（apt 层），但 pip 层仍有约 700MB
+无用依赖：library 一次 `import api.library_app` 就会经 `tools.utils` 的
+`import *` 顺带加载 playwright / opencv / matplotlib / jieba / wordcloud /
+pandas / numpy。
+
+### 变更：requirements 拆两层
+- 新增 `requirements-core.txt`（library 用：FastAPI/SQLAlchemy/asyncpg/httpx/
+  boto3/pillow/jieba/openpyxl 等）。
+- 新增 `requirements-crawler.txt`（`-r requirements-core.txt` + playwright/
+  opencv/matplotlib/wordcloud/pandas/pyexecjs/xhshow/parsel 等）。
+- `requirements.txt` 改为 `-r requirements-crawler.txt`，本地开发与老脚本
+  仍装全量，行为不变。
+- **补上原本缺失的 `asyncpg`**：它从没写进 requirements，只是本机 `.venv`
+  手工装过，镜像里没有 postgres 驱动（容器内连库会直接失败）。
+
+### 变更：Dockerfile stage 链
+`base-runtime`（系统库）→ `runtime`（+core，library 到此为止）→
+`crawler-runtime`（+nodejs/libgl1/中文字体 + crawler 依赖）→
+`browser-runtime`（+playwright install --with-deps）→ `app-library` / `app-browser`。
+源码 COPY 移到两条应用分支，改代码只重建最后几层，apt/pip 缓存仍命中。
+
+### 变更：消除隐式耦合（行为不变）
+- `tools/crawler_util.py`：PIL 改函数内导入；playwright 类型改 `TYPE_CHECKING`
+  + `from __future__ import annotations`。
+- `tools/slider_util.py`：`cv2` / `numpy` 改方法内导入。
+- `tools/words.py`：`jieba` / `matplotlib` / `wordcloud` 改方法内导入，
+  matplotlib 显式用 Agg 后端。
+- 断掉 `tools.utils` ↔ `tools.crawler_util` 的循环导入：把笔误
+  `from tools.utils import utils`（靠 `import *` 副作用才成立）改成
+  `from tools import utils`（`tools/async_file_writer.py`、`proxy/base_proxy.py`），
+  `crawler_util` 顶层不再 `from . import utils`。
+
+### 变更：功能降级（显式化）
+- `api/routers/export.py`：PDF 导出前检查 Playwright，缺失时返回 **503 +
+  可操作提示**（原来是 ImportError 被吞成 500）；`/export/pdf` 与
+  `/export/stories` 都适用。
+- `api/routers/data.py`：Excel 预览从 pandas 改 openpyxl（`read_only` 流式读），
+  省 pandas+numpy 约 150MB；`.xls` 旧格式提示另存为 `.xlsx`。
+
+### 验证
+- 屏蔽 playwright/cv2/matplotlib/wordcloud/pandas/numpy/execjs/xhshow/parsel/
+  humps/redis/typer/motor/tenacity 后：三个入口（library 104 / crawler 42 /
+  main 257 路由）全部正常加载。
+- library 22 个只读接口 + 带参数接口（stories 详情/评论/编辑记录/watch）
+  全部 200；PDF 导出 503 + 中文提示。
+- 爬虫侧 20 个模块（各平台 client、store、main、cmd_arg）导入无失败。
+
 ## [2026-11-06] 实时抓取/入库统计 + 消除 library 的爬虫依赖导入耦合
 
 ### 新增：实时统计（执行记录 + 系统控制台）

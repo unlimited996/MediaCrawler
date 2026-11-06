@@ -1,0 +1,50 @@
+# =============================================================================
+# library 服务（内容库 + 网关 + 前端静态页）运行时依赖
+#
+# 分层原则
+# --------
+# library 只做「查/增/删/改 + 配置 + S3 备份 + 前端静态页 + 按服务名转发」，
+# 不执行任何抓取动作：没有 Playwright 浏览器、不跑平台签名 JS、不做图像相似度
+# 匹配、不渲染词云。爬虫侧额外依赖见 requirements-crawler.txt。
+#
+# 为什么值得拆
+# ------------
+# 以前只有一个 requirements.txt，library 又通过 tools.utils 的 `import *`
+# 被拖进 playwright / opencv / matplotlib / jieba / wordcloud / pandas / numpy，
+# 1.61GB 的镜像里约 700MB 是 library 一辈子用不到的东西，跨境推送极慢。
+#
+# 维护约定：往这里加包前，先确认 library 的接口真的会调用；
+# 纯爬虫用的（opencv/playwright/matplotlib...）放 requirements-crawler.txt。
+# =============================================================================
+
+# --- Web 框架 / 服务间调用 ---
+fastapi==0.110.2
+uvicorn==0.29.0
+pydantic>=2.13.4
+python-dotenv==1.0.1
+httpx==0.28.1
+websockets>=15.0.1
+aiofiles~=23.2.1
+
+# --- 数据库 ---
+# asyncpg 之前漏在 requirements 之外（本机 .venv 手装过所以没暴露），
+# 导致镜像里没有 postgres 驱动、容器内连库直接失败。这里显式声明。
+sqlalchemy>=2.0.43
+asyncpg>=0.29.0
+greenlet>=3.0.0
+alembic>=1.16.5
+aiosqlite==0.21.0
+aiomysql==0.2.0
+asyncmy>=0.2.10
+
+# --- 业务 ---
+# pillow      : S3 媒体备份的图片处理 + 导出 PDF 时内嵌图片
+# cryptography: 账号凭证 / S3 密钥的加解密（account.crypto）
+# boto3       : S3 备份与媒体归档
+# jieba       : 立场分析的关键词提取（有 try/except 降级，但装了质量更好）
+# openpyxl    : 数据文件 Excel 预览（原先用 pandas，为省 150MB 已改写）
+pillow>=12.2.0
+cryptography>=45.0.7
+boto3>=1.43.0
+jieba==0.42.1
+openpyxl>=3.1.2
