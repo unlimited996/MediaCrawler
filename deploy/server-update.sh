@@ -61,10 +61,17 @@ if [ "${_MC_UPDATED:-0}" != "1" ]; then
     [ -n "$SRC" ] || die "tarball 解压失败"
 
     log "同步到 ${REPO_DIR}"
+    # 注意 database/ 既是**代码目录**（db_session.py / models_v2.py，打进镜像）
+    # 又是 sqlite 的数据目录（compose 挂载 ./database:/app/database）。
+    # 早先整体 exclude 'database/' 导致里面的代码永远停留在首次同步的版本
+    # （镜像里 SharedEngineHandle 缺失就是这样来的）。这里只排除数据库文件本身，
+    # .py / seed/ 照常同步。
     rsync -a --delete \
         --exclude 'deploy/.env' \
         --exclude 'logs/' --exclude 'data/' --exclude 'browser_data/' \
-        --exclude 'database/' --exclude 'api/webui/' \
+        --exclude 'database/*.db' --exclude 'database/*.db-*' \
+        --exclude 'database/*.sqlite' --exclude 'database/*.sqlite3' \
+        --exclude 'api/webui/' \
         "$SRC/" "$REPO_DIR/"
     chmod +x "$REPO_DIR/deploy/server-update.sh" \
              "$REPO_DIR/deploy/build-push.sh" 2>/dev/null || true
