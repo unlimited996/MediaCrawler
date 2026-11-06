@@ -5,6 +5,31 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-06] 修复服务器同步漏掉 database/ 代码（镜像里是旧版 db_session）
+
+### 问题
+`deploy/server-update.sh` 的 rsync 整体排除了 `database/`：
+`--exclude 'database/'`。但 `database/` 同时是**代码目录**
+（`db_session.py` / `models_v2.py` 要打进镜像）和 sqlite 数据目录
+（compose 挂载 `./database:/app/database`）。结果是服务器上的
+`database/` 永远停留在首次同步的版本。
+
+现场表现：library 容器启动正常、健康检查 200，但
+`GET /library/api/stories` 直接 500：
+`ImportError: cannot import name 'SharedEngineHandle' from 'database.db_session'`
+—— 镜像里是 11-05 的旧 `db_session.py`。
+
+### 修复
+- rsync 只排除数据库文件本身：
+  `--exclude 'database/*.db' 'database/*.db-*' 'database/*.sqlite*'`，
+  `.py` 与 `seed/` 照常同步。
+- 脚本自我更新后要**重新同步一次**：原先检测到脚本变化就 `exec` 重跑，
+  但重跑分支跳过了整个拉取阶段 —— 于是「新排除规则」永远没机会生效
+  （第一次同步用的还是旧规则）。现在把下载+rsync 抽成 `sync_code()`，
+  重跑时也执行，`_MC_UPDATED=1` 只用于防循环，不再跳过同步。
+
+> 教训：容器挂载目录与代码目录重合时，同步脚本不能按目录整体排除。
+
 ## [2026-11-06] library 镜像依赖分层：pip 层再砍约 700MB
 
 ### 背景
