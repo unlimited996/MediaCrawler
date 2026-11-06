@@ -39,7 +39,7 @@ die() { echo "[$(date '+%F %T')] !! $*" >&2; exit 1; }
 # 1) 拉代码：api.github.com 取 sha -> codeload 下 tarball -> rsync 覆盖
 #    运行时文件（.env / 日志 / 数据 / 浏览器登录态 / 已构建前端）不删。
 # ---------------------------------------------------------------------------
-if [ "${_MC_UPDATED:-0}" != "1" ]; then
+sync_code() {
     log "取 ${GITHUB_REPO}@${BRANCH} 最新 commit"
     SHA="$(curl -fsSL --max-time 30 \
         "https://api.github.com/repos/${GITHUB_REPO}/commits/${BRANCH}" \
@@ -48,7 +48,6 @@ if [ "${_MC_UPDATED:-0}" != "1" ]; then
     SHORT_SHA="${SHA:0:7}"
     log "目标提交 ${SHORT_SHA}"
 
-    BEFORE="$(md5sum "$SELF" | cut -d' ' -f1)"
     TMP="$(mktemp -d)"
     # shellcheck disable=SC2064
     trap "rm -rf '$TMP'" EXIT
@@ -77,16 +76,20 @@ if [ "${_MC_UPDATED:-0}" != "1" ]; then
              "$REPO_DIR/deploy/build-push.sh" 2>/dev/null || true
     rm -rf "$TMP"
     trap - EXIT
+}
 
-    # 脚本自身被更新 -> 用新脚本重跑（_MC_UPDATED 防止重复下载）
-    AFTER="$(md5sum "$SELF" | cut -d' ' -f1)"
-    if [ "$BEFORE" != "$AFTER" ]; then
-        log "脚本已更新，重新执行"
-        export _MC_UPDATED=1 MC_SHORT_SHA="$SHORT_SHA"
-        exec bash "$SELF" "$@"
-    fi
-else
-    SHORT_SHA="${MC_SHORT_SHA:-$(date +%y%m%d%H%M)}"
+BEFORE="$(md5sum "$SELF" | cut -d' ' -f1)"
+sync_code
+AFTER="$(md5sum "$SELF" | cut -d' ' -f1)"
+
+# 脚本自身被更新 -> 用**新脚本**再跑一遍。
+# 关键：重跑时也要重新 sync_code —— 刚才那次同步用的是旧脚本的排除规则，
+# 新规则（比如不再整体排除 database/）必须再同步一次才生效。
+# _MC_UPDATED=1 只用来防止无限循环，不跳过同步。
+if [ "$BEFORE" != "$AFTER" ] && [ "${_MC_UPDATED:-0}" != "1" ]; then
+    log "脚本已更新，用新脚本重新同步并继续"
+    export _MC_UPDATED=1
+    exec bash "$SELF" "$@"
 fi
 
 # ---------------------------------------------------------------------------
