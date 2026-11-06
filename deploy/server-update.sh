@@ -171,19 +171,26 @@ elif [ -f "$STATE_FILE" ]; then
     fi
     if [ -n "$PREV_SHA" ]; then
         CHANGED="$(mktemp)"
-        if github_compare "$PREV_SHA" "$SHA" > "$CHANGED" 2>/dev/null && [ -s "$CHANGED" ]; then
-            TOTAL="$(wc -l < "$CHANGED" | tr -d ' ')"
-            log "自 ${PREV_SHA:0:7} 以来改动 ${TOTAL} 个文件，判定需要重建的镜像"
-            if ! grep -qvE "$DOC_ONLY" "$CHANGED"; then
+        if github_compare "$PREV_SHA" "$SHA" > "$CHANGED" 2>/dev/null; then
+            if [ ! -s "$CHANGED" ]; then
+                # compare 成功但没有文件差异（例如空提交）
+                log "两次提交之间没有文件变化，跳过构建"
                 BUILD_CRAWLER=0
                 BUILD_LIBRARY=0
-                log "只有文档/CI 改动，镜像无需重建"
             else
-                if ! grep -qvE "$CRAWLER_IGNORABLE" "$CHANGED"; then
+                TOTAL="$(wc -l < "$CHANGED" | tr -d ' ')"
+                log "自 ${PREV_SHA:0:7} 以来改动 ${TOTAL} 个文件，判定需要重建的镜像"
+                if ! grep -qvE "$DOC_ONLY" "$CHANGED"; then
                     BUILD_CRAWLER=0
-                fi
-                if ! grep -qvE "$LIBRARY_IGNORABLE" "$CHANGED"; then
                     BUILD_LIBRARY=0
+                    log "只有文档/CI 改动，镜像无需重建"
+                else
+                    if ! grep -qvE "$CRAWLER_IGNORABLE" "$CHANGED"; then
+                        BUILD_CRAWLER=0
+                    fi
+                    if ! grep -qvE "$LIBRARY_IGNORABLE" "$CHANGED"; then
+                        BUILD_LIBRARY=0
+                    fi
                 fi
             fi
         else
