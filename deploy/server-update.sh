@@ -208,7 +208,17 @@ log "本次构建：${TARGETS}（PLAYWRIGHT_BROWSER=${PLAYWRIGHT_BROWSER:-chromi
 SKIP_WEBUI_BUILD=$([ "$WEBUI_BUILD" = "1" ] && echo 0 || echo 1) \
     docker compose -f "$COMPOSE_FILE" --env-file deploy/.env build $TARGETS
 
+# 构建成功即记录，避免下次同 commit 重复构建。
+# 注意：SKIP_PUSH 也照样记录 —— 状态文件的含义是「这个 commit 已构建过」，
+# 与有没有推到镜像仓库无关。
+write_state() {
+    cat > "$STATE_FILE" <<EOF
+{"sha":"${SHA}","short_sha":"${SHORT_SHA}","built_at":"$(date -Iseconds)","targets":"${TARGETS}","pushed":"$1"}
+EOF
+}
+
 if [ "$SKIP_PUSH" = "1" ]; then
+    write_state "0"
     log "SKIP_PUSH=1：只构建，不推送"
     docker images | grep -E "mediacrawler-(crawler|library)" || true
     exit 0
@@ -253,10 +263,8 @@ if [ "$BUILD_LIBRARY" = "1" ]; then
     PUSHED+=("${LIBRARY}")
 fi
 
-# 记录本次构建的 commit：下次运行时据此判断该不该重建，避免无变更也走一遍构建推送
-cat > "$STATE_FILE" <<EOF
-{"sha":"${SHA}","short_sha":"${SHORT_SHA}","built_at":"$(date -Iseconds)","targets":"${TARGETS}"}
-EOF
+# 推送完成：更新状态（pushed=1），下次据此判断该不该重建
+write_state "1"
 
 # ---------------------------------------------------------------------------
 # 7) 可选：本机把容器换成新镜像（默认关，服务一般跑在群晖/别的机器）
