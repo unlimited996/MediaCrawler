@@ -8,7 +8,7 @@ export type TaskDimension = 'author' | 'note' | 'account'
 export type BehaviorSource = 'likes' | 'collects'
 export type TaskMode = 'full' | 'incremental'
 export type ScheduleType = 'interval' | 'cron'
-export type RunStatus = 'running' | 'success' | 'failed' | 'timeout' | 'skipped' | 'stopped'
+export type RunStatus = 'queued' | 'running' | 'success' | 'failed' | 'timeout' | 'skipped' | 'stopped'
 export type TriggerType = 'schedule' | 'manual'
 
 export interface TaskOptions {
@@ -74,6 +74,8 @@ export interface ScheduledTaskRun {
   log_tail: string[]
   /** 细粒度统计（历史运行记录可能为 null） */
   stats_json: RunStats | null
+  /** 列表接口不下发明细（体积大），有值表示可展开拉 /scheduler/runs/{id} */
+  has_details?: boolean
 }
 
 /** 单篇帖子的补抓前后对比 */

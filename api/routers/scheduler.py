@@ -184,12 +184,28 @@ async def stop_current_run():
 
 
 @router.get("/tasks/{task_id}/runs", response_model=List[ScheduledTaskRunOut])
-async def list_task_runs(task_id: int, limit: int = 50):
+async def list_task_runs(task_id: int, limit: int = 50,
+                         include_details: bool = False):
     """某个任务的执行记录。"""
-    return await task_scheduler.list_runs(task_id=task_id, limit=limit)
+    return await task_scheduler.list_runs(task_id=task_id, limit=limit,
+                                          include_details=include_details)
 
 
 @router.get("/runs", response_model=List[ScheduledTaskRunOut])
-async def list_all_runs(limit: int = 100):
-    """最近的执行记录（跨任务）。"""
-    return await task_scheduler.list_runs(limit=limit)
+async def list_all_runs(limit: int = 100, include_details: bool = False):
+    """最近的执行记录（跨任务）。
+
+    默认不返回 stats_json / log_tail：列表页用不到，而且是整页里最大的字段。
+    要明细就 GET /scheduler/runs/{run_id}（或传 include_details=true）。
+    """
+    return await task_scheduler.list_runs(limit=limit,
+                                          include_details=include_details)
+
+
+@router.get("/runs/{run_id}", response_model=ScheduledTaskRunOut)
+async def get_run(run_id: int):
+    """单条执行记录（含 stats_json 明细与 log_tail）。"""
+    data = await task_scheduler.get_run(run_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="运行记录不存在")
+    return data

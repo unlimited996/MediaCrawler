@@ -24,7 +24,7 @@ export function Terminal() {
   }, [logs, isCollapsed])
 
   return (
-    <div className={`flex flex-col rounded-lg overflow-hidden transition-all duration-300 border border-cyber-border-subtle bg-[#0d1117] ${isCollapsed ? 'h-12' : 'h-full'}`}>
+    <div className={`flex flex-col rounded-lg overflow-hidden transition-all duration-300 border border-cyber-border-subtle bg-[#0d1117] text-[#c9d1d9] ${isCollapsed ? 'h-12' : 'h-full'}`}>
       {/* Terminal Header */}
       <div className="flex items-center justify-between px-4 py-2.5 bg-[#161b22] border-b border-[#30363d] flex-shrink-0">
         <div className="flex items-center gap-3">
@@ -32,7 +32,7 @@ export function Terminal() {
           <div className="flex gap-1.5">
             <span className="w-2.5 h-2.5 rounded-full bg-cyber-neon-pink/80" />
             <span className="w-2.5 h-2.5 rounded-full bg-cyber-neon-orange/80" />
-            <span className="w-2.5 h-2.5 rounded-full bg-cyber-neon-green/80" />
+            <span className="w-2.5 h-2.5 rounded-full bg-[#56d364]/80" />
           </div>
           <span className="text-xs text-[#8b949e] font-mono tracking-wider">
             {t('header.title')}
@@ -45,18 +45,18 @@ export function Terminal() {
             <span className="text-[#8b949e]">{t('header.entries', { count: logs.length })}</span>
             {liveStats && (
               <span
-                className="flex items-center gap-2 px-2 py-0.5 rounded border border-[#30363d] bg-[#0d1117]"
+                className="flex items-center gap-2 px-2 py-0.5 rounded border border-[#30363d] bg-[#0d1117] text-[#8b949e]"
                 title={t('header.statsHint')}
               >
-                <span>{t('header.fetched')} <b className="text-cyber-neon-cyan">{liveStats.fetched}</b></span>
-                <span className="text-[#30363d]">/</span>
-                <span>{t('header.saved')} <b className="text-cyber-neon-green">{liveStats.saved}</b></span>
+                <span>{t('header.fetched')} <b className="text-[#79c0ff]">{liveStats.fetched}</b></span>
+                <span className="text-[#484f58]">/</span>
+                <span>{t('header.saved')} <b className="text-[#56d364]">{liveStats.saved}</b></span>
               </span>
             )}
             {status === 'running' && (
               <div className="flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 bg-cyber-neon-green rounded-full shadow-glow-green-sm animate-pulse-fast" />
-                <span className="text-cyber-neon-green">{t('header.active')}</span>
+                <span className="w-1.5 h-1.5 bg-[#3fb950] rounded-full shadow-glow-green-sm animate-pulse-fast" />
+                <span className="text-[#3fb950]">{t('header.active')}</span>
               </div>
             )}
           </div>
@@ -112,7 +112,7 @@ export function Terminal() {
             {/* ASCII Art Banner when empty */}
             {logs.length === 0 ? (
               <div className="space-y-4">
-                <pre className="text-cyber-neon-cyan/70 text-xs leading-tight">
+                <pre className="text-[#79c0ff]/70 text-xs leading-tight">
 {`  ╔══════════════════════════════════════════════════════╗
   ║   __  __          _ _       ____                     ║
   ║  |  \\/  | ___  __| (_) __ _/ ___|_ __ __ ___      __ ║
@@ -124,7 +124,7 @@ export function Terminal() {
   ╚══════════════════════════════════════════════════════╝`}
                 </pre>
                 <div className="text-[#c9d1d9] text-xs space-y-1">
-                  <p className="text-cyber-neon-green/70">{t('banner.systemInit')}</p>
+                  <p className="text-[#56d364]/70">{t('banner.systemInit')}</p>
                   <p className="text-[#8b949e]">{t('banner.configHint')}</p>
                 </div>
               </div>
@@ -139,8 +139,8 @@ export function Terminal() {
             {/* Active Cursor */}
             {status === 'running' && (
               <div className="flex items-center gap-1 mt-3">
-                <span className="text-cyber-neon-green/80">root@crawler:~$</span>
-                <span className="w-2 h-4 bg-cyber-neon-green/80 cursor-blink" />
+                <span className="text-[#56d364]/80">root@crawler:~$</span>
+                <span className="w-2 h-4 bg-[#56d364]/80 cursor-blink" />
               </div>
             )}
           </div>

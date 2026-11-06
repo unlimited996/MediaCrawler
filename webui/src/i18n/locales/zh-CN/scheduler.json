@@ -108,6 +108,7 @@
     "statsGained": "本轮共补进 {{count}} 条评论",
     "statsEmpty": "本次没有新增或刷新的帖子",
     "statsLogsToggle": "运行日志",
+    "loadingDetail": "正在加载明细…",
     "liveFetched": "抓取",
     "liveSaved": "入库",
     "liveStatsHint": "当前这一轮的实时统计：抓取=向平台发起的抓取请求数，入库=落库的帖子/评论条数",

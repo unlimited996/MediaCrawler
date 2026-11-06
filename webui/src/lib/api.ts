@@ -5,8 +5,9 @@ import type { ScheduledTask, ScheduledTaskRun, SchedulerStatus,
 
 const api = axios.create({
   // 2026-11-04 服务拆分为 crawler / data 两个独立应用后，URL 第一段就是服务名：
-  //   /crawler/api/**  -> 抓取服务（crawler/scheduler/accounts/config）
-  //   /library/api/**  -> 内容库服务（stories/assets/export/stance-tags/s3-backup/recipes...）
+  //   /crawler/api/**  -> 抓取服务（仅：启动/停止抓取、队列、实时日志）
+  //   /library/api/**  -> 内容库服务（stories/assets/export/stance-tags/s3-backup/recipes，
+  //                       以及配置/定时任务/账号池/WS 日志 —— 这些是 DB+共享文件驱动）
   // baseURL 交给拦截器拼，调用的地方仍然写 '/stories/xxx' 这种相对路径。
   baseURL: '',
   timeout: 30000,
@@ -16,7 +17,10 @@ const api = axios.create({
 })
 
 /** 归属 crawler 服务的路径首段（其余一律走 library 内容库服务） */
-const CRAWLER_SEGMENTS = new Set(['crawler', 'scheduler', 'accounts', 'config'])
+// 只有「必须由爬虫进程处理」的才走 crawler：启动/停止抓取、队列、实时日志。
+// 配置 / 定时任务 / 账号池都是数据库驱动，library 上也挂了同样的路由，
+// 走 library 可以少一跳（不经网关转发），也让 crawler 不必为这些改动重建。
+const CRAWLER_SEGMENTS = new Set(['crawler'])
 
 /** 根据路径首段决定加哪个服务名前缀；已带服务名的不重复加。 */
 export function servicePrefix(url: string): string {
@@ -459,6 +463,8 @@ export const schedulerApi = {
     api.get<ScheduledTaskRun[]>('/scheduler/runs', {
       params: { task_id: taskId, limit },
     }),
+  /** 单条执行记录的明细（stats_json / log_tail）。列表接口为了速度不返回它们 */
+  getRun: (id: number) => api.get<ScheduledTaskRun>(`/scheduler/runs/${id}`),
   listTaskRuns: (taskId: number, limit = 50) =>
     api.get<ScheduledTaskRun[]>(`/scheduler/tasks/${taskId}/runs`, { params: { limit } }),
 }

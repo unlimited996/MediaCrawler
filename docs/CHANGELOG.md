@@ -5,6 +5,80 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-06] 控制台配色修复 + 执行记录提速 + 管理功能迁 library + 按需构建 + 配置入库
+
+### 修复：系统控制台「文字消失」
+`Terminal` 容器固定深色底（`#0d1117` / `#161b22`），但「抓取 / 入库」这两个
+标签文字**没指定颜色**，继承的是 body 的 `text-cyber-text-primary` ——
+浅色主题下那是近黑色（15 23 42），落在深灰底上几乎看不见，
+表现为「只看到数字，看不到标签」。
+
+- `Terminal.tsx`：容器统一加 `text-[#c9d1d9]`；统计标签用 `#8b949e`、
+  数字用固定亮色 `#79c0ff` / `#56d364`；banner 与提示符也改成固定色。
+- `TerminalLine.tsx`：日志级别配色从主题 neon 变量改为固定 GitHub Dark
+  色板（info `#79c0ff`、success `#56d364`、warning `#e3b341`、error `#ff7b72`）。
+  终端永远是深底，不该跟着主题变。
+- `ScheduledTasksView.tsx`：执行记录里的正文数字（新增/更新/实时进度/错误信息）
+  从 neon 主色改成 `-dim` 变体 —— 浅色主题下主色落在白面板上对比度只有
+  2.6~3.4:1，小字号看不清；dim 变体到 4.0~4.6:1。
+
+### 性能：执行记录加载
+- 后端 `list_runs` 默认**不再返回** `stats_json` / `log_json`。一页 50 条
+  记录里这两个字段通常几十~几百 KB，而列表页根本不用（只有展开才看）。
+  实测 5 条：**~660KB → 2.3KB**；10 条 5.0KB。
+- 新增 `GET /scheduler/runs/{run_id}` 返回单条明细；列表项带
+  `has_details` 提示可展开。
+- 前端 `useSchedulerRuns` 轮询间隔按状态动态：有 running/queued 时 4s，
+  全部结束 20s（原来固定 5s，记录不变化也在打）。
+- 展开某条时才请求 `useSchedulerRunDetail`，已结束记录缓存 60s。
+
+### 架构：管理功能迁到 library
+`scheduler` / `config` / `accounts` / `ws` 四组路由本质是**数据库 + 共享
+logs 目录**驱动，不依赖爬虫进程，现在同时挂在 library 上：
+
+- 配置读写 → `crawl_config_item` 表
+- 定时任务 CRUD → `scheduled_task` 表；「立即执行」写一条 queued，
+  由 crawler 的 worker 拾取（本来就是这套设计，library 不跑调度）
+- 账号池 → 账号表
+- 停止抓取 → 往挂载的 `./logs` 写 `.stop_crawl`，crawler 容器能看到
+- 实时日志 → tail 共享的 `logs/scheduler_live.jsonl`
+
+前端 `CRAWLER_SEGMENTS` 从 `{crawler, scheduler, accounts, config}` 收窄到
+`{crawler}`，WS 地址改 `/library/api/ws/logs`。**crawler 现在只负责**：
+启动/停止抓取、队列、抓取状态。日常管理功能改配置/建任务/看日志都不碰它。
+
+### 部署：按需构建
+`deploy/server-update.sh` 记录上次构建的 commit（`.build-state.json`），
+用 GitHub compare 接口取两次提交间的文件清单判断该建哪张镜像：
+
+| 改动范围 | 构建 |
+|---|---|
+| 纯文档 / CI | 都跳过 |
+| webui、library 专属接口 | 只 library |
+| media_platform、store、爬虫接口 | 只 crawler |
+| tools/config/database/requirements 等共享 | 两张都建 |
+| commit 没变 | 直接退出，不构建不推送 |
+
+推送也只推本次构建过的；`FORCE_ALL=1` 可强制全量（改了 .env 构建参数时用）。
+
+### 配置：进程参数入库（改配置不用重建镜像）
+原本只存在于 `config/*.py` 常量或容器环境变量的 16 项参数纳入配置页，
+新增「定时任务」分组：
+
+- 抓取类（next_task）：评论完整率目标、单账号并发、列表空页提前停止、
+  楼中楼最大页数、页面打开超时
+- 调度类（immediate）：同时执行任务数、扫描间隔、活跃时段起止、
+  执行抖动上下限、忙碌等待上限、保留执行记录数
+- 风控/存储：风控冷却时长、删帖是否连带删 S3 备份
+
+实现：`runtime_config.SYNC_TO_CONFIG` 在每次 `load()` 后把库值**回写**
+`config.base_config` / `config.xhs_config` 的模块属性，消费方的
+`config.SCHEDULER_TICK_SEC` 这类属性访问立刻读到新值；worker 的调度循环
+每 60 秒自动 refresh 一次，所以改配置页**不需要重启容器**。
+
+> 仍需环境变量的只有部署拓扑（`NACOS_*`、`SERVICE_*`、`CRAWLER_BASE_URL`
+> 等）：这些要在进程启动前就确定，且注册中心地址本身不能存在被它管理的库里。
+
 ## [2026-11-06] 修复服务器同步漏掉 database/ 代码（镜像里是旧版 db_session）
 
 ### 问题

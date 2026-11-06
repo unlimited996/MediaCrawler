@@ -35,8 +35,9 @@ export function useLogWebSocket() {
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const host = window.location.host
-      // 服务拆分后 WS 归属 crawler 服务，URL 里带服务名（网关按前缀转发）
-      const wsUrl = `${protocol}//${host}/crawler/api/ws/logs`
+      // 日志桥读的是挂载共享的 ./logs/scheduler_live.jsonl，library 与 crawler
+      // 看到的是同一个文件，所以走 library（少一跳网关转发，crawler 也可长期不重启）
+      const wsUrl = `${protocol}//${host}/library/api/ws/logs`
 
       const ws = new WebSocket(wsUrl)
       globalWs = ws

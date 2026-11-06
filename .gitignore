@@ -198,3 +198,6 @@ logs/
 deploy/.env
 /data/
 /browser_data/
+
+# 服务器构建状态（记录上次构建的 commit，用于按需构建）
+.build-state.json

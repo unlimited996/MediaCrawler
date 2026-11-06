@@ -333,20 +333,38 @@ mc-update
 
 `deploy/server-update.sh` 流程：API 取 sha → codeload 下 tarball →
 `rsync --delete` 覆盖代码（保留 `deploy/.env`、日志、数据、浏览器登录态）→
-构建 crawler/library 两张镜像（前端 npm build 只编一次）→ 打 `latest` +
-`sha-xxxxxxx` → 登录 CCR → 推送 → 可选本机 `up -d`。
+**按变更范围决定建哪张镜像** → 打 `latest` + `sha-xxxxxxx` → 登录 CCR →
+推送（只推构建过的）→ 可选本机 `up -d`。
 
 | 环境变量 | 默认 | 用途 |
 |---|---|---|
 | `SKIP_PUSH=1` | 0 | 只构建验证，不登录/不推送 |
 | `APPLY_LOCAL=1` | 0 | 推完顺带把本机容器换成新镜像 |
 | `WEBUI_BUILD=0` | 1 | 跳过前端重编（仅当 `api/webui` 已有产物） |
+| `FORCE_ALL=1` | 0 | 忽略变更检测，强制重建两张镜像 |
+
+### 按需构建（避免 crawler 无谓重建）
+
+脚本把上次成功构建的 commit 记在 `.build-state.json`，下次用 GitHub
+compare 接口取两次提交之间改动的文件清单来判断：
+
+| 改动范围 | 结果 |
+|---|---|
+| 只有 `docs/`、`*.md`、`.github/` | 两张都跳过 |
+| `webui/`、library 专属接口（story/data/…）、`api/library_app.py`、`api/gateway.py` | 只建 **library** |
+| `media_platform/`、`store/`、爬虫接口与服务、`worker.py`、`main.py` | 只建 **crawler** |
+| `tools/`、`config/`、`database/`、`requirements*`、`Dockerfile` 等共享部分 | 两张都建 |
+| commit 没变 | 直接退出，不构建也不推送 |
+
+改过 `deploy/.env` 里的构建参数（如 `PLAYWRIGHT_BROWSER`）时 commit 不变，
+需要 `FORCE_ALL=1 mc-update` 强制重建。compare 接口拿不到清单时保守地两张都建。
 
 凭据优先读 `deploy/.env`，其次复用 `~/.docker/config.json` 里已保存的
 `docker login`；**构建前就检查**，没凭据不会白跑 20 分钟。`deploy/.env` 已在
 `.gitignore` 里，脚本自身不含任何密码。
 
-> 脚本会先拉 tarball，若自身被更新会自动 `exec` 重新执行，保证用新逻辑。
+> 脚本会先拉 tarball，若自身被更新会用新脚本**重新同步一次**再继续（旧脚本的
+> rsync 排除规则可能有问题，必须让新规则真正生效）。
 
 **长构建建议后台跑**：全量构建 20~30 分钟，SSH 长连接可能被中间网络断开并
 带走进程（实测 `nohup/setsid` 在这台机器上仍会被会话清理）。用 systemd

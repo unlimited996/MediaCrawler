@@ -36,6 +36,8 @@ CONFIG_GROUPS: List[Dict] = [
      "description": "控制抓什么、抓多少、怎么翻页"},
     {"code": "risk", "name": "代理与风控", "sort_weight": 20, "icon": "shield",
      "description": "IP 代理池与反风控策略"},
+    {"code": "scheduler", "name": "定时任务", "sort_weight": 25, "icon": "calendar-clock",
+     "description": "调度节奏、并发与活跃时段；改完立即生效，无需重启容器"},
     {"code": "browser", "name": "浏览器", "sort_weight": 30, "icon": "monitor",
      "description": "Playwright / CDP 相关设置"},
     {"code": "storage", "name": "存储与产物", "sort_weight": 40, "icon": "database",
@@ -219,6 +221,60 @@ CONFIG_ITEMS: List[Dict] = [
     dict(group="xhs_backup", key="xhs_comment_budget_per_round", label="单轮评论请求预算（已弃用）", value_type="int",
          default="0", min=0, max=200, timing="next_task", weight=40, unit="次",
          desc="【已弃用】同上，单轮评论请求数量上限已移除。保留仅作展示，改值不再生效。"),
+
+    # ---------------- 2026-11-06 纳管：进程节奏参数 ----------------
+    # 以下参数原来只存在于 config/*.py 的模块常量或容器环境变量里，
+    # 改一次要重建镜像 + 重启容器。纳管后改库值即可：
+    #   * immediate 项改完立刻生效（runtime_config 回写到 config 模块属性）
+    #   * next_task 项在下一轮抓取启动时生效（build_crawler_env 注入 env）
+    dict(group="xhs_backup", key="comment_completeness_target", label="评论完整率目标", value_type="decimal",
+         default="0.9", min=0.1, max=1.0, timing="next_task", weight=60,
+         desc="判定「这篇帖子的评论已抓全」的阈值：已抓条数 / 平台声明条数 ≥ 该比例即视为完整，"
+              "下一轮会跳过。调低会更早跳过（省时间，但可能漏评论）；调高会补得更彻底。"),
+    dict(group="xhs_backup", key="xhs_max_concurrency_num", label="单账号并发数", value_type="int",
+         default="1", min=1, max=8, timing="next_task", weight=65, unit="个",
+         desc="同一账号同时开几个抓取任务。小红书风控敏感，建议保持 1；调大容易撞 461。"),
+    dict(group="xhs_backup", key="xhs_behavior_early_stop_pages", label="列表连续空页提前停止", value_type="int",
+         default="3", min=0, max=20, timing="next_task", weight=70, unit="页",
+         desc="翻账号主页/列表时，连续多少页没有新内容就提前结束（0=不提前停）。"),
+    dict(group="xhs_backup", key="xhs_sub_comment_max_pages", label="楼中楼最大翻页数", value_type="int",
+         default="3", min=1, max=50, timing="next_task", weight=75, unit="页",
+         desc="每条一级评论最多翻几页二级回复。调大可抓到更多楼中楼，但请求量会上升。"),
+
+    dict(group="scheduler", key="scheduler_max_concurrency", label="同时执行的任务数", value_type="int",
+         default="1", min=1, max=10, timing="immediate", weight=10, unit="个",
+         desc="调度器最多并行跑几个抓取任务。多账号可适当调大；同账号并发仍受单账号并发数限制。"),
+    dict(group="scheduler", key="scheduler_tick_sec", label="调度扫描间隔", value_type="int",
+         default="15", min=5, max=600, timing="immediate", weight=15, unit="秒",
+         desc="每隔多久扫一次到期任务。调小响应更及时（数据库压力略增），调大更省资源。"),
+    dict(group="scheduler", key="scheduler_active_hour_start", label="活跃时段开始", value_type="int",
+         default="6", min=0, max=23, timing="immediate", weight=20, unit="点",
+         desc="只在这个时间段内自动执行定时任务（0-23 小时）。配合结束时间可做到「夜间不抓」。"),
+    dict(group="scheduler", key="scheduler_active_hour_end", label="活跃时段结束", value_type="int",
+         default="24", min=1, max=24, timing="immediate", weight=25, unit="点",
+         desc="活跃时段结束小时（不含）。24 表示到当天结束；小于开始时间则表示跨零点。"),
+    dict(group="scheduler", key="scheduler_jitter_min_sec", label="执行抖动下限", value_type="decimal",
+         default="1", min=0, max=3600, timing="immediate", weight=30, unit="秒",
+         desc="到点后再随机延迟这么久才真正开跑，让多次任务的请求时间点错开，看起来更像人工。"),
+    dict(group="scheduler", key="scheduler_jitter_max_sec", label="执行抖动上限", value_type="decimal",
+         default="5", min=0, max=3600, timing="immediate", weight=35, unit="秒",
+         desc="抖动区间的上限，和下限一起构成 [min, max] 的随机延迟。"),
+    dict(group="scheduler", key="scheduler_busy_wait_sec", label="忙碌等待上限", value_type="int",
+         default="1800", min=60, max=86400, timing="immediate", weight=40, unit="秒",
+         desc="有任务在跑时，到期的其它任务最多等多久。超过则本轮跳过并记录，避免无限堆积。"),
+    dict(group="scheduler", key="scheduler_run_history", label="保留执行记录数", value_type="int",
+         default="100", min=10, max=5000, timing="immediate", weight=45, unit="条",
+         desc="每个任务保留最近多少条执行记录，超出自动清理。执行记录列表按此上限展示。"),
+
+    dict(group="risk", key="risk_cooldown_hours", label="风控冷却时长", value_type="int",
+         default="6", min=0, max=72, timing="immediate", weight=40, unit="小时",
+         desc="撞到风控（461/471/验证码）熔断后，该账号多久内不再自动重试。0 表示不冷却。"),
+    dict(group="browser", key="page_goto_timeout_sec", label="页面打开超时", value_type="int",
+         default="45", min=10, max=300, timing="next_task", weight=45, unit="秒",
+         desc="打开详情页/登录页的最长等待时间。网络慢或平台抖动时可调大。"),
+    dict(group="storage", key="s3_backup_purge_with_story", label="删帖时同时删备份", value_type="bool",
+         default="true", timing="immediate", weight=45,
+         desc="在数据管理里删除帖子时，是否连带删除它在 S3 上的媒体备份。关掉可保留备份以便恢复。"),
 ]
 
 

@@ -9,10 +9,19 @@
 # 服务器不需要 .git，也不依赖 GitHub 主站。
 #
 # 用法（在服务器上）：
-#   mc-update                          # 完整流程
+#   mc-update                          # 完整流程（按变更范围自动决定建哪张镜像）
+#   FORCE_ALL=1 mc-update              # 忽略变更检测，强制重建两张镜像
 #   SKIP_PUSH=1 mc-update              # 只构建验证，不登录/不推送
 #   APPLY_LOCAL=1 mc-update            # 推完顺便把本机容器换成新镜像
 #   WEBUI_BUILD=0 mc-update            # 跳过前端重编（仅当 api/webui 已有产物）
+#
+# 按需构建：脚本记录上次构建的 commit（.build-state.json），用 GitHub compare
+# 接口拿到两次提交之间的文件清单，判断哪张镜像真的需要重建：
+#   * 只改 webui/docs/library 专属接口 -> 只建 library（crawler 不动）
+#   * 只改爬虫专属（media_platform/store/...）-> 只建 crawler
+#   * 改了共享模块（tools/config/database/...）或说不清 -> 两张都建
+#   * commit 没变 -> 直接跳过，不构建也不推送
+# 想强制全量（例如改了 deploy/.env 里的构建参数）就 FORCE_ALL=1。
 #
 # 凭据：从 deploy/.env 读 TENCENT_REGISTRY_USERNAME / TENCENT_REGISTRY_PASSWORD；
 #       也可先手工 `docker login ccr.ccs.tencentyun.com`，脚本会复用已存凭据。
@@ -24,6 +33,7 @@ cd "$(dirname "$0")/.."
 REPO_DIR="$(pwd)"
 SELF="$(readlink -f "$0")"
 COMPOSE_FILE="docker-compose.split.yml"
+STATE_FILE="$REPO_DIR/.build-state.json"
 
 GITHUB_REPO="${GITHUB_REPO:-unlimited996/MediaCrawler}"
 BRANCH="${BRANCH:-main}"
@@ -31,6 +41,7 @@ REGISTRY="${REGISTRY:-ccr.ccs.tencentyun.com}"
 SKIP_PUSH="${SKIP_PUSH:-0}"
 APPLY_LOCAL="${APPLY_LOCAL:-0}"
 WEBUI_BUILD="${WEBUI_BUILD:-1}"
+FORCE_ALL="${FORCE_ALL:-0}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { echo "[$(date '+%F %T')] !! $*" >&2; exit 1; }
@@ -71,6 +82,7 @@ sync_code() {
         --exclude 'database/*.db' --exclude 'database/*.db-*' \
         --exclude 'database/*.sqlite' --exclude 'database/*.sqlite3' \
         --exclude 'api/webui/' \
+        --exclude '.build-state.json' \
         "$SRC/" "$REPO_DIR/"
     chmod +x "$REPO_DIR/deploy/server-update.sh" \
              "$REPO_DIR/deploy/build-push.sh" 2>/dev/null || true
@@ -120,14 +132,81 @@ if [ "$SKIP_PUSH" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4) 构建（前端 npm build 在 Dockerfile Stage 1，只编一次，两张镜像共用）
+# 4) 决定构建哪张镜像（按变更范围）
+#
+# 判据：GitHub compare 接口给出两次提交之间改动的文件清单。
+#   * 「不影响 crawler」的白名单：前端产物、文档、部署脚本、library 专属接口
+#   * 「只影响 crawler」的白名单：媒体平台/存储层/爬虫接口与服务
+# 白名单之外的（tools/、config/、database/、requirements、Dockerfile…）
+# 一律视为共享变更 -> 两张都重建，宁可多建也不让镜像版本错配。
 # ---------------------------------------------------------------------------
-log "构建 crawler + library（PLAYWRIGHT_BROWSER=${PLAYWRIGHT_BROWSER:-chromium}）"
-SKIP_WEBUI_BUILD=$([ "$WEBUI_BUILD" = "1" ] && echo 0 || echo 1) \
-    docker compose -f "$COMPOSE_FILE" --env-file deploy/.env build
-
 CRAWLER="${REGISTRY}/${NAMESPACE}/mediacrawler-crawler"
 LIBRARY="${REGISTRY}/${NAMESPACE}/mediacrawler-library"
+
+# 改了这些文件不需要重建 crawler（crawler 既不提供前端，也不挂这些路由）
+CRAWLER_IGNORABLE='^(webui/|docs/|deploy/|\.github/|[^/]*\.md$|api/webui/|api/library_app\.py$|api/gateway\.py$|api/routers/(story|data|discover|export|stance_tags|s3_backup|recipe|media|app_config|internal)\.py$|requirements-core\.txt$)'
+# 改了这些文件不需要重建 library
+LIBRARY_IGNORABLE='^(media_platform/|store/|api/routers/(crawler|accounts|scheduler)\.py$|api/crawler_app\.py$|api/services/(profile_crawler|task_scheduler|crawler_manager|crawl_queue|worker_control|crawl_control)\.py$|worker\.py$|main\.py$)'
+# 纯文档/CI 改动：镜像内容确实会变（COPY .），但功能完全不受影响，直接跳过
+DOC_ONLY='^(docs/|[^/]*\.md$|\.github/)'
+
+BUILD_CRAWLER=1
+BUILD_LIBRARY=1
+
+github_compare() {
+    # 输出两提交之间改动的文件名（每行一个）；失败返回非 0
+    curl -fsSL --max-time 30 \
+        "https://api.github.com/repos/${GITHUB_REPO}/compare/$1...$2" \
+        | jq -r '.files[]?.filename // empty'
+}
+
+if [ "$FORCE_ALL" = "1" ]; then
+    log "FORCE_ALL=1：强制重建两张镜像"
+elif [ -f "$STATE_FILE" ]; then
+    PREV_SHA="$(jq -r '.sha // empty' "$STATE_FILE" 2>/dev/null || true)"
+    if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" = "$SHA" ]; then
+        log "提交 ${SHORT_SHA} 已经是当前构建版本，跳过构建与推送"
+        log "（改了 deploy/.env 里的构建参数请用 FORCE_ALL=1 mc-update）"
+        exit 0
+    fi
+    if [ -n "$PREV_SHA" ]; then
+        CHANGED="$(mktemp)"
+        if github_compare "$PREV_SHA" "$SHA" > "$CHANGED" 2>/dev/null && [ -s "$CHANGED" ]; then
+            TOTAL="$(wc -l < "$CHANGED" | tr -d ' ')"
+            log "自 ${PREV_SHA:0:7} 以来改动 ${TOTAL} 个文件，判定需要重建的镜像"
+            if ! grep -qvE "$DOC_ONLY" "$CHANGED"; then
+                BUILD_CRAWLER=0
+                BUILD_LIBRARY=0
+                log "只有文档/CI 改动，镜像无需重建"
+            else
+                if ! grep -qvE "$CRAWLER_IGNORABLE" "$CHANGED"; then
+                    BUILD_CRAWLER=0
+                fi
+                if ! grep -qvE "$LIBRARY_IGNORABLE" "$CHANGED"; then
+                    BUILD_LIBRARY=0
+                fi
+            fi
+        else
+            log "变更清单获取失败，保守起见重建两张镜像"
+        fi
+        rm -f "$CHANGED"
+    fi
+fi
+
+TARGETS=""
+[ "$BUILD_CRAWLER" = "1" ] && TARGETS="crawler"
+[ "$BUILD_LIBRARY" = "1" ] && TARGETS="${TARGETS:+$TARGETS }library"
+if [ -z "$TARGETS" ]; then
+    log "本次改动不影响任何镜像，跳过构建与推送"
+    exit 0
+fi
+log "本次构建：${TARGETS}（PLAYWRIGHT_BROWSER=${PLAYWRIGHT_BROWSER:-chromium}）"
+
+# ---------------------------------------------------------------------------
+# 5) 构建
+# ---------------------------------------------------------------------------
+SKIP_WEBUI_BUILD=$([ "$WEBUI_BUILD" = "1" ] && echo 0 || echo 1) \
+    docker compose -f "$COMPOSE_FILE" --env-file deploy/.env build $TARGETS
 
 if [ "$SKIP_PUSH" = "1" ]; then
     log "SKIP_PUSH=1：只构建，不推送"
@@ -136,7 +215,7 @@ if [ "$SKIP_PUSH" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5) 登录 + 打 tag + 推送
+# 6) 登录 + 打 tag + 推送（只推本次构建过的）
 # ---------------------------------------------------------------------------
 if [ -n "${TENCENT_REGISTRY_USERNAME:-}" ] && [ -n "${TENCENT_REGISTRY_PASSWORD:-}" ]; then
     log "登录 ${REGISTRY}"
@@ -160,23 +239,37 @@ push_with_retry() {
     die "推送失败（重试 3 次）：${ref}"
 }
 
-for img in "${CRAWLER}" "${LIBRARY}"; do
-    docker tag "${img}:latest" "${img}:sha-${SHORT_SHA}"
-    push_with_retry "${img}:latest"
-    push_with_retry "${img}:sha-${SHORT_SHA}"
-done
+PUSHED=()
+if [ "$BUILD_CRAWLER" = "1" ]; then
+    docker tag "${CRAWLER}:latest" "${CRAWLER}:sha-${SHORT_SHA}"
+    push_with_retry "${CRAWLER}:latest"
+    push_with_retry "${CRAWLER}:sha-${SHORT_SHA}"
+    PUSHED+=("${CRAWLER}")
+fi
+if [ "$BUILD_LIBRARY" = "1" ]; then
+    docker tag "${LIBRARY}:latest" "${LIBRARY}:sha-${SHORT_SHA}"
+    push_with_retry "${LIBRARY}:latest"
+    push_with_retry "${LIBRARY}:sha-${SHORT_SHA}"
+    PUSHED+=("${LIBRARY}")
+fi
+
+# 记录本次构建的 commit：下次运行时据此判断该不该重建，避免无变更也走一遍构建推送
+cat > "$STATE_FILE" <<EOF
+{"sha":"${SHA}","short_sha":"${SHORT_SHA}","built_at":"$(date -Iseconds)","targets":"${TARGETS}"}
+EOF
 
 # ---------------------------------------------------------------------------
-# 6) 可选：本机把容器换成新镜像（默认关，服务一般跑在群晖/别的机器）
+# 7) 可选：本机把容器换成新镜像（默认关，服务一般跑在群晖/别的机器）
 # ---------------------------------------------------------------------------
 if [ "$APPLY_LOCAL" = "1" ]; then
     log "本机更新容器（--no-deps，不动正在跑的抓取）"
-    docker compose -f "$COMPOSE_FILE" --env-file deploy/.env up -d --no-deps crawler library
+    docker compose -f "$COMPOSE_FILE" --env-file deploy/.env up -d --no-deps $TARGETS
 fi
 
-log "完成 @ ${SHORT_SHA}"
-log "  ${CRAWLER}:latest"
-log "  ${LIBRARY}:latest"
+log "完成 @ ${SHORT_SHA}（本次构建：${TARGETS}）"
+for img in ${PUSHED[@]+"${PUSHED[@]}"}; do
+    log "  ${img}:latest  + :sha-${SHORT_SHA}"
+done
 if [ "$APPLY_LOCAL" != "1" ]; then
     log "在运行服务的机器上执行：docker compose pull && docker compose up -d"
 fi

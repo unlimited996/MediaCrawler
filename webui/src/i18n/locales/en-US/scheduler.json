@@ -108,6 +108,7 @@
     "statsGained": "{{count}} comments fetched this run",
     "statsEmpty": "No posts added or refreshed",
     "statsLogsToggle": "Logs",
+    "loadingDetail": "Loading details…",
     "liveFetched": "Fetch",
     "liveSaved": "Saved",
     "liveStatsHint": "Live counters for the current run: Fetch = platform requests, Saved = rows persisted",

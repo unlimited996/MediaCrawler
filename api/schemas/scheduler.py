@@ -182,6 +182,9 @@ class ScheduledTaskRunOut(BaseModel):
     # 细粒度统计：{added:[...], updated:[...]}，含前后评论完整率。
     # 历史运行记录没有该字段，前端渲染前做空值兜底。
     stats_json: Optional[dict] = None
+    #: 列表接口不返回 log_tail / stats_json（体积大），用这个标志告诉前端
+    #: 「这条有明细可展开」，展开时再请求 /scheduler/runs/{id}。
+    has_details: bool = False
 
 
 class SchedulerStatusOut(BaseModel):

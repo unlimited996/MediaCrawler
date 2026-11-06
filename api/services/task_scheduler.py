@@ -462,7 +462,21 @@ class TaskScheduler:
 
     async def _loop(self) -> None:
         tick = max(1, int(config.SCHEDULER_TICK_SEC))
+        last_cfg_sync = 0.0
         while not self._stopping:
+            # 每 60 秒把库里的配置同步一次：worker 是长驻进程，改配置页
+            # （调度节奏/并发/活跃时段/风控冷却…）不重启容器也能生效。
+            # runtime_config.load 会把值回写到 config 模块属性，
+            # 所以下面重新读 SCHEDULER_TICK_SEC 就能拿到新节奏。
+            now_mono = time.monotonic()
+            if now_mono - last_cfg_sync >= 60:
+                last_cfg_sync = now_mono
+                try:
+                    await runtime_config.refresh()
+                    tick = max(1, int(config.SCHEDULER_TICK_SEC))
+                except Exception as e:
+                    # 刷新失败就沿用旧值，绝不让调度循环挂掉
+                    self.last_error = f"配置刷新失败（沿用旧值）: {e}"
             try:
                 await self._tick()
             except asyncio.CancelledError:
@@ -661,7 +675,13 @@ class TaskScheduler:
             return self._task_dict(row) if row else None
 
     async def list_runs(self, task_id: Optional[int] = None,
-                        limit: int = 50) -> List[Dict[str, Any]]:
+                        limit: int = 50,
+                        include_details: bool = False) -> List[Dict[str, Any]]:
+        """执行记录列表。
+
+        默认**不带** stats_json / log_json（明细按 id 单独拉），
+        这样 50 条记录的响应通常只有几十 KB，轮询不卡。
+        """
         limit = max(1, min(int(limit or 50), 500))
         async with _session() as session:
             if session is None:
@@ -672,7 +692,7 @@ class TaskScheduler:
             rows = (await session.execute(
                 stmt.order_by(ScheduledTaskRun.id.desc()).limit(limit)
             )).scalars().all()
-            return [self._run_dict(r) for r in rows]
+            return [self._run_dict(r, with_details=include_details) for r in rows]
 
     # ---------- 执行 ----------
 
@@ -1251,9 +1271,18 @@ class TaskScheduler:
         }
 
     @staticmethod
-    def _run_dict(row: ScheduledTaskRun) -> Dict[str, Any]:
+    def _run_dict(row: ScheduledTaskRun,
+                  with_details: bool = True) -> Dict[str, Any]:
+        """把运行记录转成 dict。
+
+        `with_details=False` 时**不返回** stats_json / log_json：
+        一页 50 条记录里这两个字段通常是几十~几百 KB 的明细，
+        列表页根本用不到（只有展开某一条才看），带上它们会让
+        每 5 秒一次的轮询白白传输、序列化，执行记录列表明显变慢。
+        展开时前端再按 id 拉 `/scheduler/runs/{id}`。
+        """
         from tools.cst import cst_iso
-        return {
+        data: Dict[str, Any] = {
             "id": row.id,
             "task_id": row.task_id,
             "trigger_type": row.trigger_type,
@@ -1266,9 +1295,24 @@ class TaskScheduler:
             "skipped_count": int(row.skipped_count or 0),
             "attempt_count": int(row.attempt_count or 1),
             "error_message": row.error_message,
-            "log_tail": row.log_json or [],
-            "stats_json": row.stats_json,
+            "has_details": bool(row.stats_json or row.log_json),
+            "log_tail": [],
+            "stats_json": None,
         }
+        if with_details:
+            data["log_tail"] = row.log_json or []
+            data["stats_json"] = row.stats_json
+        return data
+
+    async def get_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        """单条运行记录（含 stats_json / log_tail 明细）。"""
+        async with _session() as session:
+            if session is None:
+                return None
+            row = (await session.execute(
+                select(ScheduledTaskRun).where(ScheduledTaskRun.id == int(run_id))
+            )).scalar_one_or_none()
+            return self._run_dict(row, with_details=True) if row else None
 
 
 # 全局单例

@@ -69,6 +69,54 @@ LEGACY_FALLBACK: Dict[str, str] = {
     # 单轮请求预算护栏（2026-11-02 纳管，原仅在 config/xhs_config.py 以常量存在）
     "xhs_detail_budget_per_round": "XHS_DETAIL_BUDGET_PER_ROUND",
     "xhs_comment_budget_per_round": "XHS_COMMENT_BUDGET_PER_ROUND",
+    # 进程级节奏参数（2026-11-06 纳管：改这些不用重建镜像，详见 SYNC_TO_CONFIG）
+    "comment_completeness_target": "COMMENT_COMPLETENESS_TARGET",
+    "page_goto_timeout_sec": "PAGE_GOTO_TIMEOUT_SEC",
+    "scheduler_max_concurrency": "SCHEDULER_MAX_CONCURRENCY",
+    "scheduler_tick_sec": "SCHEDULER_TICK_SEC",
+    "scheduler_busy_wait_sec": "SCHEDULER_BUSY_WAIT_SEC",
+    "scheduler_run_history": "SCHEDULER_RUN_HISTORY",
+    "scheduler_active_hour_start": "SCHEDULER_ACTIVE_HOUR_START",
+    "scheduler_active_hour_end": "SCHEDULER_ACTIVE_HOUR_END",
+    "scheduler_jitter_min_sec": "SCHEDULER_JITTER_MIN_SEC",
+    "scheduler_jitter_max_sec": "SCHEDULER_JITTER_MAX_SEC",
+    "scheduler_window_spread_sec": "SCHEDULER_WINDOW_SPREAD_SEC",
+    "risk_cooldown_hours": "RISK_COOLDOWN_HOURS",
+    "s3_backup_purge_with_story": "S3_BACKUP_PURGE_WITH_STORY",
+    "xhs_max_concurrency_num": "XHS_MAX_CONCURRENCY_NUM",
+    "xhs_behavior_early_stop_pages": "XHS_BEHAVIOR_EARLY_STOP_PAGES",
+    "xhs_sub_comment_max_pages": "XHS_SUB_COMMENT_MAX_PAGES",
+}
+
+#: 这些配置项在库里改完后要**同步回 config 模块属性**，让长驻进程
+#: （worker / 调度器 / API）不必重启就能读到新值 —— 这样调参不需要重建
+#: 镜像、也不需要重启容器。
+#:
+#: 为什么需要：这些常量原本是 `config/base_config.py` 的模块级变量，
+#: 消费方写的是 `config.SCHEDULER_TICK_SEC` 这种属性访问。库里改值后
+#: 只更新 RuntimeConfig 缓存并不会影响那些模块属性。这里在每次 load 后
+#: 回写，属性访问就能拿到新值。
+#:
+#: 注意：`from config import XXX` 这种**早先绑定**的名字不会跟着变，
+#: 所以抓取子进程仍走 build_crawler_env 注入环境变量（每次任务启动刷新）。
+#: 键 -> (子模块名, 模块内属性名)
+SYNC_TO_CONFIG: Dict[str, tuple] = {
+    "comment_completeness_target": ("base_config", "COMMENT_COMPLETENESS_TARGET"),
+    "page_goto_timeout_sec": ("base_config", "PAGE_GOTO_TIMEOUT_SEC"),
+    "scheduler_max_concurrency": ("base_config", "SCHEDULER_MAX_CONCURRENCY"),
+    "scheduler_tick_sec": ("base_config", "SCHEDULER_TICK_SEC"),
+    "scheduler_busy_wait_sec": ("base_config", "SCHEDULER_BUSY_WAIT_SEC"),
+    "scheduler_run_history": ("base_config", "SCHEDULER_RUN_HISTORY"),
+    "scheduler_active_hour_start": ("base_config", "SCHEDULER_ACTIVE_HOUR_START"),
+    "scheduler_active_hour_end": ("base_config", "SCHEDULER_ACTIVE_HOUR_END"),
+    "scheduler_jitter_min_sec": ("base_config", "SCHEDULER_JITTER_MIN_SEC"),
+    "scheduler_jitter_max_sec": ("base_config", "SCHEDULER_JITTER_MAX_SEC"),
+    "scheduler_window_spread_sec": ("base_config", "SCHEDULER_WINDOW_SPREAD_SEC"),
+    "risk_cooldown_hours": ("base_config", "RISK_COOLDOWN_HOURS"),
+    "s3_backup_purge_with_story": ("base_config", "S3_BACKUP_PURGE_WITH_STORY"),
+    "xhs_max_concurrency_num": ("xhs_config", "XHS_MAX_CONCURRENCY_NUM"),
+    "xhs_behavior_early_stop_pages": ("xhs_config", "XHS_BEHAVIOR_EARLY_STOP_PAGES"),
+    "xhs_sub_comment_max_pages": ("xhs_config", "XHS_SUB_COMMENT_MAX_PAGES"),
 }
 
 
@@ -150,7 +198,33 @@ class RuntimeConfig:
             if values:
                 self._values, self._types, self._meta = values, types, meta
                 self.config_version = max_version
+                # 把进程级参数回写到 config 模块属性：改配置不需要重启/重建
+                self._sync_to_config_modules()
             self._loaded = True
+
+    def _sync_to_config_modules(self) -> None:
+        """见 SYNC_TO_CONFIG：让 `config.XXX` 属性读到库里的最新值。"""
+        import importlib
+
+        import config as _config_pkg
+
+        for cfg_key, (mod_name, attr) in SYNC_TO_CONFIG.items():
+            if cfg_key not in self._values:
+                continue
+            value = self._values[cfg_key]
+            try:
+                mod = importlib.import_module(f"config.{mod_name}")
+                setattr(mod, attr, value)
+            except Exception:
+                continue
+            # config/__init__.py 是 `from .base_config import *`，包级属性是
+            # 导入时复制的一份，必须一起改，否则 config.X 与
+            # config.base_config.X 会不一致。
+            if hasattr(_config_pkg, attr):
+                try:
+                    setattr(_config_pkg, attr, value)
+                except Exception:
+                    pass
 
     async def _fetch_items(self):
         # 延迟导入，避免 config 与 database 循环依赖

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { schedulerApi } from '@/lib/api'
-import type { ScheduledTaskPayload } from '@/types/scheduler'
+import type { ScheduledTaskPayload, ScheduledTaskRun } from '@/types/scheduler'
 
 const QK = ['schedulerTasks']
 const RUNS_QK = ['schedulerRuns']
@@ -33,11 +33,33 @@ export function useSchedulerDimensions() {
   })
 }
 
+/** 执行记录列表：只返回轻量字段（无 stats_json / log_tail）。
+ *
+ * 轮询间隔按「是否有任务在跑」动态调整：
+ *   * 有 running/queued -> 4s（看实时进度）
+ *   * 全部已结束       -> 20s（记录不会变，没必要 5s 打一次）
+ * 明细走 useSchedulerRunDetail，仅在展开时请求。
+ */
 export function useSchedulerRuns(limit = 50) {
   return useQuery({
     queryKey: [...RUNS_QK, limit],
     queryFn: async () => (await schedulerApi.listRuns(undefined, limit)).data,
-    refetchInterval: 5000,
+    refetchInterval: (query) => {
+      const rows = query.state.data as ScheduledTaskRun[] | undefined
+      const busy = rows?.some((r) => r.status === 'running' || r.status === 'queued')
+      return busy ? 4000 : 20000
+    },
+  })
+}
+
+/** 某条执行记录的明细：展开时才拉，已结束的记录不会变所以缓存久一点 */
+export function useSchedulerRunDetail(runId: number | null) {
+  return useQuery({
+    queryKey: ['schedulerRun', runId],
+    queryFn: async () => (await schedulerApi.getRun(runId as number)).data,
+    enabled: runId != null,
+    staleTime: 60_000,
+    gcTime: 300_000,
   })
 }
 

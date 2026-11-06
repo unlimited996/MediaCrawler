@@ -12,11 +12,12 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Badge } from '@/components/ui/badge'
 import {
   useSchedulerTasks, useSchedulerStatus, useSchedulerRuns, useSchedulerDimensions,
+  useSchedulerRunDetail,
   useCreateTask, useUpdateTask, useDeleteTask, useToggleTask, useRunTask,
   useStopScheduler,
 } from '@/hooks/useScheduler'
 import type { ScheduledTask, ScheduledTaskPayload, TaskType, TaskDimension,
-              RunStatus, RunStatsItem } from '@/types/scheduler'
+              RunStatus, RunStats, RunStatsItem } from '@/types/scheduler'
 
 const PLATFORMS = [
   { value: 'xhs', label: '小红书' },
@@ -55,7 +56,7 @@ function StatRow({ item }: { item: RunStatsItem }) {
         {b.fetched}→{a.fetched}/{a.declared}
       </span>
       {item.gained > 0 && (
-        <span className="text-cyber-neon-green shrink-0">+{item.gained}</span>
+        <span className="text-cyber-neon-green-dim shrink-0">+{item.gained}</span>
       )}
       <span className="text-cyber-text-muted truncate max-w-[110px]" title={item.title}>
         {item.title}
@@ -118,11 +119,11 @@ function fmtTime(iso: string | null): string {
 
 function runStatusMeta(status: RunStatus, t: (k: string) => string) {
   switch (status) {
-    case 'success': return { label: t('runStatus.success'), cls: 'bg-cyber-neon-green/15 text-cyber-neon-green border-cyber-neon-green/30', Icon: CheckCircle2 }
-    case 'failed': return { label: t('runStatus.failed'), cls: 'bg-cyber-neon-pink/15 text-cyber-neon-pink border-cyber-neon-pink/30', Icon: XCircle }
+    case 'success': return { label: t('runStatus.success'), cls: 'bg-cyber-neon-green/15 text-cyber-neon-green-dim border-cyber-neon-green/30', Icon: CheckCircle2 }
+    case 'failed': return { label: t('runStatus.failed'), cls: 'bg-cyber-neon-pink/15 text-cyber-neon-pink-dim border-cyber-neon-pink/30', Icon: XCircle }
     case 'timeout': return { label: t('runStatus.timeout'), cls: 'bg-cyber-neon-orange/15 text-cyber-neon-orange border-cyber-neon-orange/30', Icon: Clock }
     case 'skipped': return { label: t('runStatus.skipped'), cls: 'bg-cyber-text-muted/15 text-cyber-text-muted border-cyber-border-subtle', Icon: MinusCircle }
-    default: return { label: t('runStatus.running'), cls: 'bg-cyber-neon-cyan/15 text-cyber-neon-cyan border-cyber-neon-cyan/30', Icon: Loader2 }
+    default: return { label: t('runStatus.running'), cls: 'bg-cyber-neon-cyan/15 text-cyber-neon-cyan-dim border-cyber-neon-cyan/30', Icon: Loader2 }
   }
 }
 
@@ -144,6 +145,9 @@ export function ScheduledTasksView() {
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<ScheduledTaskPayload>(EMPTY_FORM)
   const [expandedRun, setExpandedRun] = useState<number | null>(null)
+  // 执行记录明细按需拉取：列表接口不含 stats_json / log_tail（那是最占体积的字段）
+  const runDetailQ = useSchedulerRunDetail(expandedRun)
+  const runDetail = runDetailQ.data
   // 任务列表维度筛选：全部 / 关注用户 / 关注帖子 / 登录用户
   const [dimFilter, setDimFilter] = useState<'all' | TaskDimension>('all')
 
@@ -255,7 +259,7 @@ export function ScheduledTasksView() {
                 title={status.mode === 'worker'
                   ? `执行器独立运行${status.worker?.pid ? `（pid ${status.worker.pid}）` : ''}`
                   : undefined}
-                className={`text-[10px] font-mono ${schedulerLive ? 'border-cyber-neon-green/40 text-cyber-neon-green' : 'border-cyber-neon-pink/40 text-cyber-neon-pink'}`}>
+                className={`text-[10px] font-mono ${schedulerLive ? 'border-cyber-neon-green/40 text-cyber-neon-green-dim' : 'border-cyber-neon-pink/40 text-cyber-neon-pink-dim'}`}>
                 {schedulerLive ? t('statusRunning') : t('statusStopped')}
               </Badge>
               {(status.queued_runs || 0) > 0 && (
@@ -267,7 +271,7 @@ export function ScheduledTasksView() {
                 {t('enabledTasks', { count: status.enabled_tasks })}
               </Badge>
               {status.running_tasks > 0 && (
-                <Badge variant="outline" className="text-[10px] font-mono border-cyber-neon-cyan/40 text-cyber-neon-cyan">
+                <Badge variant="outline" className="text-[10px] font-mono border-cyber-neon-cyan/40 text-cyber-neon-cyan-dim">
                   <Loader2 className="w-2.5 h-2.5 animate-spin mr-1" />
                   {t('runningTasks', { count: status.running_tasks })}
                 </Badge>
@@ -669,7 +673,7 @@ export function ScheduledTasksView() {
                         <Badge variant="outline" className="text-[9px] font-mono border-cyber-border-subtle text-cyber-text-muted">已停用</Badge>
                       )}
                       {running && (
-                        <Badge variant="outline" className="text-[9px] font-mono border-cyber-neon-cyan/40 text-cyber-neon-cyan">
+                        <Badge variant="outline" className="text-[9px] font-mono border-cyber-neon-cyan/40 text-cyber-neon-cyan-dim">
                           <Loader2 className="w-2 h-2 animate-spin mr-0.5" />执行中
                         </Badge>
                       )}
@@ -696,7 +700,7 @@ export function ScheduledTasksView() {
                       <span>{t('runCount', { count: task.run_count })}</span>
                     </div>
                     {task.last_error && (
-                      <p className="text-[10px] text-cyber-neon-pink mt-1 line-clamp-2">{task.last_error}</p>
+                      <p className="text-[10px] text-cyber-neon-pink-dim mt-1 line-clamp-2">{task.last_error}</p>
                     )}
                   </div>
                   <div className="flex items-center gap-1 flex-shrink-0">
@@ -739,9 +743,9 @@ export function ScheduledTasksView() {
                 className="ml-auto flex items-center gap-1.5 text-[10px] font-mono text-cyber-text-muted"
                 title={t('runs.liveStatsHint')}
               >
-                <span>{t('runs.liveFetched')} <b className="text-cyber-neon-cyan">{status.live_stats.fetched}</b></span>
+                <span>{t('runs.liveFetched')} <b className="text-cyber-neon-cyan-dim">{status.live_stats.fetched}</b></span>
                 <span className="text-cyber-border-subtle">/</span>
-                <span>{t('runs.liveSaved')} <b className="text-cyber-neon-green">{status.live_stats.saved}</b></span>
+                <span>{t('runs.liveSaved')} <b className="text-cyber-neon-green-dim">{status.live_stats.saved}</b></span>
               </span>
             )}
           </div>
@@ -771,8 +775,8 @@ export function ScheduledTasksView() {
                       <span className="text-cyber-text-secondary truncate max-w-[140px]" title={task?.name}>{task?.name || `#${run.task_id}`}</span>
                       {run.status !== 'running' && (
                         <>
-                          <span className="text-cyber-neon-green">{t('runs.newCount', { count: run.new_count })}</span>
-                          <span className="text-cyber-neon-cyan">{t('runs.updatedCount', { count: run.updated_count })}</span>
+                          <span className="text-cyber-neon-green-dim">{t('runs.newCount', { count: run.new_count })}</span>
+                          <span className="text-cyber-neon-cyan-dim">{t('runs.updatedCount', { count: run.updated_count })}</span>
                           <span>{t('runs.skippedCount', { count: run.skipped_count })}</span>
                           <span>{t('runs.duration', { sec: ((run.duration_ms || 0) / 1000).toFixed(1) })}</span>
                           {run.attempt_count > 1 && <span>{t('runs.attempts', { count: run.attempt_count })}</span>}
@@ -780,7 +784,7 @@ export function ScheduledTasksView() {
                       )}
                     </div>
                     {run.status === 'running' && status?.live_stats && (
-                      <p className="text-[10px] font-mono text-cyber-neon-cyan">
+                      <p className="text-[10px] font-mono text-cyber-neon-cyan-dim">
                         {t('runs.liveProgress', {
                           fetched: status.live_stats.fetched,
                           saved: status.live_stats.saved,
@@ -788,11 +792,16 @@ export function ScheduledTasksView() {
                       </p>
                     )}
                     {run.error_message && (
-                      <p className="text-[10px] text-cyber-neon-pink line-clamp-2">{run.error_message}</p>
+                      <p className="text-[10px] text-cyber-neon-pink-dim line-clamp-2">{run.error_message}</p>
                     )}
                   </button>
-                  {open && run.stats_json && (() => {
-                    const st = run.stats_json
+                  {open && runDetailQ.isLoading && (
+                    <p className="mt-1.5 text-[9px] font-mono text-cyber-text-muted">
+                      {t('runs.loadingDetail')}
+                    </p>
+                  )}
+                  {open && runDetail?.stats_json && (() => {
+                    const st = runDetail.stats_json as RunStats
                     const all = [...st.added, ...st.updated]
                     const gained = all.reduce((s, i) => s + (i.gained || 0), 0)
                     const page = (list: RunStatsItem[]) => list.slice(0, STAT_ROW_LIMIT)
@@ -800,7 +809,7 @@ export function ScheduledTasksView() {
                       <div className="mt-1.5 space-y-1 rounded bg-cyber-bg-primary/40 p-2">
                         <div className="flex items-center gap-2 text-[9px] font-mono flex-wrap">
                           <span className="text-cyber-neon-purple font-semibold">{t('runs.statsTitle')}</span>
-                          <span className="text-cyber-neon-green">{t('runs.statsGained', { count: gained })}</span>
+                          <span className="text-cyber-neon-green-dim">{t('runs.statsGained', { count: gained })}</span>
                         </div>
                         {all.length === 0 ? (
                           <p className="text-[9px] font-mono text-cyber-text-muted">{t('runs.statsEmpty')}</p>
@@ -808,7 +817,7 @@ export function ScheduledTasksView() {
                           <>
                             {st.added.length > 0 && (
                               <div>
-                                <p className="text-[9px] font-mono text-cyber-neon-green">
+                                <p className="text-[9px] font-mono text-cyber-neon-green-dim">
                                   {t('runs.statsAdded', { count: st.added.length })}
                                 </p>
                                 {page(st.added).map((it) => (
@@ -823,7 +832,7 @@ export function ScheduledTasksView() {
                             )}
                             {st.updated.length > 0 && (
                               <div>
-                                <p className="text-[9px] font-mono text-cyber-neon-cyan">
+                                <p className="text-[9px] font-mono text-cyber-neon-cyan-dim">
                                   {t('runs.statsUpdated', { count: st.updated.length })}
                                 </p>
                                 {page(st.updated).map((it) => (
@@ -841,9 +850,9 @@ export function ScheduledTasksView() {
                       </div>
                     )
                   })()}
-                  {open && (run.log_tail || []).length > 0 && (
+                  {open && (runDetail?.log_tail || []).length > 0 && (
                     <pre className="mt-1.5 max-h-40 overflow-auto rounded bg-cyber-bg-primary/60 p-2 text-[9px] leading-4 font-mono text-cyber-text-muted whitespace-pre-wrap">
-                      {(run.log_tail || []).join('\n')}
+                      {(runDetail?.log_tail || []).join('\n')}
                     </pre>
                   )}
                 </div>
