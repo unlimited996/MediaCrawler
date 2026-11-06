@@ -1,0 +1,123 @@
+# =============================================================================
+# 群晖 Container Manager 专用（只拉镜像、不构建）
+#
+# 与 docker-compose.split.yml 的区别：
+#   * 去掉 build: 段和 deploy/.env 依赖 —— 群晖不需要源码，导入即可运行
+#   * 不挂载 ./database —— 那是**代码目录**（db_session.py/models_v2.py），
+#     挂一个空目录进去会把代码覆盖掉，容器直接起不来（服务器部署踩过）
+#   * 不挂载 ./deploy —— 配置全部写在 environment 里
+#   * 关掉 Nacos，用容器内网 DNS 静态互联（compose 内部 crawler:8001 可解析）
+#   * 自带一个 PostgreSQL；已有外部库的话删掉 postgres 服务并改下面 5 个
+#     POSTGRES_DB_* 变量即可
+#
+# 用法：Container Manager -> 项目 -> 新增 -> 上传本文件（改好密码）
+#      -> 启动后**必须执行一次建表**，见下方 README 里的说明。
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mediacrawler-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mc
+      # 改成你自己的强密码；也可以在项目「环境变量」里设 MC_DB_PASSWORD
+      POSTGRES_PASSWORD: ${MC_DB_PASSWORD:-ChangeMe_2026}
+      POSTGRES_DB: mediacrawler
+      TZ: Asia/Shanghai
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mc -d mediacrawler"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  crawler:
+    image: ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
+    container_name: mediacrawler-crawler
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      APP_ROLE: crawler
+      SERVICE_NAME: mediacrawler-crawler
+      SERVICE_PORT: "8001"
+      PORT: "8001"
+      WORKER_ENABLED: "1"
+      # ---- 数据库（v2 数据层 + 配置表都用它）----
+      CONFIG_DB_TYPE: postgres
+      POSTGRES_DB_HOST: postgres
+      POSTGRES_DB_PORT: "5432"
+      POSTGRES_DB_USER: mc
+      POSTGRES_DB_PWD: ${MC_DB_PASSWORD:-ChangeMe_2026}
+      POSTGRES_DB_NAME: mediacrawler
+      # ---- 服务互联：群晖没有 Nacos，必须关掉，否则每次发现都会先超时 ----
+      NACOS_ENABLED: "0"
+      CRAWLER_SERVICE_NAME: mediacrawler-crawler
+      LIBRARY_SERVICE_NAME: mediacrawler-library
+      CRAWLER_BASE_URL: http://crawler:8001
+      LIBRARY_BASE_URL: http://library:8081
+      GATEWAY_ENABLED: "0"
+      # ---- 运行行为 ----
+      SCHEDULER_ENABLED: "1"
+      SCHEDULER_IN_API: "0"
+      HEADLESS: "true"
+      TZ: Asia/Shanghai
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./browser_data:/app/browser_data
+    # 不对宿主机暴露，只给 library 容器访问
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/crawler/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  library:
+    image: ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:latest
+    container_name: mediacrawler-library
+    restart: unless-stopped
+    depends_on:
+      - crawler
+    environment:
+      APP_ROLE: library
+      SERVICE_NAME: mediacrawler-library
+      SERVICE_PORT: "8081"
+      PORT: "8081"
+      WORKER_ENABLED: "0"
+      # ---- 数据库 ----
+      CONFIG_DB_TYPE: postgres
+      POSTGRES_DB_HOST: postgres
+      POSTGRES_DB_PORT: "5432"
+      POSTGRES_DB_USER: mc
+      POSTGRES_DB_PWD: ${MC_DB_PASSWORD:-ChangeMe_2026}
+      POSTGRES_DB_NAME: mediacrawler
+      # ---- 服务互联 ----
+      NACOS_ENABLED: "0"
+      CRAWLER_SERVICE_NAME: mediacrawler-crawler
+      LIBRARY_SERVICE_NAME: mediacrawler-library
+      # 关键：网关把 /crawler/** 转发到这里，必须是容器服务名，不能是 127.0.0.1
+      CRAWLER_BASE_URL: http://crawler:8001
+      LIBRARY_BASE_URL: http://library:8081
+      GATEWAY_ENABLED: "1"
+      # ---- 运行行为 ----
+      SCHEDULER_ENABLED: "1"
+      SCHEDULER_IN_API: "0"
+      HEADLESS: "true"
+      TZ: Asia/Shanghai
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./browser_data:/app/browser_data
+    ports:
+      # 群晖 8081 被占用就改左边，例如 "18081:8081"
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/library/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
