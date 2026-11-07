@@ -505,6 +505,31 @@ compose 里 `ports: "${LIBRARY_PORT:-18081}:8081"`）。crawler 另外映射了
 > 先把 Nacos 挪到别的宿主端口，再让反代/业务监听 9000 —— 注册中心与业务混在
 > 同一端口，后续排障会很痛，不建议。
 
+#### 群晖 Container Manager 导入 compose（目录问题）
+
+用 `deploy/synology/docker-compose.prefilled.yml`（已填好群晖本机 PostgreSQL），
+或仓库里的无密码模板 `deploy/synology/docker-compose.yml`。
+
+**群晖 DSM 的 Docker 不会自动创建 bind mount 的宿主目录**（Linux Docker 上会）。
+直接写 `./logs:/app/logs` 会报：
+
+```
+Error response from daemon: Bind mount failed:
+'/volume1/docker/crawler/browser_data' does not exist
+```
+
+所以群晖专用 compose 用 **named volumes**（`mc-logs` / `mc-data` /
+`mc-browser-data`），由 Docker 自动创建，不需要预先建任何目录。两个服务共用
+同一份卷（logs 是跨进程日志桥、browser_data 是登录态），不能各建一份。
+`docker compose down` 不会删数据，只有 `down -v` 会。
+
+想在 File Station 里直接看文件，就先建目录再换回 bind mount：
+
+```bash
+mkdir -p /volume1/docker/crawler/{logs,data,browser_data}
+# 然后把 compose 里的 mc-logs 换回 ./logs（另外两个同理）
+```
+
 #### 群晖 Docker GUI 单独起两个容器（不用 compose）时必改
 
 compose 里的 `http://crawler:8001` 依赖 compose 服务名，GUI 起容器时不存在：
