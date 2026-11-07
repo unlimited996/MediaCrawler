@@ -64,6 +64,10 @@ services:
       # 容器里没有本地浏览器，必须关掉，改用镜像自带的 headless chromium。
       XHS_ENABLE_CDP_MODE: "false"
       XHS_CDP_CONNECT_EXISTING: "false"
+      # ---- 可选：改为连你电脑上开着的 Chrome（CDP，反检测更好）----
+      # 把上面两项改成 "true"，再加一行 CDP_HOST: "<你电脑的局域网IP>"；
+      # Chrome 启动参数、防火墙、风险见 docs/DEPLOY_SPLIT.md「容器连本地 Chrome」。
+      # 注意：电脑关机/睡眠/Chrome 没开时，定时任务会直接失败。
       TZ: Asia/Shanghai
     volumes:
       - mc-logs:/app/logs

@@ -32,6 +32,16 @@ from tools.browser_launcher import BrowserLauncher
 from tools import utils
 
 
+def _cdp_host() -> str:
+    """CDP 浏览器所在主机；默认 localhost（本机开发）。
+
+    容器部署时 cdp_browser 原本把 localhost 写死在 3 处，容器里的
+    localhost 是容器自己，所以永远连不到宿主机/局域网里另一台电脑上的
+    Chrome。用 CDP_HOST 环境变量即可把目标指过去。
+    """
+    return str(getattr(config, "CDP_HOST", "localhost") or "localhost")
+
+
 class CDPBrowserManager:
     """
     CDP browser manager, responsible for launching and managing browsers connected via CDP
@@ -173,7 +183,8 @@ class CDPBrowserManager:
         """
         self.debug_port = config.CDP_DEBUG_PORT
         utils.logger.info(
-            f"[CDPBrowserManager] Connecting to existing browser on port {self.debug_port}..."
+            f"[CDPBrowserManager] Connecting to existing browser "
+            f"at {_cdp_host()}:{self.debug_port}..."
         )
         utils.logger.info(
             "[CDPBrowserManager] Make sure remote debugging is enabled in your browser: "
@@ -255,7 +266,7 @@ class CDPBrowserManager:
             # Simple socket connection test
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(5)
-                result = s.connect_ex(("localhost", debug_port))
+                result = s.connect_ex((_cdp_host(), debug_port))
                 if result == 0:
                     utils.logger.info(
                         f"[CDPBrowserManager] CDP port {debug_port} is accessible"
@@ -315,12 +326,20 @@ class CDPBrowserManager:
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
-                    f"http://localhost:{debug_port}/json/version", timeout=10
+                    f"http://{_cdp_host()}:{debug_port}/json/version", timeout=10
                 )
                 if response.status_code == 200:
                     data = response.json()
                     ws_url = data.get("webSocketDebuggerUrl")
                     if ws_url:
+                        # Chrome 自己回报的地址通常是 ws://localhost:9222/...，
+                        # 在容器里会解析到容器自身；替换成 CDP_HOST 才行。
+                        from urllib.parse import urlparse, urlunparse
+                        u = urlparse(ws_url)
+                        host = _cdp_host()
+                        if u.hostname in ("localhost", "127.0.0.1", "::1"):
+                            ws_url = urlunparse(u._replace(
+                                netloc=f"{host}:{u.port or debug_port}"))
                         utils.logger.info(
                             f"[CDPBrowserManager] Got browser WebSocket URL: {ws_url}"
                         )
@@ -341,7 +360,7 @@ class CDPBrowserManager:
             if self.connect_existing:
                 # Existing browser remote debugging in Chrome 136+ does not expose
                 # /json/version. Connect directly and wait for user confirmation.
-                ws_url = f"ws://localhost:{self.debug_port}/devtools/browser"
+                ws_url = f"ws://{_cdp_host()}:{self.debug_port}/devtools/browser"
                 utils.logger.info(f"[CDPBrowserManager] Connecting to existing browser via CDP: {ws_url}")
                 utils.logger.info(
                     "[CDPBrowserManager] Please check your browser for a confirmation dialog and accept it"

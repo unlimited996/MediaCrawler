@@ -112,6 +112,12 @@ ENABLE_CDP_MODE = False
 # 如果端口被占用，系统会自动尝试下一个可用端口
 CDP_DEBUG_PORT = 9222
 
+# CDP 浏览器所在的主机。默认 localhost = 本机开发（连这台机器上开的 Chrome）。
+# 容器里想连局域网/宿主机另一台电脑上的 Chrome 时，把它设成那台机器的 IP，
+# 例如 CDP_HOST=192.168.10.50；容器里的 localhost 指的是容器自己，
+# 不设的话永远连不到外部浏览器。
+CDP_HOST = _env_str("CDP_HOST", "localhost")
+
 # 自定义浏览器路径（可选）
 # 如果为空，系统会自动检测 Chrome/Edge 的安装路径
 # Windows 示例: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"

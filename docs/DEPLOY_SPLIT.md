@@ -563,6 +563,62 @@ HEADLESS: "true"
 > ⚠️ 配置页里的 `enable_cdp_mode` 映射到 `config.ENABLE_CDP_MODE`，
 > 对小红书**不生效**（xhs 读的是 `XHS_*`）。容器部署请以环境变量为准。
 
+#### 容器连本地 Chrome（CDP，可选）
+
+**能做**，但原来不行：`tools/cdp_browser.py` 把目标地址写死成 `localhost`，
+容器里的 localhost 是容器自己。现在改成读 `CDP_HOST`（默认 `localhost`），
+socket 探测、`/json/version`、WebSocket 直连三处都走这个地址，并且会把
+Chrome 回报的 `ws://localhost:9222/...` 里的 host 一并替换掉。
+
+##### 1) 你电脑上启动一个带调试端口的 Chrome
+
+先**退出所有 Chrome 进程**（Chrome 单实例：已有进程在跑时新参数会被忽略），
+然后用独立 profile 启动（Windows CMD）：
+
+```bat
+"C://Program Files//Google//Chrome//Application//chrome.exe" ^
+  --remote-debugging-port=9222 ^
+  --remote-debugging-address=0.0.0.0 ^
+  --remote-allow-origins=* ^
+  --user-data-dir=D://chrome-debug-profile
+```
+
+四个参数都不能省：`0.0.0.0` 让容器能连（默认只听 127.0.0.1）、
+`--remote-allow-origins=*` 应对 Chrome 111+ 的 WebSocket Origin 校验、
+独立 `--user-data-dir` 是 Chrome 136+ 对默认 profile 开调试端口的限制。
+
+验证：本机打开 `http://127.0.0.1:9222/json/version` 应看到 JSON；
+再在群晖容器里 `curl http://<你电脑IP>:9222/json/version` 也能拿到。
+Windows 防火墙需要放行 **TCP 9222 入站**（建议把来源限制成群晖的 IP）。
+
+##### 2) 群晖 compose 的 crawler 服务改成
+
+```yaml
+XHS_ENABLE_CDP_MODE: "true"
+XHS_CDP_CONNECT_EXISTING: "true"
+CDP_HOST: "192.168.10.50"     # 换成你电脑的局域网 IP
+CDP_DEBUG_PORT: "9222"
+```
+
+然后 `docker compose up -d crawler`。日志应从
+`CDP port 9222 is not accessible` 变成
+`Connecting to existing browser at 192.168.10.50:9222...` →
+`Successfully connected to browser`。
+
+##### 3) 代价与风险（务必看）
+
+- **定时任务不适合**：你的电脑关机、睡眠、Chrome 没开、或者换了 IP，
+  到点的抓取任务会全部失败。无人值守请保持默认的
+  `XHS_ENABLE_CDP_MODE=false`（走容器内 headless chromium）。
+  这个模式适合**手动抓一轮 / 调试 / 过验证码**。
+- **安全**：9222 是完全控制浏览器的端口，同网段任何设备都能读你的
+  Cookie、以你的身份发请求。只在需要时开，用完关掉调试 Chrome，
+  防火墙来源限制到群晖 IP。
+- **登录态来源变了**：CDP 用的是你 Chrome 那个 profile 的登录态，
+  不再用容器 `mc-browser-data` 卷里的；两边不共享。
+- 网络要求：群晖容器（Docker bridge，172.x）要能路由到你电脑的
+  192.168.10.x，且中间没有 AP 隔离 / 访客网络隔离。
+
 #### 群晖 Docker GUI 单独起两个容器（不用 compose）时必改
 
 compose 里的 `http://crawler:8001` 依赖 compose 服务名，GUI 起容器时不存在：
