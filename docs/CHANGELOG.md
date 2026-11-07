@@ -5,6 +5,24 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-07] CDP 目标地址可配置（容器可连局域网里的 Chrome）
+
+`tools/cdp_browser.py` 原来把目标写死成 `localhost`（socket 探测、
+`/json/version`、WebSocket 直连共 3 处），容器里的 localhost 是容器自己，
+所以无法连接宿主机/另一台电脑上开了远程调试的 Chrome。
+
+- 新增 `CDP_HOST`（`config/base_config.py`，默认 `localhost`，
+  本机开发行为不变）；三处地址统一改走 `_cdp_host()`。
+- Chrome 回报的 `webSocketDebuggerUrl` 里若含 localhost/127.0.0.1，
+  自动替换成 `CDP_HOST`，否则容器会连回自己。
+- 日志提示带上目标 host，便于排查。
+- 群晖 compose 默认仍 `XHS_ENABLE_CDP_MODE=false`（无人值守定时任务
+  不依赖用户电脑开机）；文档新增「容器连本地 Chrome」一节的启动参数、
+  防火墙要求、安全风险与适用场景。
+
+实测（新镜像）：默认 `CDP_HOST=localhost`；设 `CDP_HOST=192.168.10.50`
+后 `_cdp_host()` 正确返回该 IP；`main.py --help` 与默认关闭 CDP 的行为不变。
+
 ## [2026-11-07] 容器抓取卡在 CDP 9222：补上小红书平台专属开关
 
 `ENABLE_CDP_MODE`（base_config）默认 False，但 `XHS_ENABLE_CDP_MODE`
