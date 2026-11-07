@@ -12,8 +12,8 @@
                       浏览器 / 调用方
                             │
         ┌───────────────────┴────────────────────┐
-        │  http://host:8081/crawler/api/...      │  ← 服务名在 URL 里
-        │  http://host:8081/library/api/...      │
+        │  http://host:18081/crawler/api/...      │  ← 服务名在 URL 里
+        │  http://host:18081/library/api/...      │
         ▼
 ┌──────────────────────────────────────────────┐
 │ library 内容库服务（8081）                     │
@@ -422,14 +422,14 @@ docker compose -f docker-compose.split.yml --env-file deploy/.env up -d
 
 # 3) 看状态
 docker compose -f docker-compose.split.yml ps
-curl -fsS http://127.0.0.1:8081/library/health
-curl -fsS http://127.0.0.1:8081/crawler/health
+curl -fsS http://127.0.0.1:18081/library/health
+curl -fsS http://127.0.0.1:18081/crawler/health
 
 # 4) 看日志
 docker compose -f docker-compose.split.yml logs -f --tail=100
 ```
 
-浏览器打开 `http://<服务器>:8081/` 即可。
+浏览器打开 `http://<服务器>:18081/` 即可。
 
 ### 5.1 挂载出来的是什么（排障核心）
 
@@ -477,14 +477,15 @@ docker compose -f docker-compose.split.yml up -d --no-deps crawler  # 只换 cra
 > **library 服务内置的网关**去查这个地址簿，再把请求转发给 crawler。
 > 业务流量不经过 Nacos。
 
-**统一入口是 library 的 8081**（compose 里 `ports: "${LIBRARY_PORT:-8081}:8081"`，
-crawler 不对外暴露）：
+**统一入口是 library**（宿主 `18081` → 容器 `8081`，
+compose 里 `ports: "${LIBRARY_PORT:-18081}:8081"`）。crawler 另外映射了
+宿主 `18001` → 容器 `8001`，只在直连调试时用；正常访问全部走 library 网关：
 
 | 想调的服务 | 正确 URL |
 |---|---|
-| crawler 抓取状态（经网关转发） | `http://www.joyeuse.cn:8081/crawler/api/crawler/status` |
-| library 数据列表（本地处理） | `http://www.joyeuse.cn:8081/library/api/stories?sort=publish&page=1&page_size=20` |
-| 前端页面 | `http://www.joyeuse.cn:8081/` |
+| crawler 抓取状态（经网关转发） | `http://www.joyeuse.cn:18081/crawler/api/crawler/status` |
+| library 数据列表（本地处理） | `http://www.joyeuse.cn:18081/library/api/stories?sort=publish&page=1&page_size=20` |
+| 前端页面 | `http://www.joyeuse.cn:18081/` |
 
 `sort=publish`（发布时间倒序）是合法值，另外还支持 `heat` / `time` / `like` / `comment`。
 
@@ -494,7 +495,7 @@ crawler 不对外暴露）：
 
 ```
 来源： http://www.joyeuse.cn/          （80 / 443）
-目标： http://<群晖内网IP>:8081/
+目标： http://<群晖内网IP>:18081/
 ```
 
 之后即可用 `http://www.joyeuse.cn/crawler/api/crawler/status` 与
@@ -554,11 +555,11 @@ worker 有文件锁（`logs/.worker.lock`），多起不会重复执行；跨主
 
 | 现象 | 先看什么 |
 |---|---|
-| 页面打开空白 / 404 | `library` 容器是否起了；`curl :8081/` 是否 200 |
-| `/crawler/api/**` 返回 503 | 网关没发现实例：`curl :8081/gateway/status`；看 `NACOS_SERVER`（要 9000 不是 8085）与 `CRAWLER_BASE_URL` |
+| 页面打开空白 / 404 | `library` 容器是否起了；`curl :18081/` 是否 200 |
+| `/crawler/api/**` 返回 503 | 网关没发现实例：`curl :18081/gateway/status`；看 `NACOS_SERVER`（要 9000 不是 8085）与 `CRAWLER_BASE_URL` |
 | `/crawler/api/**` 返回 502 | Nacos 里有实例但连不上：多半是 `SERVICE_IP` 注册成了不可达 IP（本地开发设成 `127.0.0.1`） |
 | 接口 500 | `logs/library.console.log` 尾部 traceback |
-| 抓取不动 | `logs/worker.console.log`、`logs/worker.out.log`；`curl :8081/crawler/health` 看 `worker_alive` |
+| 抓取不动 | `logs/worker.console.log`、`logs/worker.out.log`；`curl :18081/crawler/health` 看 `worker_alive` |
 | 定时任务一直 `queued` | worker 不在线（`worker_alive=false`）或 `SCHEDULER_ENABLED=0` |
 | Nacos 里看不到实例 | 容器网络到 **9000**（OpenAPI）不通；`SERVICE_IP` 手工指定时要填对端可达 IP |
 | 想改配置但不想改库 | 改 `deploy/.env` 后 `up -d`（启动类参数），页面可调的参数在「配置管理」里 |

@@ -8,10 +8,10 @@
 # 只拉远端镜像、不本地构建：
 #   docker compose -f docker-compose.split.yml pull
 #
-# 对外只有一个端口：library 的 8081
-#   http://host:8081/                 前端
-#   http://host:8081/library/api/**   内容库（帖子/评论/媒体/标签/菜谱/导出/S3）
-#   http://host:8081/crawler/api/**   抓取（按服务名转发给 crawler 容器）
+# 对外端口：library 18081（唯一入口）/ crawler 18001（可选直连调试）
+#   http://host:18081/                 前端
+#   http://host:18081/library/api/**   内容库（帖子/评论/媒体/标签/菜谱/导出/S3）
+#   http://host:18081/crawler/api/**   抓取（按服务名转发给 crawler 容器）
 #
 # 两个容器都从同一批镜像仓库拉取，日志与环境变量文件全部挂到宿主机：
 #   ./logs/          应用日志（worker.out.log / *.console.log / scheduler_live.jsonl）
@@ -54,9 +54,9 @@ services:
       - ./browser_data:/app/browser_data
       - ./database:/app/database
       - ./deploy:/app/deploy:ro
-    # 只在内网暴露给 library 容器；如需直连调试再打开
-    # ports:
-    #   - "8001:8001"
+    ports:
+      # 直连调试用；正常访问走 library 的网关即可
+      - "${CRAWLER_PORT:-18001}:8001"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/crawler/health"]
       interval: 30s
@@ -102,7 +102,7 @@ services:
       - ./database:/app/database
       - ./deploy:/app/deploy:ro
     ports:
-      - "${LIBRARY_PORT:-8081}:8081"
+      - "${LIBRARY_PORT:-18081}:8081"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/library/health"]
       interval: 30s

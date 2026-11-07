@@ -1,4 +1,6 @@
 # =============================================================================
+# 端口：宿主 18081 -> library 容器 8081（前端/网关，唯一入口）
+#       宿主 18001 -> crawler 容器 8001（可选直连调试）
 # 群晖 Container Manager 专用（只拉镜像、不构建；连接群晖本机已有的 PostgreSQL）
 #
 # 与 docker-compose.split.yml 的区别：
@@ -58,7 +60,9 @@ services:
       - ./logs:/app/logs
       - ./data:/app/data
       - ./browser_data:/app/browser_data
-    # 不对宿主机暴露，只给 library 容器访问
+    ports:
+      # 容器 8001 -> 宿主 18001（可选：直连调试 crawler 用）
+      - "18001:8001"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/crawler/health"]
       interval: 30s
@@ -103,8 +107,8 @@ services:
       - ./data:/app/data
       - ./browser_data:/app/browser_data
     ports:
-      # 群晖 8081 被占用就改左边，例如 "18081:8081"
-      - "8081:8081"
+      # 容器 8081 -> 宿主 18081（前端 + 网关，对外唯一入口）
+      - "18081:8081"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/library/health"]
       interval: 30s
