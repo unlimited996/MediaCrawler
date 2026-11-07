@@ -5,6 +5,41 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-07] 修复容器执行抓取报 `ModuleNotFoundError: No module named 'cache'`
+
+### 根因
+`.dockerignore` 里有一行裸 `cache`，本意是排除运行时缓存，但项目根目录的
+`cache/` 是**Python 源码包**（`abs_cache.py` / `cache_factory.py` /
+`local_cache.py` / `redis_cache.py`），被 `proxy/base_proxy.py`、各平台登录、
+短信等 8 处引用。于是 `crawler` 镜像里缺整个包：
+
+```
+main.py -> media_platform.bilibili -> proxy.proxy_ip_pool -> proxy.base_proxy
+        -> from cache.abs_cache import AbstractCache  => ModuleNotFoundError
+```
+
+容器能起、health 200（API 进程不加载平台模块），但一执行定时任务抓取就崩，
+worker 按策略 60s 重试仍然失败。镜像内实测只有 `cache: MISSING`，其它模块齐全。
+
+### 修复
+- `.dockerignore`：删掉裸 `cache`，改为 `.cache` / `**/.cache` / `**/*.cache`，
+  并写明「根目录 cache/ 是源码包，禁止排除」。
+- `api/routers/env.py`：把 `cache` 加入 `_COMMON_MODULES` 自检，
+  以后再出现打包遗漏，`/library/api/env/check` 与 `/crawler/api/env/check`
+  会直接报「缺少依赖：cache」，不用等抓取才暴露。
+
+### 验证（重建后的 crawler 镜像）
+```
+/app/cache/ 五个 .py 齐全
+python main.py --help                     正常（完整 import 链）
+from media_platform.bilibili import BilibiliCrawler
+from proxy.base_proxy import *
+import cache.abs_cache                    -> IMPORT_OK
+```
+
+> 部署注意：镜像 tag 是 `latest`，群晖上必须显式 `docker compose pull crawler`
+> 才会拿到新镜像，只 `up -d` 不会自动更新。
+
 ## [2026-11-06] 控制台配色修复 + 执行记录提速 + 管理功能迁 library + 按需构建 + 配置入库
 
 ### 修复：系统控制台「文字消失」
