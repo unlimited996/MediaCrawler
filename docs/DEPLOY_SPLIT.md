@@ -509,6 +509,11 @@ compose 里 `ports: "${LIBRARY_PORT:-18081}:8081"`）。crawler 另外映射了
 
 用 `deploy/synology/docker-compose.prefilled.yml`（已填好群晖本机 PostgreSQL），
 或仓库里的无密码模板 `deploy/synology/docker-compose.yml`。
+> ⚠️ **`POSTGRES_DB_NAME` 必须是实际存数据的库名**（本项目是 `imdb`，不是
+> `postgres` 默认库）。填错的表现很有迷惑性：容器正常启动、健康检查 200、
+> 配置页也有数据，但**帖子/评论全空** —— 因为连到了另一套刚建好的空表。
+> 换库名后要 `docker compose up -d` 重建容器才生效。
+
 
 **群晖 DSM 的 Docker 不会自动创建 bind mount 的宿主目录**（Linux Docker 上会）。
 直接写 `./logs:/app/logs` 会报：

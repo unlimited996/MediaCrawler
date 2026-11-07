@@ -1,4 +1,6 @@
 # =============================================================================
+# 数据库：192.168.10.38:4321 / im / **imdb**（不是默认的 postgres，
+#         项目数据都在 imdb 库里；改库名后需 up -d 重建容器）
 # 端口：宿主 18081 -> library 容器 8081（前端/网关，唯一入口）
 #       宿主 18001 -> crawler 容器 8001（可选直连调试）
 # 群晖 Container Manager 专用（只拉镜像、不构建；连接群晖本机已有的 PostgreSQL）
@@ -46,7 +48,7 @@ services:
       POSTGRES_DB_PORT: "4321"
       POSTGRES_DB_USER: im
       POSTGRES_DB_PWD: ${MC_DB_PASSWORD:?请在群晖项目环境变量里设置 MC_DB_PASSWORD}
-      POSTGRES_DB_NAME: postgres
+      POSTGRES_DB_NAME: imdb
       # ---- 服务互联：群晖没有 Nacos，必须关掉，否则每次发现都会先超时 ----
       NACOS_ENABLED: "0"
       CRAWLER_SERVICE_NAME: mediacrawler-crawler
@@ -91,7 +93,7 @@ services:
       POSTGRES_DB_PORT: "4321"
       POSTGRES_DB_USER: im
       POSTGRES_DB_PWD: ${MC_DB_PASSWORD:?请在群晖项目环境变量里设置 MC_DB_PASSWORD}
-      POSTGRES_DB_NAME: postgres
+      POSTGRES_DB_NAME: imdb
       # ---- 服务互联 ----
       NACOS_ENABLED: "0"
       CRAWLER_SERVICE_NAME: mediacrawler-crawler
