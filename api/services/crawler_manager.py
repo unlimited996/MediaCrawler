@@ -28,6 +28,10 @@ from ..schemas import CrawlerStartRequest, LogEntry, LoginTypeEnum
 from .crawl_queue import crawl_queue
 from tools.cst import cst_now
 
+#: worker 写实时日志的位置。compose 把 ./logs 同时挂给 crawler 和 library，
+#: 所以两个进程看到的是同一个文件；worker 拉起的子进程日志（含 [QRCODE]）在这里。
+LIVE_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "scheduler_live.jsonl"
+
 
 class CrawlerManager:
     """Crawler process manager
@@ -509,19 +513,70 @@ class CrawlerManager:
             "queue_running": stats.get("running", 0),
         }
 
+    @staticmethod
+    def _qr_fresh(qr: Optional[Dict[str, Any]]) -> bool:
+        """二维码 5 分钟内有效。"""
+        if not qr:
+            return False
+        try:
+            from datetime import timedelta
+
+            from tools.cst import CST
+            at = datetime.fromisoformat(qr.get("at") or "")
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=CST)
+            return cst_now() - at <= timedelta(minutes=5)
+        except Exception:
+            return False
+
     def get_qrcode(self) -> Optional[Dict[str, Any]]:
-        """取当前等待扫码的二维码（5 分钟内有效，过期返回 None）。"""
-        if not self.qr_code:
+        """取当前等待扫码的二维码（5 分钟内有效，过期返回 None）。
+
+        **worker 模式的关键回退**：抓取子进程是由 worker 拉起的，它的 stdout
+        不经过 API 进程，二维码只写进挂载共享的 logs/scheduler_live.jsonl。
+        只看 self.qr_code 的话，WebUI 的二维码浮窗永远拿到 {"qr": null}。
+        """
+        if self._qr_fresh(self.qr_code):
+            return self.qr_code
+        live = self._qrcode_from_live_log()
+        return live if self._qr_fresh(live) else None
+
+    def _qrcode_from_live_log(self) -> Optional[Dict[str, Any]]:
+        """从 worker 实时日志（JSONL，每行含 at/msg）里取最近一条 [QRCODE]。"""
+        import json
+
+        if not LIVE_LOG_PATH.exists():
             return None
         try:
-            from datetime import datetime, timedelta
-            from tools.cst import CST
-            at = datetime.fromisoformat(self.qr_code.get("at") or "")
-            if datetime.now(CST) - at > timedelta(minutes=5):
-                return None
+            lines = LIVE_LOG_PATH.read_text(
+                encoding="utf-8", errors="replace").splitlines()[-800:]
         except Exception:
             return None
-        return self.qr_code
+
+        for raw in reversed(lines):
+            if "[QRCODE]" not in raw:
+                continue
+            msg, at = raw, ""
+            try:
+                obj = json.loads(raw)
+                msg, at = str(obj.get("msg") or ""), str(obj.get("at") or "")
+            except Exception:
+                pass
+            idx = msg.find("[QRCODE]")
+            if idx < 0:
+                continue
+            image = msg[idx + len("[QRCODE]"):].strip()
+            if not image.startswith("data:image"):
+                continue
+            # 日志里的 at 形如 "2026-11-07 09:46:18"（无时区），补上 CST
+            try:
+                from tools.cst import CST
+                dt = datetime.strptime(at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST)
+                at_iso = dt.isoformat()
+            except Exception:
+                at_iso = cst_now().isoformat()
+            return {"image": image, "at": at_iso}
+        return None
 
     async def _get_pool_cookie(self, platform: str) -> Optional[str]:
         """从账号池取该平台的活跃登录态（解密后的 cookie 串）。
