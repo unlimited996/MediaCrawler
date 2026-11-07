@@ -535,6 +535,34 @@ mkdir -p /volume1/docker/crawler/{logs,data,browser_data}
 # 然后把 compose 里的 mc-logs 换回 ./logs（另外两个同理）
 ```
 
+#### 容器里必须关掉小红书 CDP 模式
+
+`config/base_config.py` 的 `ENABLE_CDP_MODE = False`，但小红书有**平台专属**
+开关 `XHS_ENABLE_CDP_MODE`，默认 `True`，且 `media_platform/xhs/core.py`
+优先读它。这个模式是给本机开发用的：连你电脑上开了远程调试的
+Chrome/Edge（端口 9222），复用登录态、反检测更好。
+
+容器里没有本地浏览器，于是日志会一直刷：
+
+```
+[XiaoHongShuCrawler] Launching browser using CDP mode
+[CDPBrowserManager] CDP port 9222 is not accessible   （每秒一条，等 60s 后失败）
+```
+
+群晖专用 compose 已在 crawler 服务里显式设：
+
+```yaml
+XHS_ENABLE_CDP_MODE: "false"
+XHS_CDP_CONNECT_EXISTING: "false"
+HEADLESS: "true"
+```
+
+关掉后走镜像自带的 headless chromium。扫码登录仍然可用：二维码通过
+`[QRCODE]` 日志行推给 WebUI，前端轮询展示，不需要容器里有图形界面。
+
+> ⚠️ 配置页里的 `enable_cdp_mode` 映射到 `config.ENABLE_CDP_MODE`，
+> 对小红书**不生效**（xhs 读的是 `XHS_*`）。容器部署请以环境变量为准。
+
 #### 群晖 Docker GUI 单独起两个容器（不用 compose）时必改
 
 compose 里的 `http://crawler:8001` 依赖 compose 服务名，GUI 起容器时不存在：
@@ -589,6 +617,7 @@ worker 有文件锁（`logs/.worker.lock`），多起不会重复执行；跨主
 | `/crawler/api/**` 返回 503 | 网关没发现实例：`curl :18081/gateway/status`；看 `NACOS_SERVER`（要 9000 不是 8085）与 `CRAWLER_BASE_URL` |
 | `/crawler/api/**` 返回 502 | Nacos 里有实例但连不上：多半是 `SERVICE_IP` 注册成了不可达 IP（本地开发设成 `127.0.0.1`） |
 | 接口 500 | `logs/library.console.log` 尾部 traceback |
+| 刷 `CDP port 9222 is not accessible` | crawler 没设 `XHS_ENABLE_CDP_MODE=false`（见上一节） |
 | 抓取不动 | `logs/worker.console.log`、`logs/worker.out.log`；`curl :18081/crawler/health` 看 `worker_alive` |
 | 定时任务一直 `queued` | worker 不在线（`worker_alive=false`）或 `SCHEDULER_ENABLED=0` |
 | Nacos 里看不到实例 | 容器网络到 **9000**（OpenAPI）不通；`SERVICE_IP` 手工指定时要填对端可达 IP |

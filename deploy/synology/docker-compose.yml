@@ -60,6 +60,10 @@ services:
       SCHEDULER_ENABLED: "1"
       SCHEDULER_IN_API: "0"
       HEADLESS: "true"
+      # 小红书默认走 CDP（连本机 Chrome:9222），那是本机开发模式；
+      # 容器里没有本地浏览器，必须关掉，改用镜像自带的 headless chromium。
+      XHS_ENABLE_CDP_MODE: "false"
+      XHS_CDP_CONNECT_EXISTING: "false"
       TZ: Asia/Shanghai
     volumes:
       - mc-logs:/app/logs

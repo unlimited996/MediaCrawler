@@ -5,6 +5,22 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-07] 容器抓取卡在 CDP 9222：补上小红书平台专属开关
+
+`ENABLE_CDP_MODE`（base_config）默认 False，但 `XHS_ENABLE_CDP_MODE`
+（xhs_config）默认 **True**，`media_platform/xhs/core.py` 又优先读后者。
+该模式为本地开发设计（连本机 Chrome:9222 复用登录态），容器里没有本地浏览器，
+于是每秒刷 `CDP port 9222 is not accessible`、等 60s 后任务失败。
+
+- 群晖 compose 的 crawler 服务新增 `XHS_ENABLE_CDP_MODE: "false"` /
+  `XHS_CDP_CONNECT_EXISTING: "false"`，配合 `HEADLESS: "true"` 走镜像自带
+  headless chromium；扫码登录由 `[QRCODE]` 日志推给 WebUI，不依赖 GUI。
+- `deploy/.env.example` 同步加注释说明「容器部署必须为 false」。
+- 实测：旧默认 `use_cdp=True`；加变量后 `use_cdp=False`，容器内
+  `chromium.launch()` 渲染正常。
+- 已知限制：配置页 `enable_cdp_mode` 映射到 `config.ENABLE_CDP_MODE`，
+  对小红书不生效（xhs 读 `XHS_*`），容器请以环境变量为准。
+
 ## [2026-11-07] 修复容器执行抓取报 `ModuleNotFoundError: No module named 'cache'`
 
 ### 根因
