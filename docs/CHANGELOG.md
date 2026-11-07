@@ -5,6 +5,33 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-07] 修复 worker 模式下 WebUI 看不到扫码登录二维码
+
+### 背景
+容器首次跑抓取时未登录，日志会输出 `[QRCODE]data:image/png;base64,...`，
+前端 `LoginQrcodeFab` 每 2 秒轮询 `/crawler/qrcode` 把它渲染成图片。
+
+### 断点
+`CrawlerManager` 只从**自己拉起的子进程 stdout** 解析 `[QRCODE]` 存进
+`self.qr_code`。但拆分部署后抓取子进程由 **worker** 拉起，stdout 不经过
+crawler API 进程，二维码只落在挂载共享的
+`logs/scheduler_live.jsonl`（JSONL，每行 at/level/msg）。
+于是 `/crawler/qrcode` 恒返回 `{"qr": null}`，WebUI 浮窗永远不出现，
+用户只能对着日志里一大串 base64 干等 120 秒超时。
+
+### 修复
+`get_qrcode()` 增加日志回退：
+- `self.qr_code` 不新鲜时，倒序扫 `scheduler_live.jsonl` 最近 800 行取最新
+  一条 `[QRCODE]`，解析出 data URL
+- 日志里的 `at`（无时区）补上 CST 后做 5 分钟有效期判断，取最新、判过期
+- 本地模式（API 自己拉起子进程）行为不变，优先用内存里的二维码
+- 日志路径抽成模块级 `LIVE_LOG_PATH`，便于测试
+
+### 验证
+本地：新码返回、多行取最新、过期返回 None、无码返回 None。
+镜像内端到端：`GET /crawler/api/crawler/qrcode` → 200，
+`qr = data:image/png;base64,TEST_QR_FROM_WORKER`（来自模拟的 worker 日志）。
+
 ## [2026-11-07] 修复 `launch_persistent_context` 找不到 Chromium 可执行文件
 
 ### 现象
