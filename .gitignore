@@ -201,3 +201,6 @@ deploy/.env
 
 # 服务器构建状态（记录上次构建的 commit，用于按需构建）
 .build-state.json
+
+# 含明文数据库密码的群晖本地配置，绝不入库
+deploy/synology/docker-compose.prefilled.yml

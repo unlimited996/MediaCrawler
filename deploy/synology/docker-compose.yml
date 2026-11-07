@@ -1,57 +1,47 @@
 # =============================================================================
-# 群晖 Container Manager 专用（只拉镜像、不构建）
+# 群晖 Container Manager 专用（只拉镜像、不构建；连接群晖本机已有的 PostgreSQL）
 #
 # 与 docker-compose.split.yml 的区别：
 #   * 去掉 build: 段和 deploy/.env 依赖 —— 群晖不需要源码，导入即可运行
 #   * 不挂载 ./database —— 那是**代码目录**（db_session.py/models_v2.py），
 #     挂一个空目录进去会把代码覆盖掉，容器直接起不来（服务器部署踩过）
 #   * 不挂载 ./deploy —— 配置全部写在 environment 里
+#   * 不启动 PostgreSQL 容器 —— 直接用宿主机上已有的库（192.168.10.38:4321）
 #   * 关掉 Nacos，用容器内网 DNS 静态互联（compose 内部 crawler:8001 可解析）
-#   * 自带一个 PostgreSQL；已有外部库的话删掉 postgres 服务并改下面 5 个
-#     POSTGRES_DB_* 变量即可
 #
-# 用法：Container Manager -> 项目 -> 新增 -> 上传本文件（改好密码）
-#      -> 启动后**必须执行一次建表**，见下方 README 里的说明。
+# ⚠️ 本文件会提交到公开仓库，所以**不含明文密码**。
+#    上传前请在 Container Manager 项目的「环境变量」里加一条：
+#        MC_DB_PASSWORD = 你的数据库密码
+#    或者直接把下面 ${MC_DB_PASSWORD:?...} 整段替换成明文（别把改后的文件传 git）。
+#
+# 启动后**必须执行一次建表**（容器不会自动建表）：
+#    docker exec mediacrawler-library python -m database.init_v2 postgres
+#
+# ⚠️ 宿主机 PostgreSQL 需要允许来自 Docker 网桥的连接：
+#    listen_addresses 要包含 192.168.10.38（或 *）
+#    pg_hba.conf 里放行容器网段（群晖通常是 172.16.0.0/12），例如：
+#        host  all  im  172.16.0.0/12  scram-sha-256
+#    群晖防火墙也要放行 4321。
 # =============================================================================
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: mediacrawler-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: mc
-      # 改成你自己的强密码；也可以在项目「环境变量」里设 MC_DB_PASSWORD
-      POSTGRES_PASSWORD: ${MC_DB_PASSWORD:-ChangeMe_2026}
-      POSTGRES_DB: mediacrawler
-      TZ: Asia/Shanghai
-    volumes:
-      - ./pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mc -d mediacrawler"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
   crawler:
     image: ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
     container_name: mediacrawler-crawler
     restart: unless-stopped
-    depends_on:
-      - postgres
     environment:
       APP_ROLE: crawler
       SERVICE_NAME: mediacrawler-crawler
       SERVICE_PORT: "8001"
       PORT: "8001"
       WORKER_ENABLED: "1"
-      # ---- 数据库（v2 数据层 + 配置表都用它）----
+      # ---- 群晖本机已有的 PostgreSQL ----
       CONFIG_DB_TYPE: postgres
-      POSTGRES_DB_HOST: postgres
-      POSTGRES_DB_PORT: "5432"
-      POSTGRES_DB_USER: mc
-      POSTGRES_DB_PWD: ${MC_DB_PASSWORD:-ChangeMe_2026}
-      POSTGRES_DB_NAME: mediacrawler
+      POSTGRES_DB_HOST: 192.168.10.38
+      POSTGRES_DB_PORT: "4321"
+      POSTGRES_DB_USER: im
+      POSTGRES_DB_PWD: ${MC_DB_PASSWORD:?请在群晖项目环境变量里设置 MC_DB_PASSWORD}
+      POSTGRES_DB_NAME: postgres
       # ---- 服务互联：群晖没有 Nacos，必须关掉，否则每次发现都会先超时 ----
       NACOS_ENABLED: "0"
       CRAWLER_SERVICE_NAME: mediacrawler-crawler
@@ -88,13 +78,13 @@ services:
       SERVICE_PORT: "8081"
       PORT: "8081"
       WORKER_ENABLED: "0"
-      # ---- 数据库 ----
+      # ---- 群晖本机已有的 PostgreSQL ----
       CONFIG_DB_TYPE: postgres
-      POSTGRES_DB_HOST: postgres
-      POSTGRES_DB_PORT: "5432"
-      POSTGRES_DB_USER: mc
-      POSTGRES_DB_PWD: ${MC_DB_PASSWORD:-ChangeMe_2026}
-      POSTGRES_DB_NAME: mediacrawler
+      POSTGRES_DB_HOST: 192.168.10.38
+      POSTGRES_DB_PORT: "4321"
+      POSTGRES_DB_USER: im
+      POSTGRES_DB_PWD: ${MC_DB_PASSWORD:?请在群晖项目环境变量里设置 MC_DB_PASSWORD}
+      POSTGRES_DB_NAME: postgres
       # ---- 服务互联 ----
       NACOS_ENABLED: "0"
       CRAWLER_SERVICE_NAME: mediacrawler-crawler
