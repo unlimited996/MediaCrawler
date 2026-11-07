@@ -5,6 +5,37 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-07] 修复 `launch_persistent_context` 找不到 Chromium 可执行文件
+
+### 现象
+容器关掉 CDP 后走标准模式，随即崩：
+`BrowserType.launch_persistent_context: Executable doesn't exist at
+/ms-playwright/chromium-1248/chrome-linux64/chrome`
+
+### 根因
+构建参数为省镜像体积设了 `PLAYWRIGHT_BROWSER=chromium-headless-shell`，
+镜像里只有 `chromium_headless_shell-1248`。但 `SAVE_LOGIN_STATE=True` 时
+`XiaoHongShuCrawler.launch_browser` 用 `launch_persistent_context`，
+Playwright 默认按**完整 chromium** 的路径找可执行文件。
+`tools/crawler_util.chromium_launch_kwargs()` 本是版本回退兜底，却只扫
+`chromium-*` 目录（且漏了新版 `chrome-linux64`），不认识
+`chromium_headless_shell-*`，于是没兜住。
+
+### 修复
+扩展回退候选：识别 `chromium_headless_shell-*/chrome-headless-shell-*`、
+补齐 `chrome-linux64`、用 `rsplit` 正确取两种目录的修订号；同版本时
+完整 chromium 优先（rank +1）。实测 headless shell **可以**跑
+`launch_persistent_context`，因此无需加装 600MB 完整 chromium，
+浏览器层与镜像体积保持不变。
+
+### 验证（重建后镜像内复现完整链路）
+```
+playwright 期望路径: /ms-playwright/chromium-1248/chrome-linux64/chrome（不存在）
+回退选中: /ms-playwright/chromium_headless_shell-1248/.../chrome-headless-shell
+launch_persistent_context OK: ok
+```
+镜像内 `PLAYWRIGHT_NO_SANDBOX=1` 已默认设置，root 运行不会卡在沙箱检查。
+
 ## [2026-11-07] CDP 目标地址可配置（容器可连局域网里的 Chrome）
 
 `tools/cdp_browser.py` 原来把目标写死成 `localhost`（socket 探测、
