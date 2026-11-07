@@ -26,7 +26,9 @@ import config
 router = APIRouter(prefix="/env", tags=["env"])
 
 #: 各服务「必须能 import」的包。缺了就是镜像/依赖装错了。
-_COMMON_MODULES = ("fastapi", "uvicorn", "sqlalchemy", "httpx", "pydantic")
+#: cache 是项目源码包（不是运行时缓存），曾被 .dockerignore 误排除，
+#: 导致容器一跑 main.py 就 ModuleNotFoundError；放进自检里能提前发现。
+_COMMON_MODULES = ("fastapi", "uvicorn", "sqlalchemy", "httpx", "pydantic", "cache")
 _LIBRARY_MODULES = ("asyncpg", "aiofiles", "boto3", "openpyxl", "jieba")
 _CRAWLER_MODULES = ("playwright", "cv2", "execjs", "pandas")
 

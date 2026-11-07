@@ -43,7 +43,13 @@ examples
 logs
 tmp
 .tmp
-cache
+# ⚠️ 项目根目录的 cache/ 是 **Python 源码包**（abs_cache.py / cache_factory.py /
+# local_cache.py / redis_cache.py），proxy、平台登录、短信模块都 import 它。
+# 早期这里写了裸 `cache` 把它排除了，容器一执行 main.py 就报
+# ModuleNotFoundError: No module named 'cache'。只排除真正的运行时缓存目录。
+.cache
+**/.cache
+**/*.cache
 
 # 运行时数据：容器里通过 volume 挂载，保持镜像干净
 browser_data
