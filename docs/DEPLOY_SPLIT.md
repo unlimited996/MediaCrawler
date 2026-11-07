@@ -619,6 +619,47 @@ CDP_DEBUG_PORT: "9222"
 - 网络要求：群晖容器（Docker bridge，172.x）要能路由到你电脑的
   192.168.10.x，且中间没有 AP 隔离 / 访客网络隔离。
 
+#### 登录方式怎么选（扫码 / 短信 / Cookie / 原版页面）
+
+##### 现状（2026-11-07 核对）
+
+| 方式 | 代码 | 容器里可用？ |
+|---|---|---|
+| 扫码 `qrcode` | `login_by_qrcode` | ✅ 二维码经 `[QRCODE]` 日志 → 共享 `scheduler_live.jsonl` → `/crawler/qrcode` → WebUI 右下角浮窗 |
+| 短信 `phone` | `login_by_mobile` | ❌ **死代码**：各平台 `core.py` 把 `login_phone` 硬编码成 `""`；验证码从 `CacheFactory.create_cache(CACHE_TYPE_MEMORY)`（进程内内存缓存）读，没有外部写入入口，等满 120s 必然超时 |
+| Cookie `cookie` | `login_by_cookies` | ✅ 需配合下面的「无浏览器模式」 |
+| 无浏览器模式 | `_browser_required()` | ✅ 配置页 `enable_browser=false` + `cookies` 填入 Cookie，完全不启动浏览器 |
+
+项目里**没有** noVNC / Xvfb / 页面截图推送；容器是 headless chromium，
+`_human_verify` 的「弹出可见浏览器窗口」在容器里不生效。
+
+##### 想「弹出原版小红书登录页」：用已有的 CDP_HOST
+
+上一节「容器连本地 Chrome」已把 CDP 目标地址做成可配置。连上本地 Chrome 后，
+**你电脑上会真的出现一个浏览器窗口**，小红书原版登录弹窗里扫码、
+手机号 + 短信验证码都能直接点 —— 这是目前唯一「原版页面」且零新开发的路径。
+
+但要注意：CDP 用的是你 Chrome 的 profile，登录态**不会**写进容器的
+`mc-browser-data` 卷。所以登录完成后把 Cookie 导出到配置页，让定时任务
+走无浏览器模式：
+
+1. 本地 Chrome 登录小红书，F12 → Application → Cookies，复制完整 Cookie
+   （至少要有 `web_session`）
+2. WebUI 配置页 → 抓取行为 → `cookies` 填入；「浏览器」分组把
+   `enable_browser` 改成 `false`
+3. 群晖 compose 保持 `XHS_ENABLE_CDP_MODE=false`（定时任务不依赖你电脑开机）
+4. 之后抓取直接用 Cookie 发请求，不扫码、不弹页面、不启浏览器
+
+> 这是**无人值守定时任务最稳**的方案：一次配置，长期免登录；Cookie 过期
+> 只需重新贴一次。CDP 只在需要人工过验证码/重新拿 Cookie 时临时开。
+
+##### 如果坚持「在 WebUI 里弹原版页面」
+
+需要新增 noVNC（Xvfb + 有头 chromium + websockify + 前端 iframe），
+代价：镜像 +约 100MB、新增宿主端口映射、改 Dockerfile/compose/前后端、
+重建镜像重新拉取；还要处理登录会话与抓取任务争抢同一个
+`browser_data` profile 锁的互斥。属于独立功能，做之前先确认投入。
+
 #### 群晖 Docker GUI 单独起两个容器（不用 compose）时必改
 
 compose 里的 `http://crawler:8001` 依赖 compose 服务名，GUI 起容器时不存在：
