@@ -358,16 +358,33 @@ def chromium_launch_kwargs(browser_type=None) -> Dict[str, Any]:
             or os.path.join(os.path.expanduser("~"), "AppData", "Local", "ms-playwright"))
     if os.path.isdir(root):
         for name in os.listdir(root):
-            if not name.startswith("chromium-"):
+            is_full = name.startswith("chromium-")
+            is_shell = name.startswith("chromium_headless_shell-")
+            if not (is_full or is_shell):
                 continue
             try:
-                rev = int(name.split("-", 1)[1])
+                # 两种目录都以修订号结尾：chromium-1248 /
+                # chromium_headless_shell-1248，用 rsplit 才都能取到 1248
+                rev = int(name.rsplit("-", 1)[-1])
             except (IndexError, ValueError):
                 rev = 0
             base = os.path.join(root, name)
-            for sub in ("chrome-win", "chrome-win64", "chrome-linux"):
-                _add(os.path.join(base, sub, "chrome.exe"), rev)
-                _add(os.path.join(base, sub, "chrome"), rev)
+            if is_shell:
+                # 为省镜像体积，构建时常常只装 chromium-headless-shell。
+                # 它同样支持 launch_persistent_context（已实测），
+                # 不认识这个目录就会退回默认的完整 chromium 路径而崩溃。
+                for sub in ("chrome-headless-shell-linux64",
+                            "chrome-headless-shell-win64",
+                            "chrome-headless-shell-mac-x64",
+                            "chrome-headless-shell-mac-arm64"):
+                    _add(os.path.join(base, sub, "chrome-headless-shell"), rev * 10)
+                    _add(os.path.join(base, sub, "chrome-headless-shell.exe"), rev * 10)
+            else:
+                # 同版本时完整 chromium 优先（rank 高 1），功能更全
+                for sub in ("chrome-win", "chrome-win64",
+                            "chrome-linux", "chrome-linux64"):
+                    _add(os.path.join(base, sub, "chrome.exe"), rev * 10 + 1)
+                    _add(os.path.join(base, sub, "chrome"), rev * 10 + 1)
 
     # 2) 系统安装的 Chrome / Edge（兜底）
     for p in (os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"),
