@@ -1,1 +1,0 @@
-{"items":[{"id":1,"name":"garage","endpoint":"http://www.joyeuse.cn:3900","access_key_id":"GK563d29829d5df54f3b0980b1","secret_masked":"","has_secret":true,"region":"garage","bucket":"photos","addressing_style":"path","enabled":true,"last_check_at":"2026-10-25T00:56:18.551514+00:00","last_check_ok":true,"last_error":null,"created_at":"2026-10-21T09:56:19.081306+00:00"}]}
