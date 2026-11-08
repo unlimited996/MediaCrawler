@@ -9,6 +9,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from ..service_paths import library_api
+
 router = APIRouter(prefix="/export", tags=["export"])
 
 # 数据目录与导出目录（data/exports/）
@@ -99,7 +101,7 @@ async def export_pdf(req: ExportPdfRequest):
         "size": result["size"],
         "record_count": result["record_count"],
         "image_count": result["image_count"],
-        "download_url": f"/api/export/download/{result['name']}",
+        "download_url": library_api(f"export/download/{result['name']}"),
     }
 
 
@@ -137,7 +139,7 @@ async def export_stories(req: ExportStoriesRequest):
         "size": result["size"],
         "record_count": result["record_count"],
         "image_count": result["image_count"],
-        "download_url": f"/api/export/download/{result['name']}",
+        "download_url": library_api(f"export/download/{result['name']}"),
     }
 
 

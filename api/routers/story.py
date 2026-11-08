@@ -146,7 +146,7 @@ async def _load_comment_pictures(session, comment_ids: List[int]
             except Exception:
                 rel = str(m.local_path).replace("\\", "/")
             local_url = _asset_url("raw", rel)
-        backup_url = (f"/api/s3-backup/object/{backup_map[m.id]}"
+        backup_url = (_library_api(f"s3-backup/object/{backup_map[m.id]}")
                       if m.id in backup_map else None)
         resolved = local_url or backup_url or (m.source_url or None)
         src = ("local" if local_url else
@@ -325,7 +325,7 @@ async def list_stories(
                 # 只取首张已备份的图片做封面回退
                 if sid in backup_cover or _mt != "image":
                     continue
-                backup_cover[sid] = f"/api/s3-backup/object/{_key}"
+                backup_cover[sid] = _library_api(f"s3-backup/object/{_key}")
 
         from tools.media_backup import story_backup_state
 
@@ -483,7 +483,7 @@ async def get_story(story_id: int):
                 .where(MediaBackup.media_id.in_([m.id for m in media]),
                        MediaBackup.status == "uploaded")
             )).all()
-            backup_urls = {mid: f"/api/s3-backup/object/{key}"
+            backup_urls = {mid: _library_api(f"s3-backup/object/{key}")
                            for mid, key in b_rows}
 
         author_name = None

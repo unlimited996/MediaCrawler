@@ -15,7 +15,7 @@ import { crawlerApi } from '@/lib/api'
  */
 export function LoginQrcodeFab() {
   const { t } = useTranslation('config')
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(true)
 
   const q = useQuery({
     queryKey: ['crawlerQrcode'],
@@ -30,7 +30,7 @@ export function LoginQrcodeFab() {
   const src = qr.startsWith('data:') ? qr : `data:image/png;base64,${qr}`
 
   return (
-    <div className="fixed bottom-5 right-5 z-50 flex flex-col items-end gap-2">
+    <div className="fixed bottom-5 right-5 z-[70] flex flex-col items-end gap-2">
       {open && (
         <div className="w-64 rounded-lg glass-panel float-panel border border-cyber-border-subtle p-3 shadow-lg animate-slide-up">
           <div className="mb-2 flex items-center justify-between">

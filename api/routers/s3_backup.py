@@ -35,6 +35,8 @@ from database.models_v2 import MediaAttachment, MediaBackup, S3Config
 from tools.media_backup import active_settings
 from .story import _session
 
+from ..service_paths import library_api
+
 router = APIRouter(prefix="/s3-backup", tags=["s3-backup"])
 
 #: 手动触发的批处理任务（同一时刻只跑一个）
@@ -405,7 +407,7 @@ def _item_out(r: MediaBackup) -> Dict[str, Any]:
         "content_id": r.content_id,
         "media_type": r.media_type,
         "object_key": r.object_key,
-        "object_url": f"/api/s3-backup/object/{r.object_key}",
+        "object_url": library_api(f"s3-backup/object/{r.object_key}"),
         "source_url": r.source_url,
         "mime_type": r.mime_type,
         "size_bytes": r.size_bytes,

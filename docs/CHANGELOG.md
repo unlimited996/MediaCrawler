@@ -5,6 +5,30 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-09] 修复图片 404 与恢复二维码小弹窗
+
+### 1. 数据库读取的图片显示不出来
+拆分部署后 library 挂的是 `/library/api/**`，但后端 6 处、前端 3 处
+仍返回/请求旧的 `/api/...` 绝对路径，浏览器直接 404：
+- `story.py`（S3 备份封面 / 媒体 URL ×3）、`s3_backup.py`（object_url）、
+  `export.py`（download_url ×2）、`recipe.py`（media URL）
+- 前端 `api.ts`（导出下载）、`S3BackupView.tsx`（备份图片 ×2）
+
+统一改用 `api/service_paths.library_api()`（单体 `api/main.py` 也把同一批
+路由挂到了 `/library/api`，本地开发不受影响）。
+
+### 2. 二维码小弹窗恢复显示
+原版登录页里的二维码只是截图的一部分，缩放后不好扫；右下角小弹窗
+显示的是原始 base64 图，清晰可扫。之前打开大页面时：
+- 大弹窗 `z-[60]` 全屏遮罩盖住 `z-50` 的小弹窗
+- 登录会话期间没有抓取任务，`/crawler/qrcode` 返回 null
+
+修复：
+- 小弹窗改为默认展开、`z-[70]`（浮在大页面之上）
+- 登录会话从 `img.qrcode-img` 取原始 base64，内容变化时才写一条
+  `[QRCODE]` 到共享 `logs/scheduler_live.jsonl`；
+  `CrawlerManager.get_qrcode()` 的已有回退会读出来给小弹窗显示原图
+
 ## [2026-11-08] 修复 WebUI 原版登录页被判「网络存在风险」
 
 登录会话最初只用了裸 `launch_persistent_context`，而抓取任务

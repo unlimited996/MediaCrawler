@@ -47,6 +47,8 @@ from database.models_recipe import (
 )
 from .story import _session
 
+from ..service_paths import library_api
+
 router = APIRouter(prefix="/recipes", tags=["recipe"])
 media_router = APIRouter(prefix="/media", tags=["media"])
 app_config_router = APIRouter(prefix="/app-config", tags=["app-config"])
@@ -85,7 +87,7 @@ def _media_url(key: Optional[str]) -> Optional[str]:
     """对象键 → 相对访问地址。客户端用自身 base 拼绝对地址。"""
     if not key:
         return None
-    return "/api/media/" + "/".join(
+    return library_api("media/") + "/".join(
         _quote_segment(seg) for seg in key.split("/") if seg)
 
 

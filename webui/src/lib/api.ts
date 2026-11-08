@@ -176,7 +176,7 @@ export interface ExportPdfResult {
 export const exportApi = {
   exportPdf: (payload: { file_path: string; limit?: number; embed_images?: boolean }) =>
     api.post<ExportPdfResult>('/export/pdf', payload),
-  getDownloadUrl: (name: string) => `/api/export/download/${name}`,
+  getDownloadUrl: (name: string) => `/library/api/export/download/${name}`,
 }
 
 export interface HotItem {

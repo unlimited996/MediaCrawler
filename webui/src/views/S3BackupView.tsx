@@ -350,7 +350,7 @@ export function S3BackupView() {
                     const allKept = g.keys.length > 0 && g.keys.every((k: string) => excludedKeys.has(k))
                     // 组内所有副本的大图地址，交给看图器后可左右翻页对比
                     const groupSrcs: string[][] = g.keys.map(
-                      (k: string) => [`/api/s3-backup/object/${k}`])
+                      (k: string) => [`/library/api/s3-backup/object/${k}`])
                     return (
                       <div key={g.checksum}
                            className="overflow-hidden rounded border border-cyber-border-subtle">
@@ -395,7 +395,7 @@ export function S3BackupView() {
                                   <div key={k}
                                        className={`w-24 flex-shrink-0 rounded border p-1 sm:w-28 ${kept ? 'border-emerald-500/60 bg-emerald-500/5' : 'border-cyber-border-subtle'}`}>
                                     <div className="relative">
-                                      <img src={`/api/s3-backup/object/${k}`} alt=""
+                                      <img src={`/library/api/s3-backup/object/${k}`} alt=""
                                            loading="lazy"
                                            onClick={() => viewer?.open(groupSrcs, i)}
                                            className="aspect-square w-full cursor-zoom-in rounded bg-cyber-bg-tertiary object-cover"

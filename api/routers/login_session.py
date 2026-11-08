@@ -32,6 +32,9 @@ router = APIRouter(prefix="/crawler/login-session", tags=["login-session"])
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOCK_FILE = PROJECT_ROOT / "logs" / ".login_session_active"
+# 与 CrawlerManager.get_qrcode() 的回退日志是同一个文件；把页面上的二维码
+# 原图写进去，右下角小弹窗就能显示清晰可扫的原图（截图里的二维码太小）。
+LIVE_LOG = PROJECT_ROOT / "logs" / "scheduler_live.jsonl"
 # 必须与 XiaoHongShuCrawler.launch_browser 完全一致，否则同一个
 # browser_data profile 两种指纹交替出现，会被小红书判「网络存在风险」。
 VIEWPORT = {"width": 1920, "height": 1080}
@@ -68,6 +71,7 @@ class _LoginSession:
         self.context = None
         self.page = None
         self.last_active = 0.0
+        self._last_qr: Optional[str] = None
         self.lock = asyncio.Lock()
         self.started_at: Optional[str] = None
 
@@ -156,6 +160,7 @@ class _LoginSession:
             ctx, pw = self.context, self.playwright
             self.context = self.page = self.playwright = None
             self.started_at = None
+            self._last_qr = None
             LOCK_FILE.unlink(missing_ok=True)
             if ctx:
                 try:
@@ -178,10 +183,42 @@ class _LoginSession:
             print(f"[login-session] 打开 {url} 失败（可点刷新页面重试）: "
                   f"{type(e).__name__}: {e}", flush=True)
 
+    async def _publish_qrcode(self) -> None:
+        """原版登录页里的二维码是 img.qrcode-img 的 base64。
+
+        截图缩放后不好扫，把它原样写进共享实时日志，
+        CrawlerManager.get_qrcode() 会读出来给右下角小弹窗显示原图。
+        内容不变就只写一次，避免刷屏。
+        """
+        if not self.page:
+            return
+        try:
+            loc = self.page.locator("img.qrcode-img").first
+            if await loc.count() == 0:
+                return
+            src = await loc.get_attribute("src")
+            if not src or not src.startswith("data:image") or src == self._last_qr:
+                return
+            self._last_qr = src
+            import json
+
+            line = json.dumps({
+                "ts": time.strftime("%H:%M:%S"),
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "level": "info",
+                "msg": "[QRCODE]" + src,
+            }, ensure_ascii=False)
+            LIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(LIVE_LOG, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception:
+            pass
+
     async def screenshot(self) -> bytes:
         if not self.page:
             raise RuntimeError("会话未启动")
         self.touch()
+        await self._publish_qrcode()
         return await self.page.screenshot(type="jpeg", quality=60)
 
     async def input(self, action: str, x: float = 0, y: float = 0,
