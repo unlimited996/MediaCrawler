@@ -686,6 +686,14 @@ CDP_DEBUG_PORT: "9222"
 避免两个 Chromium 抢同一个 profile 导致锁死或损坏登录态。
 启动会话时若已有 running 任务，接口返回 409 提示先等任务结束。
 
+> ⚠️ **浏览器指纹必须和抓取任务一致**：登录会话与 `launch_browser()` 共用
+> 同一个 `browser_data` profile，如果两边 UA / 视口 / 反检测参数不同，
+> 小红书会看到「同一个账号两种指纹交替」并提示「网络存在风险」。
+> 登录会话现已复用完全相同的 UA（Chrome 126）、1920x1080 视口、
+> 三个 stealth 启动参数、系统代理，并补了 `Accept-Language` /
+> `Upgrade-Insecure-Requests`、`zh-CN` locale、`Asia/Shanghai` 时区和
+> `navigator.webdriver` 初始化脚本。
+
 > 已知限制：截图式交互有约 0.8s 延迟，输入需先点页面里的输入框获得焦点；
 > 这是「轻量远程页面」，不是完整 VNC，但登录这种点几下 + 输两串数字的操作足够。
 

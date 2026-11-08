@@ -5,6 +5,30 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-08] 修复 WebUI 原版登录页被判「网络存在风险」
+
+登录会话最初只用了裸 `launch_persistent_context`，而抓取任务
+`XiaoHongShuCrawler.launch_browser()` 带了一整套反检测参数。两者共用同一个
+`browser_data/<platform>_user_data_dir`，指纹不一致 → 小红书风控页。
+
+补齐（`api/routers/login_session.py`）：
+- `user_agent` 固定为与抓取一致的 Chrome/126（**关键**：headless shell 默认 UA
+  含 `HeadlessChrome`，一眼被识别）
+- viewport 1920x1080（原 1280x800）
+- 三个 stealth args：`--disable-blink-features=AutomationControlled` /
+  `--exclude-switches=enable-automation` / `--disable-infobars`
+- `proxy=system_playwright_proxy()`、`accept_downloads=True`
+- `extra_http_headers`: `Accept-Language: zh-CN,zh;q=0.9,en;q=0.8`、
+  `Upgrade-Insecure-Requests: 1`
+- `locale=zh-CN`、`timezone_id=Asia/Shanghai`
+- `add_init_script` 抹掉 `navigator.webdriver`、补 languages/plugins/window.chrome
+
+镜像内实测：UA 不含 `HeadlessChrome`、`navigator.webdriver` 非 true、
+viewport 1920x1080、languages `['zh-CN']`、时区 `Asia/Shanghai`。
+
+> 上限：TLS/JA3 指纹与出口 IP 是 Playwright 改不了的。若补齐后仍提示风险，
+> 只能改用 `CDP_HOST` 连本地真实 Chrome（见「容器连本地 Chrome」一节）。
+
 ## [2026-11-08] WebUI 原版登录页（登录态自动落盘，无需手工导出 Cookie）
 
 需求：除了二维码还要能短信验证，且要在 WebUI 里看到**原版页面**；
