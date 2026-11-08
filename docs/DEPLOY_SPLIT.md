@@ -660,6 +660,35 @@ CDP_DEBUG_PORT: "9222"
 重建镜像重新拉取；还要处理登录会话与抓取任务争抢同一个
 `browser_data` profile 锁的互斥。属于独立功能，做之前先确认投入。
 
+#### WebUI 里打开原版登录页（推荐，登录态自动落盘）
+
+不想只靠二维码、也不想手工导出 Cookie 时用这个。右下角点「**原版登录页**」：
+容器内启动一个 headless persistent context 打开小红书**原版页面**，
+截图推到弹窗里，点击坐标 / 文本输入回传给 Playwright 执行。
+扫码、手机号 + 短信验证码、滑块验证都在真实页面上操作。
+
+**登录态自动写进容器**：会话用的 `user_data_dir` 与抓取任务
+`launch_browser()` 完全相同（`/app/browser_data/xhs_user_data_dir`，
+挂在 `mc-browser-data` 卷上）。Chromium 关闭时自己把 Cookie 落盘，
+之后定时任务再用 persistent context 启动就是已登录状态 ——
+不需要导出 Cookie、不需要改配置、不需要重启容器。
+点「完成登录并保存」关闭会话即可。
+
+实现要点（避免引入 Xvfb / noVNC）：
+- 截图走 `GET /crawler/api/crawler/login-session/screenshot`（JPEG，800ms 刷新），
+  `POST .../input` 执行 click / type / key / scroll / reload
+- 导航放后台任务，start 秒回，不会顶到前端 axios 的 30s 超时
+- 页面空白/加载失败时点「**刷新页面**」重试
+- 会话 15 分钟无操作自动关闭并释放 profile
+
+**互斥**：会话期间写 `logs/.login_session_active`；worker 的
+`_pickup_queued` 见到标记就暂停拾取（记录保持 queued，会话结束后自动执行），
+避免两个 Chromium 抢同一个 profile 导致锁死或损坏登录态。
+启动会话时若已有 running 任务，接口返回 409 提示先等任务结束。
+
+> 已知限制：截图式交互有约 0.8s 延迟，输入需先点页面里的输入框获得焦点；
+> 这是「轻量远程页面」，不是完整 VNC，但登录这种点几下 + 输两串数字的操作足够。
+
 #### 群晖 Docker GUI 单独起两个容器（不用 compose）时必改
 
 compose 里的 `http://crawler:8001` 依赖 compose 服务名，GUI 起容器时不存在：

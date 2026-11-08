@@ -111,14 +111,9 @@ class _LoginSession:
                 LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
                 LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
                 self.touch()
-                # 打开原版首页；登录弹窗没自动出来时用户可以在截图里自己点
-                try:
-                    await page.goto(
-                        "https://www.rednote.com" if config.XHS_INTERNATIONAL
-                        else "https://www.xiaohongshu.com",
-                        wait_until="domcontentloaded", timeout=30000)
-                except Exception:
-                    pass
+                # 导航放后台，别让 start 卡到前端 axios 的 30s 超时；
+                # 页面没加载出来时用户可点「刷新页面」重试。
+                asyncio.create_task(self._navigate(page))
             except Exception:
                 await pw.stop()
                 self.playwright = self.context = self.page = None
@@ -142,6 +137,16 @@ class _LoginSession:
                 except Exception:
                     pass
 
+    @staticmethod
+    async def _navigate(page) -> None:
+        url = ("https://www.rednote.com" if config.XHS_INTERNATIONAL
+               else "https://www.xiaohongshu.com")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        except Exception as e:
+            print(f"[login-session] 打开 {url} 失败（可点刷新页面重试）: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
     async def screenshot(self) -> bytes:
         if not self.page:
             raise RuntimeError("会话未启动")
@@ -161,6 +166,11 @@ class _LoginSession:
             await self.page.keyboard.press(str(key or "Enter"))
         elif action == "scroll":
             await self.page.mouse.wheel(0, float(dy))
+        elif action == "reload":
+            try:
+                await self.page.reload(wait_until="domcontentloaded", timeout=15000)
+            except Exception:
+                await self._navigate(self.page)
         else:
             raise ValueError(f"不支持的操作: {action}")
 
@@ -190,7 +200,7 @@ async def _running_task_count() -> int:
 
 
 class InputPayload(BaseModel):
-    action: str = Field(..., description="click | type | key | scroll")
+    action: str = Field(..., description="click | type | key | scroll | reload")
     x: float = 0
     y: float = 0
     text: str = ""

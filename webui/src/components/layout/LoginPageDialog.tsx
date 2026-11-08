@@ -162,6 +162,8 @@ export function LoginPageDialog() {
             <Button size="sm" variant="outline" className="h-8 font-mono text-xs"
               onClick={() => void send({ action: 'key', key: 'Backspace' })}>退格</Button>
             <Button size="sm" variant="outline" className="h-8 font-mono text-xs"
+              onClick={() => void send({ action: 'reload' })}>刷新页面</Button>
+            <Button size="sm" variant="outline" className="h-8 font-mono text-xs"
               onClick={() => void send({ action: 'scroll', dy: -400 })}>
               <ChevronUp className="h-3.5 w-3.5" />
             </Button>

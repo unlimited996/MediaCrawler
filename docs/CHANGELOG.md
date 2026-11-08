@@ -5,6 +5,35 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-08] WebUI 原版登录页（登录态自动落盘，无需手工导出 Cookie）
+
+需求：除了二维码还要能短信验证，且要在 WebUI 里看到**原版页面**；
+登录态必须自动写进容器，不能让用户手工复制 Cookie。
+
+### 实现
+- 新增 `api/routers/login_session.py`（crawler 侧，浏览器依赖在这一侧）：
+  用「截图 + 坐标/文本回传」代替 Xvfb/noVNC —— 零系统包、零新端口、
+  镜像体积不变。接口：`start` / `screenshot` (JPEG) / `input`
+  (click/type/key/scroll/reload) / `status` / `stop`。
+- **共享 profile**：`user_data_dir` 与 `XiaoHongShuCrawler.launch_browser()`
+  一致（`browser_data/<platform>_user_data_dir`），Chromium 关闭时自动把
+  Cookie 刷进 `mc-browser-data` 卷，后续抓取直接已登录。
+- 登录态检测：`web_session` cookie；前端轮询 status 显示「已登录」。
+- 导航放后台任务，避免 `page.goto` 拖过前端 axios 30s 超时；
+  加载失败可点「刷新页面」。
+- 互斥：会话写 `logs/.login_session_active`，`task_scheduler._pickup_queued`
+  见标记即暂停拾取（任务保持 queued，会话结束后自动执行）；start 时若有
+  running 任务返回 409。
+- 前端 `LoginPageDialog`（App 层右下角）+ `loginSessionApi`。
+
+### 验证（真实镜像内 ASGI 端到端）
+```
+start 200 / screenshot 200 image/jpeg / click·type·key·reload 200
+status 200 (active, idle_left_sec) / stop 200 / 标记已清理
+profile 目录存在，289 个文件（Chromium 落盘）
+```
+前端 `npm run build` 通过。
+
 ## [2026-11-07] 修复 worker 模式下 WebUI 看不到扫码登录二维码
 
 ### 背景
