@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import config
 from .routers import (accounts_router, config_router, crawler_router, env_router,
-                      scheduler_router, websocket_router)
+                      login_session_router, scheduler_router, websocket_router)
 from .services import boot_tasks, discovery
 
 #: 服务名（也是 URL 前缀）和 API 前缀
@@ -52,6 +52,8 @@ app.include_router(accounts_router, prefix=API_PREFIX)
 app.include_router(config_router, prefix=API_PREFIX)
 app.include_router(websocket_router, prefix=API_PREFIX)
 app.include_router(env_router, prefix=API_PREFIX)
+# WebUI 原版登录页会话（截图 + 坐标回传，登录态写进共享 browser_data 卷）
+app.include_router(login_session_router, prefix=API_PREFIX)
 
 
 @app.get(f"{SERVICE_PREFIX}/health", tags=["health"])

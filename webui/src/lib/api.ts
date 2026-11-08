@@ -116,6 +116,25 @@ export const crawlerApi = {
   getQrcode: () => api.get<{ qr: string | null; at?: string }>('/crawler/qrcode'),
 }
 
+/** WebUI 原版登录页会话：截图 + 坐标/文本回传，登录态自动写进容器卷 */
+export interface LoginSessionStatus {
+  active: boolean
+  logged_in: boolean
+  started_at: string | null
+  idle_left_sec: number
+  message: string
+}
+
+export const loginSessionApi = {
+  start: () => api.post<{ ok: boolean; viewport: { width: number; height: number }; message: string }>(
+    '/crawler/login-session/start'),
+  status: () => api.get<LoginSessionStatus>('/crawler/login-session/status'),
+  input: (payload: { action: string; x?: number; y?: number; text?: string; key?: string; dy?: number }) =>
+    api.post<{ ok: boolean }>('/crawler/login-session/input', payload),
+  stop: () => api.post<{ ok: boolean; logged_in: boolean; message: string }>(
+    '/crawler/login-session/stop'),
+}
+
 /** 抓取队列：爬虫忙时提交的任务排队，前一个跑完自动续跑 */
 export const crawlerQueueApi = {
   list: (status?: string) =>

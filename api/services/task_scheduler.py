@@ -427,6 +427,24 @@ class TaskScheduler:
         为什么用库而不是进程内队列：API 与执行器是两个进程，进程内队列在
         任一方重启后都会丢；落库则天然具备「重启后继续」的语义。
         """
+        # WebUI「原版登录页」会话进行中时暂停拾取：登录会话和抓取任务共用
+        # 同一个 browser_data/<platform>_user_data_dir，两个 Chromium 同时打开
+        # 会锁死甚至损坏 profile。记录保持 queued，会话结束下一轮 tick 自动执行。
+        # 静默返回（每 15s 一次 tick，写日志会刷屏）。
+        try:
+            from pathlib import Path
+            import time as _time
+
+            flag = (Path(__file__).resolve().parents[2]
+                    / "logs" / ".login_session_active")
+            if flag.exists():
+                if _time.time() - flag.stat().st_mtime > 20 * 60:
+                    flag.unlink(missing_ok=True)   # 异常退出留下的陈旧标记
+                else:
+                    return 0
+        except Exception:
+            pass
+
         picked: List[tuple] = []
         try:
             async with _session() as session:
