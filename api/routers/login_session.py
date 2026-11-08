@@ -26,13 +26,34 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 import config
-from tools.crawler_util import chromium_launch_kwargs
+from tools.crawler_util import chromium_launch_kwargs, system_playwright_proxy
 
 router = APIRouter(prefix="/crawler/login-session", tags=["login-session"])
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOCK_FILE = PROJECT_ROOT / "logs" / ".login_session_active"
-VIEWPORT = {"width": 1280, "height": 800}
+# 必须与 XiaoHongShuCrawler.launch_browser 完全一致，否则同一个
+# browser_data profile 两种指纹交替出现，会被小红书判「网络存在风险」。
+VIEWPORT = {"width": 1920, "height": 1080}
+USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Safari/537.36")
+STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--exclude-switches=enable-automation",
+    "--disable-infobars",
+]
+# 正常 Chrome 会带这些请求头；headless shell 默认不发，容易触发风控
+EXTRA_HEADERS = {
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+}
+INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+window.chrome = window.chrome || { runtime: {} };
+"""
 IDLE_TIMEOUT_SEC = 15 * 60
 
 
@@ -97,14 +118,24 @@ class _LoginSession:
             pw = await async_playwright().start()
             try:
                 kwargs = chromium_launch_kwargs(pw.chromium)
+                kwargs.setdefault("args", [])
+                kwargs["args"] = list(kwargs["args"]) + [
+                    a for a in STEALTH_ARGS if a not in kwargs["args"]]
                 profile = _profile_dir()
                 profile.mkdir(parents=True, exist_ok=True)
                 ctx = await pw.chromium.launch_persistent_context(
                     user_data_dir=str(profile),
+                    accept_downloads=True,
                     headless=True,
+                    proxy=system_playwright_proxy(),
                     viewport=VIEWPORT,
+                    user_agent=USER_AGENT,
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                    extra_http_headers=EXTRA_HEADERS,
                     **kwargs,
                 )
+                await ctx.add_init_script(INIT_SCRIPT)
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 self.playwright, self.context, self.page = pw, ctx, page
                 self.started_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -151,7 +182,7 @@ class _LoginSession:
         if not self.page:
             raise RuntimeError("会话未启动")
         self.touch()
-        return await self.page.screenshot(type="jpeg", quality=70)
+        return await self.page.screenshot(type="jpeg", quality=60)
 
     async def input(self, action: str, x: float = 0, y: float = 0,
                     text: str = "", key: str = "", dy: float = 0) -> None:
