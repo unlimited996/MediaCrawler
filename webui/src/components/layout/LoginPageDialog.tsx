@@ -17,6 +17,9 @@ export function LoginPageDialog() {
   const [status, setStatus] = useState<LoginSessionStatus | null>(null)
   const [text, setText] = useState('')
   const [tick, setTick] = useState(0)
+  // 手机把 1920x1080 截图压到 375px 会看不清验证码，默认给原始尺寸 + 横向滚动
+  const [fit, setFit] = useState(
+    typeof window !== 'undefined' ? window.innerWidth >= 768 : true)
   const imgRef = useRef<HTMLImageElement>(null)
 
   // 截图刷新：加时间戳绕开浏览器缓存
@@ -110,10 +113,10 @@ export function LoginPageDialog() {
   }
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4">
-      <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-cyber-border-DEFAULT bg-cyber-bg-panel shadow-2xl">
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-0 sm:p-4">
+      <div className="flex h-full w-full max-w-none flex-col overflow-hidden rounded-none border border-cyber-border-DEFAULT bg-cyber-bg-panel shadow-2xl sm:h-auto sm:max-h-[92vh] sm:max-w-4xl sm:rounded-lg">
         {/* 标题栏 */}
-        <div className="flex items-center gap-2 border-b border-cyber-border-subtle px-4 py-2.5">
+        <div className="flex items-center gap-2 border-b border-cyber-border-subtle px-3 py-2 sm:px-4 sm:py-2.5">
           <Monitor className="h-4 w-4 text-cyber-neon-cyan-dim" />
           <span className="text-sm font-mono font-semibold text-cyber-text-primary">原版登录页</span>
           {status?.logged_in && (
@@ -121,7 +124,7 @@ export function LoginPageDialog() {
               <CheckCircle2 className="h-3.5 w-3.5" /> 已登录
             </span>
           )}
-          <span className="ml-auto text-[11px] font-mono text-cyber-text-muted">
+          <span className="ml-auto hidden text-[11px] font-mono text-cyber-text-muted sm:inline">
             {status?.message || '正在打开…'}
           </span>
           <Button variant="ghost" size="sm" className="h-7 px-2" onClick={stop} title="关闭">
@@ -130,21 +133,22 @@ export function LoginPageDialog() {
         </div>
 
         {/* 原版页面截图：点哪里就点哪里 */}
-        <div className="flex-1 overflow-auto bg-[#0d1117] p-2">
+        <div className="min-h-0 flex-1 overflow-auto overscroll-contain bg-[#0d1117] p-1 sm:p-2">
           <img
             ref={imgRef}
             src={`/crawler/api/crawler/login-session/screenshot?t=${tick}`}
             alt="小红书登录页"
             onClick={onImageClick}
-            className="mx-auto block w-full max-w-[1280px] cursor-crosshair select-none"
+            className={`mx-auto block cursor-crosshair select-none ${
+              fit ? 'w-full max-w-[1280px]' : 'w-[1920px] max-w-none'}`}
             draggable={false}
           />
         </div>
 
         {/* 输入工具条 */}
-        <div className="space-y-2 border-t border-cyber-border-subtle px-4 py-3">
+        <div className="space-y-2 border-t border-cyber-border-subtle bg-cyber-bg-panel px-3 py-2 sm:px-4 sm:py-3">
           <p className="text-[11px] font-mono text-cyber-text-muted">
-            先点上面的输入框获得焦点，再在下面打字。二维码、手机号、短信验证码都在原版页面里操作。
+            先点页面里的输入框获得焦点，再在下面打字；手机上可左右拖动查看完整页面，验证码弹窗在截图里滚动查找。
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <Input
@@ -152,7 +156,7 @@ export function LoginPageDialog() {
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') submitText() }}
               placeholder="手机号 / 验证码，回车发送"
-              className="h-8 w-64 font-mono text-xs"
+              className="h-8 w-full font-mono text-xs sm:w-64"
             />
             <Button size="sm" className="h-8 font-mono text-xs" onClick={submitText} disabled={!text}>
               输入
@@ -162,7 +166,11 @@ export function LoginPageDialog() {
             <Button size="sm" variant="outline" className="h-8 font-mono text-xs"
               onClick={() => void send({ action: 'key', key: 'Backspace' })}>退格</Button>
             <Button size="sm" variant="outline" className="h-8 font-mono text-xs"
+              onClick={() => setFit((v) => !v)}>{fit ? '原始尺寸' : '适应屏幕'}</Button>
+            <Button size="sm" variant="outline" className="h-8 font-mono text-xs"
               onClick={() => void send({ action: 'reload' })}>刷新页面</Button>
+            <Button size="sm" variant="outline" className="h-8 font-mono text-xs"
+              onClick={() => void send({ action: 'scroll', dy: -3000 })}>回顶部</Button>
             <Button size="sm" variant="outline" className="h-8 font-mono text-xs"
               onClick={() => void send({ action: 'scroll', dy: -400 })}>
               <ChevronUp className="h-3.5 w-3.5" />

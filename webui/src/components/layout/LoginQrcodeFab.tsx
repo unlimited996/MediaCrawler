@@ -30,9 +30,9 @@ export function LoginQrcodeFab() {
   const src = qr.startsWith('data:') ? qr : `data:image/png;base64,${qr}`
 
   return (
-    <div className="fixed bottom-5 right-5 z-[70] flex flex-col items-end gap-2">
+    <div className="fixed left-2 top-2 z-[70] flex flex-col items-start gap-2 sm:bottom-5 sm:left-auto sm:right-5 sm:top-auto sm:items-end">
       {open && (
-        <div className="w-64 rounded-lg glass-panel float-panel border border-cyber-border-subtle p-3 shadow-lg animate-slide-up">
+        <div className="w-52 rounded-lg glass-panel float-panel border border-cyber-border-subtle p-2 shadow-lg animate-slide-up sm:w-64 sm:p-3">
           <div className="mb-2 flex items-center justify-between">
             <span className="flex items-center gap-1.5 text-[11px] font-mono font-semibold text-cyber-text-primary">
               <QrCode className="h-3.5 w-3.5 text-cyber-neon-cyan" />
@@ -48,7 +48,7 @@ export function LoginQrcodeFab() {
             </button>
           </div>
           <div className="flex justify-center rounded-md border border-cyber-neon-cyan/40 bg-white p-2">
-            <img src={src} alt={t('queue.qrcodeAlt', '登录二维码')} className="h-40 w-40" />
+            <img src={src} alt={t('queue.qrcodeAlt', '登录二维码')} className="h-28 w-28 sm:h-40 sm:w-40" />
           </div>
           <p className="mt-2 text-[10px] leading-4 text-cyber-text-muted">
             {t('queue.qrcodeHint', '扫码并确认后会自动继续抓取。二维码 5 分钟内有效，过期请重新启动任务。')}
