@@ -51,6 +51,10 @@ services:
       POSTGRES_DB_NAME: imdb
       # ---- 服务互联：群晖没有 Nacos，必须关掉，否则每次发现都会先超时 ----
       NACOS_ENABLED: "0"
+      # Nacos 就在本机内网；当前 NACOS_ENABLED=0 走静态互联、不产生连接，
+      # 日后启用服务发现即用内网地址（别填 www.joyeuse.cn，DDNS 漂移会连不上）。
+      # 注意 9000=OpenAPI，8085 只是控制台 Web 端口，填 8085 必然注册失败。
+      NACOS_SERVER: "192.168.10.38:9000"
       CRAWLER_SERVICE_NAME: mediacrawler-crawler
       LIBRARY_SERVICE_NAME: mediacrawler-library
       CRAWLER_BASE_URL: http://crawler:8001
@@ -104,6 +108,10 @@ services:
       POSTGRES_DB_NAME: imdb
       # ---- 服务互联 ----
       NACOS_ENABLED: "0"
+      # Nacos 就在本机内网；当前 NACOS_ENABLED=0 走静态互联、不产生连接，
+      # 日后启用服务发现即用内网地址（别填 www.joyeuse.cn，DDNS 漂移会连不上）。
+      # 注意 9000=OpenAPI，8085 只是控制台 Web 端口，填 8085 必然注册失败。
+      NACOS_SERVER: "192.168.10.38:9000"
       CRAWLER_SERVICE_NAME: mediacrawler-crawler
       LIBRARY_SERVICE_NAME: mediacrawler-library
       # 关键：网关把 /crawler/** 转发到这里，必须是容器服务名，不能是 127.0.0.1

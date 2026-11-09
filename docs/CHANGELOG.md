@@ -5,6 +5,33 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-09] Nacos 地址改内网：端口纠正 8085 → 9000
+
+排查 DDNS 漂移（`www.joyeuse.cn` 解析到旧 IP `117.25.104.151`，S3/Garage
+因此连不上）时，要求把 Nacos 地址也统一改成内网 IP。
+
+- **端口纠正**：需求里给的 `192.168.10.38:8085` 是 Nacos 3.x 的**控制台
+  Web 端口**（容器 8080 → 宿主 8085）；`NACOS_SERVER` 必须填 OpenAPI 的
+  **9000**（容器 8848 → 宿主 9000）。填 8085 会一直注册失败。
+- `deploy/.env.example`、`deploy/synology/docker-compose.yml` /
+  `prefilled.yml`（crawler + library 各一处）统一为
+  `NACOS_SERVER=192.168.10.38:9000`，并补注释区分「同内网用内网 IP」与
+  「跨公网必须用公网可达地址」。
+- 群晖当前 `NACOS_ENABLED=0`，靠 `CRAWLER_BASE_URL=http://crawler:8001`
+  静态互联（`/library/health` 实测 `nacos_enabled:false`）。新变量不产生
+  连接、不影响运行；`tools/nacos_client.py::get_client()` 读
+  `os.getenv("NACOS_SERVER", ...)`，显式设了就会覆盖代码兜底默认值。
+  环境变量变更需 `docker compose up -d` 重建容器才反映到 health 显示。
+- **不建议在群晖启用 Nacos**：网关拿注册表的 `ip:port` 直连 crawler，
+  而群晖宿主映射是 `18001:8001`，注册端口容易对不上；同 compose 静态互联更稳。
+- 代码里 `config/base_config.py` / `tools/nacos_client.py` 的
+  `www.joyeuse.cn:9000` 是 `os.getenv` 的兜底默认值，两处部署都已显式设
+  env，永远走不到；改它要重建两张镜像且会拖累本地开发，故保留。
+- 服务器 `/opt/mediacrawler/deploy/.env` 不改：那台机器是公网 ECS
+  `1.94.118.54`，`192.168.10.38` 是群晖内网 IP，从 ECS 不可达；且当前
+  服务器上没有运行 MediaCrawler 容器。
+- `docs/DEPLOY_SPLIT.md` 新增「`NACOS_SERVER` 该填哪个地址」表格。
+
 ## [2026-11-09] 容器抓取命中安全验证：弹出窗口永远看不到 → 推送到 WebUI
 
 ### 现象
