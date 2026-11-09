@@ -41,8 +41,8 @@ SEED_S3_CONFIG: Dict[str, str] = {
 #: 远端直取的体积上限（视频偏大，给 300MB）
 _MAX_REMOTE_BYTES = 300 * 1024 * 1024
 #: 单批处理数量 / 批内并发
-_BATCH_LIMIT = 20
-_BATCH_CONCURRENCY = 4
+_BATCH_LIMIT = 100
+_BATCH_CONCURRENCY = 8
 #: 退避基数（秒）：60 × 2^retry_count
 _RETRY_BACKOFF_SEC = 60
 

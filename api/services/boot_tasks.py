@@ -163,7 +163,9 @@ def start_s3_backup() -> None:
 
             while True:
                 try:
-                    await enqueue_missing(limit=200)
+                    # 入队量必须小于每批上传量，否则 pending 只涨不消
+                    # （原来 200 入队 vs 20 上传，队列 10:1 爆炸）
+                    await enqueue_missing(limit=60)
                     await run_backup_batch()
                     await retry_orphaned_purges(limit=50)
                 except Exception as e:

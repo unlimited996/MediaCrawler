@@ -5,6 +5,31 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-09] 评论图 95% 是坏 URL；S3 备份队列只涨不消
+
+### 1. 评论里的图显示不出来
+`media_attachment.local_path` 里混着 Windows 抓取时写入的绝对路径
+`D:/workspace/MediaCrawler/data/xhs/media/...`。`_load_comment_pictures`
+用 `Path(...).relative_to(DATA_DIR)`，容器里 `DATA_DIR=/app/data` 必然失败，
+except 分支原样拼接 → `/library/api/assets/raw/D:/workspace/...` → **404**。
+抽样 30 帖 38 张评论图，**36 张（95%）**是这种坏 URL。
+
+而 story 主图走 `assets/media/{platform}/{parent}/{name}`（按文件名解析），
+所以主图正常、只有评论区缺图 —— 这就是「主图能看、评论缺图」的原因。
+
+修复：新增 `_rel_local_path()`，`relative_to` 失败时退化为「截取 `/data/`
+之后的部分」并折叠重复斜杠。规范化后绝对路径变成 `xhs/media/...`，
+`assets/raw/...` 实测 200；同图的重抓重复记录规范化后 `local_url` 相同，
+既有去重逻辑生效，不再渲染两张。
+
+### 2. S3 备份列表「都是空的」
+列表按 id 倒序，第一页全是最新入队、还没上传的 pending；而
+`boot_tasks` 每 60s `enqueue_missing(limit=200)`，`run_backup_batch` 却是
+`_BATCH_LIMIT=20`、并发 4 —— **入队:上传 = 10:1**，pending 从 360 涨到 540。
+
+调整：`_BATCH_LIMIT 20→100`、`_BATCH_CONCURRENCY 4→8`、入队 200→60，
+上传快于入队，队列可回收。S3 对象抽查 5/5 正常（已上传 5520）。
+
 ## [2026-11-09] S3 图片显示不出来：真因是 Fernet 密钥不匹配，不是地址
 
 ### 先说结论：S3 不该接 Nacos

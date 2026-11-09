@@ -11,6 +11,7 @@ GET /api/tags                 标签列表
 """
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -112,6 +113,31 @@ def _comment_public(c: Comment, author_name: Optional[str],
     }
 
 
+def _rel_local_path(raw: str, data_dir) -> str:
+    """把 local_path 规范成相对 DATA_DIR 的路径。
+
+    历史数据里混有 Windows 抓取时写入的绝对路径
+    （``D:/workspace/MediaCrawler/data/xhs/media/...``）。容器里
+    DATA_DIR=/app/data，``relative_to`` 必然失败，以前会原样拼进
+    ``assets/raw/D:/...`` → 404（评论图里 95% 是这种坏 URL）。
+    这里退化为「截取 /data/ 之后的部分」，让历史数据也能出图。
+    """
+    s_ = str(raw or "").replace("\\", "/").strip()
+    if not s_:
+        return ""
+    # 折叠重复斜杠：历史脏数据里可能有 D:// 或 dir//file
+    s_ = re.sub(r"/{2,}", "/", s_)
+    try:
+        return Path(s_).relative_to(data_dir).as_posix()
+    except Exception:
+        pass
+    marker = "/data/"
+    i = s_.find(marker)
+    if i >= 0:
+        return s_[i + len(marker):]
+    return s_.lstrip("/")
+
+
 async def _load_comment_pictures(session, comment_ids: List[int]
                                  ) -> Dict[int, List[Dict[str, Any]]]:
     """批量取出评论配图（target_type='comment'）并解析成前端可直出的 URL。
@@ -138,14 +164,12 @@ async def _load_comment_pictures(session, comment_ids: List[int]
     )).all()
     backup_map = {mid: key for mid, key in backups}
     from tools.paths import DATA_DIR
+
     for m in media_rows:
         local_url = None
         if m.local_path:
-            try:
-                rel = Path(m.local_path).relative_to(DATA_DIR).as_posix()
-            except Exception:
-                rel = str(m.local_path).replace("\\", "/")
-            local_url = _asset_url("raw", rel)
+            rel = _rel_local_path(m.local_path, DATA_DIR)
+            local_url = _asset_url("raw", rel) if rel else None
         backup_url = (_library_api(f"s3-backup/object/{backup_map[m.id]}")
                       if m.id in backup_map else None)
         resolved = local_url or backup_url or (m.source_url or None)
