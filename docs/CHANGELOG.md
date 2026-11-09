@@ -5,6 +5,45 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-09] S3 图片显示不出来：真因是 Fernet 密钥不匹配，不是地址
+
+### 先说结论：S3 不该接 Nacos
+Nacos 解决的是 **HTTP 服务**的注册/发现；S3（Garage）是**对象存储**，
+boto3 必须用固定 `endpoint` 直连，不会去注册中心查地址。把 Garage 注册进
+Nacos 没有任何消费者，对图片显示零帮助。真需要「地址可切换」，endpoint
+本来就存在数据库、WebUI 改一处 `invalidate_config_cache()` 立即生效，
+比服务发现更轻、更可靠。
+
+### 图片不显示的根因（三条候选源全废）
+帖子 307 实测：
+- `local_url: null` —— 群晖 `mc-data` 卷没有本地副本
+- `url` —— xhscdn 外链带时间戳，已过期 → 403
+- `backup_url` → `/library/api/s3-backup/object/...` → **502**
+
+而 S3 里其实有 **5480 个对象 / 582MB**（`/s3-backup/stats` 实测），只是
+取不出来。测试接口报 `AccessDenied ... Invalid signature`；endpoint 已是
+内网 `192.168.10.38:3900`（网络层已通），所以问题在认证。
+
+群晖 `mc-data` 是新建空卷，自动生成了另一把 Fernet key，解不开 10-21 在
+本地加密落库的 S3 Secret —— `GET /s3-backup/configs` 的 `secret_masked`
+返回空就是证据。
+
+### 修复：统一 Fernet 密钥
+- 群晖两份 compose 的 crawler + library 都加 `COOKIE_ENC_KEY`
+  （值 = 当初加密用的 `data/.cookie_key`；prefilled 写明文、模板用
+  `${COOKIE_ENC_KEY:-}` 占位、`.env.example` 加说明）。
+- `account/crypto.py::_load_or_create_key()` 优先级 env > `data/.cookie_key`，
+  设了就用它解历史密文，同时也修好账号池 Cookie 的解密。
+- 只改环境变量：`docker compose up -d` 即可，**不用重建镜像**。
+- 验证链：`secret_masked` 非空 → `POST /configs/1/test` 返回 `ok:true`
+  → `object/...` 200 → 帖子 307 出图。
+- 兜底：若 `secret_masked` 仍为空（key 不匹配），在群晖执行
+  `garage key info GK563d29829d5df54f3b0980b1` 取真实 secret，WebUI 重填一次。
+
+### 注意
+本地与群晖共用同一个 `imdb` 库，endpoint 现指向内网；本地开发机不在
+`192.168.10.x`，本地跑 S3 备份会连不上（群晖正常）。
+
 ## [2026-11-09] Nacos 地址改内网：端口纠正 8085 → 9000
 
 排查 DDNS 漂移（`www.joyeuse.cn` 解析到旧 IP `117.25.104.151`，S3/Garage

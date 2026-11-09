@@ -747,6 +747,28 @@ CDP_DEBUG_PORT: "9222"
 或把 35–55s 的随机间隔再拉长。真正无人值守可考虑「命中验证即熔断、等冷却」，
 避免每次都要人点一下。
 
+#### 图片显示不出来 / S3 报 `Invalid signature`
+
+**不要试图把 S3 接进 Nacos**：Nacos 管的是 HTTP 服务实例，S3 是对象存储，
+boto3 只认固定 `endpoint`，注册进去没有消费者。
+
+排查顺序（帖子详情页图片为空时）：
+
+1. `GET /library/api/s3-backup/configs` 看 `secret_masked`
+   - **空字符串** = 当前机器的 Fernet key 解不开库里的密文（换机器 / 换
+     `mc-data` 卷最常见），此时 `configs/1/test` 会报
+     `AccessDenied ... Invalid signature`
+2. 修法 A（推荐，免找 secret）：把**当初加密用的** `data/.cookie_key`
+   作为 `COOKIE_ENC_KEY` 注入两个服务，`docker compose up -d`。
+   群晖 compose 已按此配好。
+3. 修法 B：群晖上 `garage key info <KeyID>` 取 `Secret key`，WebUI
+   「图片备份 → 编辑 → Secret Key」重填 → 测试连接 → 保存。
+4. 修好后的判定：`secret_masked` 非空、`test` 返回 `ok:true`、
+   `object/<key>` 返回 200。S3 里已有的备份对象会立刻可读。
+
+> 外链（xhscdn）带时间戳签名，过期后永久 403，救不回来；只能靠 S3 备份
+> 或重新落盘。
+
 #### 群晖 Docker GUI 单独起两个容器（不用 compose）时必改
 
 compose 里的 `http://crawler:8001` 依赖 compose 服务名，GUI 起容器时不存在：

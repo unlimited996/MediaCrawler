@@ -55,6 +55,10 @@ services:
       # 日后启用服务发现即用内网地址（别填 www.joyeuse.cn，DDNS 漂移会连不上）。
       # 注意 9000=OpenAPI，8085 只是控制台 Web 端口，填 8085 必然注册失败。
       NACOS_SERVER: "192.168.10.38:9000"
+      # 与历史加密数据对齐：群晖 mc-data 是新卷，会自己生成另一把 Fernet key，
+      # 导致库里 10-21 加密的 S3 Secret / 账号池 Cookie 解不开（Invalid signature）。
+      # 固定成当初加密用的 key（本地 data/.cookie_key），一次性修好解密。
+      COOKIE_ENC_KEY: ${COOKIE_ENC_KEY:-}
       CRAWLER_SERVICE_NAME: mediacrawler-crawler
       LIBRARY_SERVICE_NAME: mediacrawler-library
       CRAWLER_BASE_URL: http://crawler:8001
@@ -112,6 +116,10 @@ services:
       # 日后启用服务发现即用内网地址（别填 www.joyeuse.cn，DDNS 漂移会连不上）。
       # 注意 9000=OpenAPI，8085 只是控制台 Web 端口，填 8085 必然注册失败。
       NACOS_SERVER: "192.168.10.38:9000"
+      # 与历史加密数据对齐：群晖 mc-data 是新卷，会自己生成另一把 Fernet key，
+      # 导致库里 10-21 加密的 S3 Secret / 账号池 Cookie 解不开（Invalid signature）。
+      # 固定成当初加密用的 key（本地 data/.cookie_key），一次性修好解密。
+      COOKIE_ENC_KEY: ${COOKIE_ENC_KEY:-}
       CRAWLER_SERVICE_NAME: mediacrawler-crawler
       LIBRARY_SERVICE_NAME: mediacrawler-library
       # 关键：网关把 /crawler/** 转发到这里，必须是容器服务名，不能是 127.0.0.1
