@@ -5,6 +5,43 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-09] 态度标签库/S3 备份页「空」= 三个页面绕过了服务前缀；图片过期加免签名兜底
+
+### 1. 态度标签库空 / S3 备份页全空（同一个根因）
+`StanceTagsView.tsx`、`S3BackupView.tsx`、`StoryEditLogDialog.tsx` 各自
+`axios.create({ baseURL: '/api' })`，绕开了 `lib/api.ts` 的 `servicePrefix`
+（拆分后应走 `/library/api`）。实测前端请求：
+
+```
+/api/stance-tags          404
+/api/s3-backup/stats      404
+/api/s3-backup/configs    404
+/library/api/config/platforms  200
+```
+
+所以标签库显示「version 0 · 0 个标签」、S3 页数据全空 —— 不是没数据
+（接口实测 10 个标签 / 171 条规则 / version 9，S3 已上传 5520 张）。
+
+修复：三个文件统一 `import api from '@/lib/api'`，删掉自建实例。
+S3BackupView 里 `<img src="/library/api/...">` 是 DOM 属性不走 axios，保持原样。
+
+### 2. 过期图片：免签名 CDN 兜底（不需要 token）
+小红书图片外链带时间戳+签名，过期即 403；签名无法在客户端重算。
+但实测**换免签名域名仍返回 200**（过期 10 天的链接）：
+
+```
+sns-webpic-qc.xhscdn.com/<ts>/<sign>/<key>!xxx  -> 403
+sns-img-qc.xhscdn.com/<key>!xxx                 -> 200 image/webp
+```
+
+新增 `tools/media_url.py::xhs_mirror_url()`；`_load_comment_pictures` 与
+story 详情 media 输出增加 `mirror_url`；前端候选顺序改为
+**本地 → S3 备份 → 免签名镜像 → 原外链**，并给 `<img>` 加
+`referrerPolicy="no-referrer"`（实测带本站 Referer 会 403，带小红书
+Referer 或不带是 200）。
+
+单测：签名 URL 变换、已是镜像域名、非小红书 URL、空值 4 个用例全过。
+
 ## [2026-11-09] 评论图 95% 是坏 URL；S3 备份队列只涨不消
 
 ### 1. 评论里的图显示不出来

@@ -10,13 +10,12 @@
 
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import axios from 'axios'
+import api from '@/lib/api'
 import {
   Plus, Trash2, Power, Save, RefreshCw, Wand2, ChevronDown, ChevronRight,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
-const api = axios.create({ baseURL: '/api' })
 
 interface TagRule {
   id: number

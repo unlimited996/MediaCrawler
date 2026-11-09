@@ -25,6 +25,7 @@ from database.models_v2 import (
 )
 
 from ..service_paths import asset_url as _asset_url, library_api as _library_api
+from tools.media_url import xhs_mirror_url
 
 router = APIRouter(prefix="/stories", tags=["story"])
 
@@ -185,6 +186,8 @@ async def _load_comment_pictures(session, comment_ids: List[int]
             "url": resolved,
             "local_url": local_url,
             "backup_url": backup_url,
+            # 原外链过期（403）时的免签名镜像，前端 <img> 用它兜底
+            "mirror_url": xhs_mirror_url(m.source_url) if m.source_url else None,
             "source": src,
         })
     return out
@@ -587,6 +590,8 @@ async def get_story(story_id: int):
                 ),
                 # S3 备份地址（P4）：本地 / 外链都不可用时兜底
                 "backup_url": backup_urls.get(m.id),
+                # 平台原图过期时的免签名镜像（仅小红书适用）
+                "mirror_url": xhs_mirror_url(m.source_url) if m.source_url else None,
                 # 访问链优先级：本地 → 平台远程 → S3 备份
                 "source": ("local" if m.local_path
                            else ("remote" if m.source_url

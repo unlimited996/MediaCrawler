@@ -207,7 +207,8 @@ export interface MediaItem {
 
 /** 单条媒体的候选源（去重去空，保持优先级顺序） */
 function mediaCandidates(m: any): string[] {
-  const raw = [m?.local_url, m?.url, m?.backup_url]
+  // 本地 → S3 备份 → 免签名镜像 → 原外链（xhscdn 签名过期即 403）
+  const raw = [m?.local_url, m?.backup_url, m?.mirror_url, m?.url]
   const out: string[] = []
   for (const u of raw) {
     if (typeof u === 'string' && u && !out.includes(u)) out.push(u)
@@ -298,6 +299,8 @@ export function MediaImage({
       src={current}
       alt={alt}
       loading="lazy"
+      // xhscdn 免签名镜像有防盗链：带本站 Referer 会 403，必须不发 Referer
+      referrerPolicy="no-referrer"
       onClick={handleClick}
       className={`${className} ${zoomable ? 'cursor-zoom-in' : ''}`}
       style={style}

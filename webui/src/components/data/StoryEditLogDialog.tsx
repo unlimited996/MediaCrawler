@@ -7,10 +7,9 @@
 
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import axios from 'axios'
+import api from '@/lib/api'
 import { X, History } from 'lucide-react'
 
-const api = axios.create({ baseURL: '/api' })
 
 interface EditItem {
   id: number

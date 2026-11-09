@@ -14,7 +14,7 @@
 
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import axios from 'axios'
+import api from '@/lib/api'
 import {
   CloudUpload, Crosshair, DatabaseBackup, HardDriveDownload, Layers, Play, Plus,
   Power, RefreshCw, RotateCcw, Trash2, Wifi, X, Zap,
@@ -33,7 +33,6 @@ import {
 } from '@/lib/api'
 import { useImageViewer } from '@/components/data/platform/ImageViewer'
 
-const api = axios.create({ baseURL: '/api' })
 
 const STATUS_LABEL: Record<string, { label: string; cls: string }> = {
   pending: { label: '待备份', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40' },
