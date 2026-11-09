@@ -85,22 +85,33 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
             continue
         sizes = [int(i.size_bytes or 0) for i in items]
         keys = [i.object_key for i in items]
+        # 关键：按「不同 object_key」而不是「行数」统计。
+        # 去重执行后多行会指向同一个规范键，S3 上只剩一份——若按行数算，
+        # 报告会永远显示「可收回 N MB」，用户执行完以为没生效（2026-11-09 反馈）。
+        distinct = list(dict.fromkeys(keys))
+        if len(distinct) < 2:
+            continue
+        size_by_key: Dict[str, int] = {}
+        for k, sz in zip(keys, sizes):
+            size_by_key.setdefault(k, sz)
         # 若组内已存在规范键（上次去重留下的），优先复用，避免反复拷贝
         existing = [i for i in items if i.object_key.startswith(f"{CANON_PREFIX}/")]
         canonical = existing[0] if existing else items[0]
-        total = sum(sizes)
-        reclaimable_bytes += (total - int(canonical.size_bytes or 0))
-        redundant_objects += (len(items) - 1)
+        canon_key = canonical.object_key
+        canon_size = size_by_key.get(canon_key, int(canonical.size_bytes or 0))
+        total = sum(size_by_key.values())
+        reclaimable_bytes += (total - canon_size)
+        redundant_objects += (len(distinct) - 1)
         dup_groups.append({
             "checksum": csum,
             "media_type": items[0].media_type,
-            "count": len(items),
-            "canonical_key": canonical.object_key,
-            "canonical_already": canonical.object_key.startswith(f"{CANON_PREFIX}/"),
-            "size_bytes": int(canonical.size_bytes or 0),
-            "reclaimable_bytes": total - int(canonical.size_bytes or 0),
-            "keys": keys,
-            "sizes": sizes,  # 与 keys 一一对应，便于 UI 展示与精确估算
+            "count": len(distinct),
+            "canonical_key": canon_key,
+            "canonical_already": canon_key.startswith(f"{CANON_PREFIX}/"),
+            "size_bytes": canon_size,
+            "reclaimable_bytes": total - canon_size,
+            "keys": distinct,
+            "sizes": [size_by_key[k] for k in distinct],  # 与 keys 一一对应
             # 涉及的帖/评论（按 content_id 去重），便于判断合并范围
             "content_ids": sorted({i.content_id for i in items if i.content_id}),
         })

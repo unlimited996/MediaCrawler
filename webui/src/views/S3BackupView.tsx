@@ -215,14 +215,19 @@ export function S3BackupView() {
     mutationFn: async () => (await api.post('/s3-backup/dedup/run', { execute: false })).data,
     onSuccess: () => {
       dedupQ.refetch()
-      toast.success('去重分析完成')
+      toast.success('分析完成：仅统计，未删除任何对象。要真正回收请点「执行去重」')
     },
   })
   const dedupRunM = useMutation({
     mutationFn: async (payload: any) => (await api.post('/s3-backup/dedup/run', payload)).data,
     onSuccess: (d: any) => {
       toast.success(d?.started ? '去重合并已在后台启动，稍后查看报告' : (d?.note || '未启动'))
-      if (d?.started) setExcludedKeys(new Set())  // 已提交，清空选择
+      if (d?.started) {
+        setExcludedKeys(new Set())  // 已提交，清空选择
+        // 后台任务要跑一会儿，延时刷新两次让报告跟上
+        setTimeout(() => dedupQ.refetch(), 5000)
+        setTimeout(() => dedupQ.refetch(), 15000)
+      }
     },
     onError: (e: any) => toast.error(`启动失败：${e?.response?.data?.detail || e?.message}`),
   })
@@ -287,7 +292,7 @@ export function S3BackupView() {
             <div className="mt-2 grid grid-cols-3 gap-2">
               <StatCard label="重复组" value={dedupQ.data?.dup_groups ?? 0} tone="purple" />
               <StatCard label="冗余对象" value={dedupQ.data?.redundant_objects ?? 0} tone="orange" />
-              <StatCard label="可收回" value={fmtBytes(dedupQ.data?.reclaimable_bytes ?? 0)} tone="cyan" />
+              <StatCard label="待回收" value={fmtBytes(dedupQ.data?.reclaimable_bytes ?? 0)} tone="cyan" />
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <Button size="sm" variant="outline" className="font-mono text-xs"
@@ -322,10 +327,14 @@ export function S3BackupView() {
                   ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
                   : 'border-rose-500/30 bg-rose-500/10 text-rose-300'}`}>
                 {dedupQ.data.last_run.ok
-                  ? `上次${dedupQ.data.last_run.execute ? '执行' : '分析'}：` +
-                    `合并 ${dedupQ.data.last_run.groups ?? 0} 组，` +
-                    `删 ${dedupQ.data.last_run.objects_deleted ?? 0} 对象，` +
-                    `释放 ${fmtBytes(dedupQ.data.last_run.bytes_reclaimed ?? 0)}`
+                  ? (dedupQ.data.last_run.execute
+                      ? `上次执行：合并 ${dedupQ.data.last_run.groups ?? 0} 组，` +
+                        `删除 ${dedupQ.data.last_run.objects_deleted ?? 0} 个对象，` +
+                        `释放 ${fmtBytes(dedupQ.data.last_run.bytes_reclaimed ?? 0)}`
+                      : `上次分析（未删除任何对象）：可合并 ${dedupQ.data.last_run.groups ?? 0} 组、` +
+                        `预计删除 ${dedupQ.data.last_run.objects_deleted ?? 0} 个、` +
+                        `可回收 ${fmtBytes(dedupQ.data.last_run.bytes_reclaimed ?? 0)}。` +
+                        `点「执行去重」才会真正生效`)
                   : `上次运行失败：${dedupQ.data.last_run.error || ''}`}
                 {dedupQ.data.last_run.errors?.length
                   ? `（${dedupQ.data.last_run.errors.length} 组跳过）` : ''}
