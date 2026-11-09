@@ -5,6 +5,73 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-09] 容器抓取命中安全验证：弹出窗口永远看不到 → 推送到 WebUI
+
+### 现象
+定时任务 `--lt cookie` 已登录，打开首页仍命中安全验证，日志一路打印：
+
+```
+[XiaoHongShuCrawler] 首页命中安全验证，等待人工处理 ...
+[XiaoHongShuCrawler] 命中验证码 → 准备弹出浏览器（主页面有 / 无头模式=False）
+[XiaoHongShuCrawler] 已临时打开浏览器窗口用于人工过验证
+[anti_risk] 触发小红书安全验证！浏览器窗口已置前 ...
+最长等待 300s
+```
+
+用户看不到任何窗口，300s 后任务失败/重试。
+
+### 两个独立的原因
+1. **登录 ≠ 免风控**：Cookie/web_session 只解决「你是谁」，安全验证看的是
+   设备指纹 + 出口 IP + 行为。容器跑 `chrome-headless-shell`（headless、
+   TLS/JA3 与真实 Chrome 不同）、家宽动态 IP、定时任务固定节奏，都会触发
+   小红书风控，跟有没有登录无关。
+2. **弹窗在容器里根本不存在**：`_human_verify` 里 `need_spawn = True` 写死，
+   一律走 `_spawn_verify_browser()` 的
+   `chromium.launch(headless=False)`。容器没有 X server，镜像里也只有
+   `chrome-headless-shell`（不支持有头模式）；`launch()` 返回成功被当成
+   「窗口已打开」写进日志，实际什么都没有。`focus_browser_window()` 在
+   非 Windows 直接返回 False。`wait_for_human_verify` 于是干等 300s。
+
+### 修复：复用命中验证的那个页面，推到 WebUI
+不再另起浏览器 —— 主流程的 `self.context_page` 本来就停在验证页，
+把它通过共享文件推给 crawler API 进程（同容器共用 `mc-logs` 卷，
+与 `scheduler_live.jsonl` / `.stop_crawl` 同一套机制）：
+
+```
+logs/captcha_session/active.json   存在即「需要人工验证」，前端据此自动弹窗
+                    frame.jpg     0.8s 原子替换的页面截图
+                    cmd.jsonl     API 追加写指令，抓取进程按字节偏移消费
+                    done.json     用户点「我已完成验证」→ 等待循环立即放行
+```
+
+- 新增 `tools/captcha_bridge.py`（抓取子进程侧）：`is_remote_mode()` 默认
+  「Linux 且无 DISPLAY」= 容器；`drive()` 后台截图 + 指令回放，支持
+  `click / drag(滑块,分步移动) / type / key / scroll / reload / done`。
+- 新增 `api/routers/captcha_session.py`（API 侧纯文件中转）：
+  `status / screenshot / input / done`，挂到 `crawler_app`。
+- `core.py::_human_verify` 增加远程分支 → `_human_verify_remote()`：
+  不 spawn、不 `goto`（避免冲掉验证页）、复用 `self.context_page`；
+  结束后沿用原有链路把 Cookie 回灌 httpx + 账号池（持久化，下轮可用）。
+  本机 Windows / 有桌面的 Linux 原弹窗逻辑**完全不变**。
+- `anti_risk.wait_for_human_verify` 加向后兼容的可选 `done_check`，
+  三个等待循环里检查；用户点「我已完成验证」不用等满 300s。
+- 前端 `CaptchaDialog`：每 2s 轮询 status，active 由 false→true 自动弹出；
+  截图轻点=点击、按住拖动=滑块；原始尺寸/适应屏幕切换、手机全屏、
+  `z-[80]` 浮在登录页与小二维码弹窗之上；最小化后留「安全验证待处理」入口。
+
+### 验证
+- 本地桥接模拟：status/screenshot/click/drag/type/key/done 全 200；
+  `drag` 正确产生 move→down→move(steps=18)→up；done 后 status 立即 inactive、
+  `active.json` 清理；`wait_for_human_verify(done_check=...)` **1.0s** 放行
+  （原来要等 300s）。
+- `py_compile` 全部通过、`main.py --help` 正常、`npm run build` 通过。
+
+### 仍需注意
+这是「触发后能过」的治标方案，**风控根因（headless 指纹 / 出口 IP）没变**，
+以后还会再触发。想降低频率：用 `CDP_HOST` 连本地真实 Chrome、换出口 IP/代理、
+装完整 chromium、降频 + 拉长间隔。需要彻底无人值守时，建议改成
+「命中验证即熔断并等冷却」而不是每次等人来点。
+
 ## [2026-11-09] 手机端登录页兼容 + 帖子图片加载不出来的真实根因
 
 ### 手机端「看不到验证码弹窗」

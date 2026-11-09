@@ -5,6 +5,7 @@ import { MainContent } from '@/components/layout/MainContent'
 import { CrawlLeftPanel } from '@/components/layout/CrawlLeftPanel'
 import { LoginQrcodeFab } from '@/components/layout/LoginQrcodeFab'
 import { LoginPageDialog } from '@/components/layout/LoginPageDialog'
+import { CaptchaDialog } from '@/components/layout/CaptchaDialog'
 import { EnvironmentCheck, isEnvChecked } from '@/components/env/EnvironmentCheck'
 import { LicenseDisclaimer, isLicenseAccepted } from '@/components/license/LicenseDisclaimer'
 import { HotTimelineView } from '@/views/HotTimelineView'
@@ -114,6 +115,7 @@ function App() {
         {/* 扫码登录二维码：全局浮动可收纳，任何页面都能扫（访客视图除外） */}
         {view !== 'guest' && <LoginQrcodeFab />}
         {view !== 'guest' && <LoginPageDialog />}
+        {view !== 'guest' && <CaptchaDialog />}
 
         {/* Toast notifications - Theme-aware style */}
         <Toaster

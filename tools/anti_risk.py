@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from tools import utils
 
@@ -226,7 +226,8 @@ async def wait_for_human_verify(page, timeout_sec: int = 300,
                                 poll_sec: float = 5.0,
                                 url: Optional[str] = None,
                                 grace_sec: float = 8.0,
-                                manual_window_sec: Optional[float] = None) -> bool:
+                                manual_window_sec: Optional[float] = None,
+                                done_check: Optional[Callable[[], bool]] = None) -> bool:
     """验证码人工介入：把浏览器窗口弹到最前，等用户手动完成验证后继续。
 
     流程：窗口置前 →（可选）导航到触发风控的 URL → 等验证页真正渲染出来 →
@@ -245,6 +246,14 @@ async def wait_for_human_verify(page, timeout_sec: int = 300,
 
     page 为 None 时无法人工操作，直接返回 False（调用方应先尝试拉起浏览器）。
     """
+    # 容器远程过验证：用户点 WebUI「我已完成验证」后不必等满 300s。
+    # done_check 是同步回调（读共享标记文件），默认 None 完全不影响原有调用点。
+    def _remote_done() -> bool:
+        try:
+            return bool(done_check and done_check())
+        except Exception:
+            return False
+
     timeout_sec = int(timeout_sec or 300)
     # 轮询间隔必须 > 0：传 0 会让 waited 永远不增，循环卡死（测试里踩过）
     poll = max(0.05, float(poll_sec or 0))
@@ -267,18 +276,31 @@ async def wait_for_human_verify(page, timeout_sec: int = 300,
         except Exception as e:
             utils.logger.warning(f"[anti_risk] 打开验证页失败（不影响人工操作）：{e}")
 
-    utils.logger.warning(
-        "\n" + "=" * 64 +
-        "\n[anti_risk] 触发小红书安全验证！浏览器窗口已置前，请在该窗口中"
-        "\n           手动完成验证（滑块 / 扫码 / 点按），完成后程序会自动继续。"
-        f"\n           最长等待 {timeout_sec}s（页面：{(url or '当前页')[:80]}）" +
-        "\n" + "=" * 64)
+    if done_check:
+        # 容器 / 无图形界面：根本没有可见窗口，验证页已推到 WebUI
+        utils.logger.warning(
+            "\n" + "=" * 64 +
+            "\n[anti_risk] 触发小红书安全验证！验证页已推送到 WebUI，"
+            "\n           请在「安全验证」弹窗中完成（滑块 / 扫码 / 点按），"
+            "\n           点「我已完成验证」后程序立即继续。"
+            f"\n           最长等待 {timeout_sec}s（页面：{(url or '当前页')[:80]}）" +
+            "\n" + "=" * 64)
+    else:
+        utils.logger.warning(
+            "\n" + "=" * 64 +
+            "\n[anti_risk] 触发小红书安全验证！浏览器窗口已置前，请在该窗口中"
+            "\n           手动完成验证（滑块 / 扫码 / 点按），完成后程序会自动继续。"
+            f"\n           最长等待 {timeout_sec}s（页面：{(url or '当前页')[:80]}）" +
+            "\n" + "=" * 64)
 
     # 2) 先给页面渲染的宽限期，避免"验证页还没出来"被误判成"已完成"
     waited = 0.0
     while waited < min(grace_sec, timeout_sec):
         await asyncio.sleep(1.0)
         waited += 1.0
+        if _remote_done():
+            utils.logger.info("[anti_risk] 用户已在 WebUI 确认完成验证，立即继续")
+            return True
 
     # 3) 轮询：必须有「见过验证页 → 又消失」的过程才算通过
     saw_captcha = await page_has_captcha(page)
@@ -303,6 +325,9 @@ async def wait_for_human_verify(page, timeout_sec: int = 300,
         while waited < window:
             await asyncio.sleep(poll)
             waited += poll
+            if _remote_done():
+                utils.logger.info("[anti_risk] 用户已在 WebUI 确认完成验证，立即继续")
+                return True
             if await page_has_captcha(page):
                 utils.logger.warning(
                     "[anti_risk] 检测到验证页，转为等待你完成验证 ...")
@@ -328,6 +353,9 @@ async def wait_for_human_verify(page, timeout_sec: int = 300,
     while waited < timeout_sec:
         await asyncio.sleep(poll)
         waited += poll
+        if _remote_done():
+            utils.logger.info("[anti_risk] 用户已在 WebUI 确认完成验证，立即继续")
+            return True
         if not await page_has_captcha(page):
             utils.logger.info(
                 f"[anti_risk] 人工验证已完成（等了 {int(waited)}s），继续抓取")

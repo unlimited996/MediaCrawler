@@ -1802,6 +1802,81 @@ class XiaoHongShuCrawler(AbstractCrawler):
         except Exception:
             return False
 
+    async def _human_verify_remote(self, url: Optional[str] = None) -> bool:
+        """容器/无图形环境：把命中验证的页面推到 WebUI，由用户远程完成。
+
+        不另起有头窗口，直接复用 ``self.context_page`` —— 它就是那个停在
+        验证页的页面。用户在 WebUI 上的点击 / 滑块拖拽 / 输入由
+        ``captcha_bridge`` 回放到这个 page，``page_has_captcha`` 自然由
+        True 变 False，``wait_for_human_verify`` 随即放行；用户点「我已完成
+        验证」也会通过 done_check 立刻放行。
+
+        验证后的 Cookie 回灌沿用 _human_verify 原有链路（httpx + 账号池），
+        所以下轮定时任务也能用到最新登录态。
+        """
+        from tools import captcha_bridge as bridge
+
+        page = self.context_page
+        if page is None:
+            utils.logger.warning(
+                "[XiaoHongShuCrawler] 容器远程验证需要主页面，但 context_page 为空")
+            return False
+
+        target = url or self.index_url
+        self._human_verify_tried = True
+        utils.logger.warning(
+            "[XiaoHongShuCrawler] 容器环境无可见窗口 → 已把安全验证页推送到 "
+            "WebUI「安全验证」弹窗，请在其中完成滑块 / 扫码 / 点按")
+
+        driver: Optional[Task] = None
+        verified = False
+        try:
+            driver = asyncio.create_task(bridge.drive(page, target))
+            # 故意不传 url：当前页面已停在验证页，goto 会把验证状态冲掉
+            verified = await anti_risk.wait_for_human_verify(
+                page,
+                timeout_sec=_xhs_captcha_wait_sec(),
+                done_check=bridge.is_done,
+            )
+            if self.browser_context is not None:
+                try:
+                    if self.xhs_client is not None:
+                        await self.xhs_client.update_cookies(
+                            self.browser_context, self.cookie_urls)
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[XiaoHongShuCrawler] 验证后刷新 httpx Cookie 失败：{e}")
+                try:
+                    from tools.cookie_sync import sync_login_to_pool
+
+                    await sync_login_to_pool("xhs", self.browser_context,
+                                             self.cookie_urls)
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler] 已把验证后的登录态同步到账号池")
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[XiaoHongShuCrawler] 验证后同步账号池失败：{e}")
+        except Exception as e:
+            utils.logger.error(
+                f"[XiaoHongShuCrawler] 远程人工验证流程异常（按未通过处理）："
+                f"{type(e).__name__}: {e}")
+            verified = False
+        finally:
+            await bridge.close()
+            if driver is not None:
+                driver.cancel()
+                try:
+                    await driver
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        if verified:
+            self._comment_fail_streak = 0
+            utils.logger.info(
+                "[XiaoHongShuCrawler] 远程验证会话已结束，是否解除熔断由"
+                "紧随其后的重试结果决定")
+        return verified
+
     async def _human_verify(self, url: Optional[str] = None) -> bool:
         """撞风控后**弹出浏览器**让用户人工过验证（每轮最多一次）。
 
@@ -1822,6 +1897,18 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 "[XiaoHongShuCrawler] 本轮已尝试过一次人工验证，不再重复弹窗"
                 "（避免连续 461 反复打断你）")
             return False
+
+        # 容器 / 无图形环境：原来那条「另开有头窗口」是死路 —— 镜像里只有
+        # chrome-headless-shell，也没有 X server，日志说「已打开窗口」但用户
+        # 什么也看不到，最后干等 300s。改为把当前验证页推到 WebUI。
+        try:
+            from tools import captcha_bridge
+            if captcha_bridge.is_remote_mode():
+                return await self._human_verify_remote(url)
+        except Exception as e:
+            utils.logger.warning(
+                f"[XiaoHongShuCrawler] 远程验证模式探测失败，回退弹窗: "
+                f"{type(e).__name__}: {e}")
 
         utils.logger.warning(
             f"[XiaoHongShuCrawler] 命中验证码 → 准备弹出浏览器（"

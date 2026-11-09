@@ -44,6 +44,7 @@ _ROUTER_EXPORTS = {
     "app_config_router": ("recipe", "app_config_router"),
     "env_router": ("env", "router"),
     "login_session_router": ("login_session", "router"),
+    "captcha_session_router": ("captcha_session", "router"),
 }
 
 

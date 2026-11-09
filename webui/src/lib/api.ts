@@ -135,6 +135,24 @@ export const loginSessionApi = {
     '/crawler/login-session/stop'),
 }
 
+/** 抓取任务命中安全验证时的远程验证会话（容器无图形界面，截图 + 坐标回传） */
+export interface CaptchaSessionStatus {
+  active: boolean
+  url: string
+  started_at: string
+  age_sec: number
+  message: string
+}
+
+export const captchaSessionApi = {
+  status: () => api.get<CaptchaSessionStatus>('/crawler/captcha-session/status'),
+  input: (payload: {
+    action: string; x?: number; y?: number; x2?: number; y2?: number
+    text?: string; key?: string; dy?: number
+  }) => api.post<{ ok: boolean }>('/crawler/captcha-session/input', payload),
+  done: () => api.post<{ ok: boolean; message: string }>('/crawler/captcha-session/done'),
+}
+
 /** 抓取队列：爬虫忙时提交的任务排队，前一个跑完自动续跑 */
 export const crawlerQueueApi = {
   list: (status?: string) =>
