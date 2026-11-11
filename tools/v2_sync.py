@@ -1148,27 +1148,52 @@ def _is_blank(v) -> bool:
     return not s or s.lower() in ("null", "none", "undefined")
 
 
+def _norm_profile_url(url: str) -> str:
+    """主页链接归一化：去首尾空白、去末尾斜杠。
+
+    同一主页的 `.../profile/abc` 与 `.../profile/abc/` 必须视为同一个人，否则
+    重抓一次就会多出一个作者行（破坏「一人一行」的唯一性）。
+    协议、路径大小写、查询串都保持原样 —— 主页路径可能大小写敏感，查询串里也
+    可能带平台要求的 token，改了会跳不过去。
+    """
+    return (url or "").strip().rstrip("/")
+
+
+def _same_profile_cond(profile_url: str):
+    """主页相等条件：同时兼容库里存了末尾斜杠的历史数据。"""
+    return or_(Author.profile_url == profile_url,
+               func.rtrim(Author.profile_url, "/") == profile_url)
+
+
 def apply_author_refresh(row, nickname: str = "", avatar: str = "",
                          profile_url: str = "",
-                         follower_count: Optional[int] = None) -> List[str]:
+                         follower_count: Optional[int] = None,
+                         full: Optional[bool] = None) -> List[str]:
     """按统一规则刷新一个已存在的作者行，返回实际变动的字段名。
 
-    规则（两种情形，差别只在头像）：
-      * **头像为空**：这行是残缺快照（导入 / 列表页抓取时平台没返回头像）。
-        本次抓到的数据更完整 → 全字段更新（昵称/头像/主页/粉丝数）。
-        只补头像会留下「新头像 + 旧昵称」这类半新半旧的脏数据。
-      * 头像已有：只补空字段，绝不覆盖已有值（防止某次抓取缺字段把好数据冲成空）。
+    `full` 决定覆盖强度：
+      * `True`  → **全字段更新**：昵称 / 头像 / 主页 / 粉丝数，只要本次抓到了
+        非空值就覆盖（"读取到重复作者"走这条路，不管库里有没有头像）。
+      * `False` → 只补空字段，绝不覆盖已有值（防止某次抓取缺字段把好数据冲成空）。
+      * `None`（默认）→ 自动判断：头像为空即按全字段更新（残缺快照自愈）。
+
+    无论哪种模式，空值一律不写（抓取缺字段不会把库里已有值冲成空）；
+    昵称按列宽截断到 128。
 
     抓取链路（`_get_or_create_author`）与 JSONL 导入（`scripts/migrate_jsonl_to_v2.py`）
     共用这一个实现，避免两边策略漂移。
     """
+    if full is None:
+        full = _is_blank(getattr(row, "avatar_url", None))
+
     nickname = (nickname or "")[:128]
     updates: Dict[str, Any] = {}
 
-    if avatar and _is_blank(getattr(row, "avatar_url", None)):
+    if full:
         if nickname:
             updates["nickname"] = nickname
-        updates["avatar_url"] = avatar
+        if avatar:
+            updates["avatar_url"] = avatar
         if profile_url:
             updates["profile_url"] = profile_url
         if follower_count is not None:
@@ -1176,6 +1201,8 @@ def apply_author_refresh(row, nickname: str = "", avatar: str = "",
     else:
         if nickname and _is_blank(getattr(row, "nickname", None)):
             updates["nickname"] = nickname
+        if avatar and _is_blank(getattr(row, "avatar_url", None)):
+            updates["avatar_url"] = avatar
         if profile_url and _is_blank(getattr(row, "profile_url", None)):
             updates["profile_url"] = profile_url
         if follower_count is not None and getattr(row, "follower_count", None) is None:
@@ -1189,34 +1216,55 @@ def apply_author_refresh(row, nickname: str = "", avatar: str = "",
     return changed
 
 
+def _salvage_author_fields(keep, dupe) -> List[str]:
+    """合并前先把重复行里有、保留行里没有的数据捞到保留行（只填空，不覆盖）。
+
+    否则「保留行没有头像、重复行有头像」时，重复行一删头像就永远丢了。
+    只填空不覆盖：保留行已有的值优先，随后再由抓取到的实时数据做全字段刷新。
+    """
+    changed: List[str] = []
+    for field in ("nickname", "avatar_url", "profile_url"):
+        if _is_blank(getattr(keep, field, None)) and not _is_blank(getattr(dupe, field, None)):
+            setattr(keep, field, getattr(dupe, field))
+            changed.append(field)
+    if getattr(keep, "follower_count", None) is None and getattr(dupe, "follower_count", None) is not None:
+        keep.follower_count = dupe.follower_count
+        changed.append("follower_count")
+    # ext 里是平台附加信息，两边合并、保留行优先（Author.ext 目前未使用，做个兜底）
+    dupe_ext = getattr(dupe, "ext", None) or {}
+    if isinstance(dupe_ext, dict) and dupe_ext:
+        keep_ext = getattr(keep, "ext", None) or {}
+        keep.ext = {**dupe_ext, **keep_ext}
+        changed.append("ext")
+    return changed
+
+
 async def _get_or_create_author(session: AsyncSession, site_id: int,
                                 anon_hash: str, nickname: str = "",
                                 avatar: str = "",
                                 profile_url: str = "",
                                 follower_count: Optional[int] = None) -> Optional[int]:
-    """取/建作者，并尽力回填缺失字段（头像 / 昵称 / 主页 / 粉丝数）。
+    """取/建作者：命中已有行时合并重复行并刷新全字段，返回**规范行** id。
 
     身份匹配优先级：
       1) anon_hash（实时抓取与导入通常一致）
       2) profile_url（实时重抓必带真实主页链接；可救回「导入时哈希不一致」
          或「导入时头像/主页缺失」的历史作者 —— 这是"重新抓取自动恢复"的关键）
 
-    回填策略（两条，差别只在头像）：
-      * **库里这位用户的头像为空** → 说明这行是残缺快照（导入 / 列表页抓取时
-        平台没返回头像）。此时本次抓到的数据是更完整的一份，按「全字段更新」
-        覆盖昵称 / 头像 / 主页 / 粉丝数；只补头像会留下「新头像 + 旧昵称」
-        这种半新半旧的脏数据。
-      * 头像已有 → 只补空字段，不覆盖已有值（防止某次抓取缺字段把好数据冲成空）。
+    两条身份线索都拿到时，两个口径下的重复行会一并合并（见
+    `_merge_duplicate_authors`）：字段先捞后删、story/chapter/comment 引用全部
+    改指规范行，因此不会出现「帖子还挂在无头像的老行上」这种半吊子状态。
 
-    若以 profile_url 命中但与现有 anon_hash 不符，统一为本次（实时）哈希，
-    避免下次再走 profile_url 分支。
+    刷新强度（见 `apply_author_refresh`）：
+      * 本次**合并过重复行**（说明是同一人多行）→ 全字段更新，不看头像有没有；
+      * 否则头像为空 → 全字段更新（残缺快照自愈）；
+      * 其余情况只补空字段，不覆盖已有值。
 
-    若同一 profile_url 下存在多条作者（重复导入导致，例如同一人既有空头像行
-    又有带头像行），自动合并：评论迁到「规范行」（优先有头像、否则 id 最小），
-    并删掉未被 story 引用的孤儿重复行。
+    唯一性：哈希/主页都没有的条目**不建行**（返回 None），否则会出现大量
+    `anon_hash=''` 的行互相撞 `uq_author_site_hash`，把整条内容同步搞失败。
     """
     anon_hash = anon_hash or ""
-    profile_url = profile_url or ""
+    profile_url = _norm_profile_url(profile_url)
     nickname = (nickname or "")[:128]
 
     # 1) 优先按 anon_hash 匹配
@@ -1227,21 +1275,27 @@ async def _get_or_create_author(session: AsyncSession, site_id: int,
                                  Author.anon_hash == anon_hash)
         )).scalar_one_or_none()
 
-    # 2) 回退按 profile_url 匹配（实时重抓必带真实主页链接；可救回「导入时哈希
-    #    不一致」或「导入时头像/主页缺失」的历史作者 —— 这是"重新抓取自动恢复"的关键）
+    # 2) 回退按 profile_url 匹配（同一主页可能有多行：优先头像，其次昵称，最后 id 小）
     if row is None and profile_url:
         dupes = (await session.execute(
             select(Author).where(Author.source_site_id == site_id,
-                                 Author.profile_url == profile_url)
+                                 _same_profile_cond(profile_url))
         )).scalars().all()
         if dupes:
-            # 规范行：优先已有头像，否则 id 最小
-            if any(a.avatar_url for a in dupes):
-                row = max(dupes, key=lambda a: (bool(a.avatar_url), -a.id))
-            else:
-                row = min(dupes, key=lambda a: a.id)
+            row = max(dupes, key=lambda a: (
+                not _is_blank(a.avatar_url),
+                not _is_blank(a.nickname),
+                -a.id,
+            ))
 
     if row is None:
+        if not anon_hash and not profile_url:
+            # 没有任何身份线索：不建行。硬建会产出 anon_hash='' 的行，
+            # 第二条同类记录就撞唯一索引 → 整条内容同步失败。
+            utils.logger.debug(
+                f"[v2_sync] 作者缺少哈希与主页链接，跳过建档（site={site_id}, "
+                f"nickname={nickname!r}）")
+            return None
         row = Author(source_site_id=site_id, anon_hash=anon_hash,
                      nickname=nickname or None, avatar_url=avatar or None,
                      profile_url=profile_url or None,
@@ -1250,53 +1304,111 @@ async def _get_or_create_author(session: AsyncSession, site_id: int,
         await session.flush()
         return row.id
 
-    # 已存在：若 profile_url 非空，先把同 profile_url 的重复作者合并进本行
-    #（消除"同一人既有空头像行又有带头像行"的重复，评论一并迁到规范行）
-    if profile_url:
-        await _merge_duplicate_authors(session, site_id, profile_url, row.id)
+    # ---------- 合并重复行（主页 + 哈希两个口径） ----------
+    merged = await _merge_duplicate_authors(
+        session, site_id, row.id, profile_url=profile_url)
 
-    # ---------- 回填 / 全字段刷新（规则见 apply_author_refresh） ----------
-    changed = apply_author_refresh(row, nickname, avatar, profile_url, follower_count)
-    if changed:
-        utils.logger.info(
-            f"[v2_sync] 作者 {row.id} 字段更新：{', '.join(changed)}"
-            f"（{'头像补齐，全字段刷新' if 'avatar_url' in changed else '头像已有，仅补空字段'}）")
-
-    # 以 profile_url 命中但哈希不一致 → 统一为实时哈希，后续直连命中
+    # ---------- 哈希统一：改成实时哈希，但不能撞唯一键 ----------
     if anon_hash and row.anon_hash != anon_hash:
+        holder = (await session.execute(
+            select(Author.id).where(Author.source_site_id == site_id,
+                                    Author.anon_hash == anon_hash,
+                                    Author.id != row.id)
+        )).scalars().all()
+        if holder:
+            # 同一哈希的另一行就是同一个人：先合并掉（会 flush 删除），再改哈希
+            merged += await _merge_duplicate_authors(
+                session, site_id, row.id, anon_hash=anon_hash)
         row.anon_hash = anon_hash
+
+    # ---------- 全字段刷新（合并过的行不看头像，一律全字段更新） ----------
+    changed = apply_author_refresh(
+        row, nickname, avatar, profile_url, follower_count,
+        full=True if merged else None)
+    if changed or merged:
+        utils.logger.info(
+            f"[v2_sync] 作者 {row.id} "
+            f"{f'合并重复行 {merged} 条，' if merged else ''}"
+            f"字段更新：{', '.join(changed) or '无'}"
+            f"（{'全字段更新' if (merged or _is_blank(row.avatar_url)) else '仅补空字段'}）")
     return row.id
 
 
-async def _merge_duplicate_authors(session: AsyncSession, site_id: int,
-                                  profile_url: str, keep_id: int) -> None:
-    """把同 profile_url 的其它作者行合并进 keep_id。
+async def _merge_authors_into(session: AsyncSession, keep_id: int,
+                              dupe_ids: List[int]) -> int:
+    """把一组已知的重复作者行合并进 keep_id，返回合并的行数。
 
-    仅迁移评论引用；删除未被任何 story 引用的孤儿重复行（保留被 story 引用的，
-    避免外键 / 数据丢失）。幂等：合并一次后不再有重复。
+    处理顺序：**先捞字段 → 再迁引用 → 最后删行**：
+      1. `_salvage_author_fields`：把重复行里有、保留行里没有的昵称/头像/主页/
+         粉丝数捞到保留行，避免「有头像的那行被删、头像永久丢失」；
+      2. 引用迁移：story.author_id / story_chapter.author_id / comment.author_id
+         全部改指 keep_id —— 这是「帖子明明有同作者带头像的另一行，页面却显示
+         空头像」的根因，只迁评论不迁 story 是不够的；
+      3. 删重复行（此时已无引用，不会留悬空外键），flush 让删除先落库，
+         调用方随后修改 keep 的 anon_hash 才不会撞唯一索引。
+
+    供两条链路复用：抓取时按主页/哈希自动识别（`_merge_duplicate_authors`），
+    以及存量数据收敛脚本 `scripts/merge_duplicate_authors.py` 按连通分量批量合并。
     """
+    dupe_ids = [i for i in dict.fromkeys(dupe_ids) if i and i != keep_id]
+    if not dupe_ids:
+        return 0
+
+    keep = await session.get(Author, keep_id)
+    if keep is None:
+        return 0
+
     dupes = (await session.execute(
-        select(Author).where(Author.source_site_id == site_id,
-                             Author.profile_url == profile_url,
-                             Author.id != keep_id)
+        select(Author).where(Author.id.in_(dupe_ids))
     )).scalars().all()
     if not dupes:
-        return
-    dupe_ids = [a.id for a in dupes]
-    # 评论：全部迁到规范行
-    await session.execute(
-        update(Comment).where(Comment.author_id.in_(dupe_ids))
-        .values(author_id=keep_id)
-    )
-    # 删除未被 story 引用的孤儿重复行
-    referenced = (await session.execute(
-        select(Story.author_id).where(Story.author_id.in_(dupe_ids))
-    )).scalars().all()
-    safe_del = [i for i in dupe_ids if i not in set(referenced)]
-    if safe_del:
+        return 0
+
+    for dupe in dupes:
+        _salvage_author_fields(keep, dupe)
+
+    real_ids = [a.id for a in dupes]
+    for model in (Story, StoryChapter, Comment):
         await session.execute(
-            delete(Author).where(Author.id.in_(safe_del))
+            update(model).where(model.author_id.in_(real_ids))
+            .values(author_id=keep_id)
         )
+    await session.execute(delete(Author).where(Author.id.in_(real_ids)))
+    await session.flush()
+
+    utils.logger.info(
+        f"[v2_sync] 作者合并：{real_ids} → {keep_id}"
+        f"（story/chapter/comment 引用已重指向）")
+    return len(real_ids)
+
+
+async def _merge_duplicate_authors(session: AsyncSession, site_id: int,
+                                  keep_id: int, profile_url: str = "",
+                                  anon_hash: str = "") -> int:
+    """按身份线索找出同一作者的多条记录并合并进 keep_id，返回合并行数。
+
+    识别口径（任一命中即为同一人，两个都空则直接返回 0，避免空值全表误匹配）：
+      * profile_url 相同 —— 实时抓取必带真实主页链接，是最可靠的跨哈希线索；
+      * anon_hash 相同 —— 唯一索引下正常不会重复，这里只兜历史脏数据。
+
+    具体合并动作见 `_merge_authors_into`。幂等：合并后同一主页/哈希下只剩一行。
+    """
+    conds = []
+    if profile_url:
+        conds.append(_same_profile_cond(profile_url))
+    if anon_hash:
+        conds.append(Author.anon_hash == anon_hash)
+    if not conds:
+        return 0
+
+    dupe_ids = (await session.execute(
+        select(Author.id).where(Author.source_site_id == site_id,
+                                Author.id != keep_id,
+                                or_(*conds))
+    )).scalars().all()
+    if not dupe_ids:
+        return 0
+    return await _merge_authors_into(session, keep_id, list(dupe_ids))
 
 
 async def _get_or_create_tag(session: AsyncSession, site_id: int, name: str) -> Optional[int]:
@@ -1455,10 +1567,16 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                         publish_ts or story.first_publish_ts)
                     if title != "（无标题）":
                         story.title = title
-                    if author_id and not story.author_id:
+                    # 作者以本次抓取为准：合并重复作者后 story 必须跟着指到规范行，
+                    # 否则会一直挂在老行上（老行无头像/旧昵称 → 页面显示空头像）。
+                    if author_id and story.author_id != author_id:
                         story.author_id = author_id
                 chapter.like_count = like_count
                 chapter.comment_count = comment_count
+                # 章节作者同样跟本次抓取对齐（v2 里 chapter 与 content 是 1:1，
+                # 作者合并后旧 author_id 会变成悬空/错误引用）
+                if author_id and chapter.author_id != author_id:
+                    chapter.author_id = author_id
                 # 声明评论数必须跟着刷新：它既是「评论完整率」的分母，
                 # 也是单篇评论抓取上限的依据（见 core.batch_get_note_comments）。
                 # 只在拿到有效值时才覆盖，避免某次详情缺字段把分母清空。
