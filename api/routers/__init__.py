@@ -42,6 +42,7 @@ _ROUTER_EXPORTS = {
     "recipe_router": ("recipe", "router"),
     "media_router": ("recipe", "media_router"),
     "app_config_router": ("recipe", "app_config_router"),
+    "life_router": ("recipe", "life_router"),
     "env_router": ("env", "router"),
     "login_session_router": ("login_session", "router"),
     "captcha_session_router": ("captcha_session", "router"),

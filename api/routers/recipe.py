@@ -45,8 +45,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models_recipe import (
     SCHEMA, AppConfig, DIFFICULTY_VALUES, RECIPE_STATUS_VALUES, MealLog, Recipe,
-    RecipeCategory, RecipeFeedback, RecipeIngredient, RecipeStep, RecipeTag,
-    RecipeTagLink, TablePlanRecord,
+    RecipeCategory, RecipeFeedback, RecipeIngredient, RecipeNote, RecipeStep,
+    RecipeTag, RecipeTagLink, ShoppingCheck, TablePlanRecord, TakeoutSpot,
 )
 from .story import _session
 
@@ -1361,6 +1361,177 @@ async def delete_table_plan(plan_id: int, device_id: str = Query(..., alias="dev
         if not res.rowcount:
             raise HTTPException(status_code=404, detail="餐桌不存在")
         return {"success": True, "deleted": plan_id}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+# ===========================================================================
+# v3：做饭页备注 / 采购勾选 / 我的常点
+# ===========================================================================
+@life_router.get("/recipe-notes/{recipe_id:path}")
+async def get_recipe_note(recipe_id: str, device_id: str = Query(..., alias="deviceId")):
+    """取这道菜在这个设备上的备注；没有过就返回 ``note: null``。"""
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = (await session.execute(
+            select(RecipeNote).where(RecipeNote.recipe_id == recipe_id,
+                                     RecipeNote.device_id == device_id))).scalar_one_or_none()
+        return {
+            "recipeId": recipe_id,
+            "note": row.content if row else None,
+            "updatedAt": row.updated_at.isoformat() if row and row.updated_at else None,
+        }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.put("/recipe-notes/{recipe_id:path}")
+async def put_recipe_note(recipe_id: str, payload: Dict[str, Any] = Body(default={})):
+    """保存/覆盖备注（一个人对一道菜只有一条，再存即覆盖）。"""
+    device_id = (payload.get("deviceId") or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+    content = (payload.get("content") or "").strip()
+    if len(content) > 2000:
+        raise HTTPException(status_code=400, detail="备注最多 2000 字")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = (await session.execute(
+            select(RecipeNote).where(RecipeNote.recipe_id == recipe_id,
+                                     RecipeNote.device_id == device_id))).scalar_one_or_none()
+        if row is None:
+            row = RecipeNote(recipe_id=recipe_id, device_id=device_id, content=content)
+            session.add(row)
+        else:
+            row.content = content
+        await session.commit()
+        await session.refresh(row)
+        return {"recipeId": recipe_id, "note": row.content,
+                "updatedAt": row.updated_at.isoformat() if row.updated_at else None}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.get("/shopping-checks")
+async def list_shopping_checks(
+    device_id: str = Query(..., alias="deviceId"),
+    plan_key: str = Query(..., alias="planKey"),
+):
+    """这一桌已经买齐的食材名。客户端拿它把勾选状态恢复出来。"""
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        rows = (await session.execute(
+            select(ShoppingCheck.item_name).where(
+                ShoppingCheck.device_id == device_id,
+                ShoppingCheck.plan_key == plan_key,
+                ShoppingCheck.checked.is_(True)))).scalars().all()
+        return {"planKey": plan_key, "items": list(rows), "count": len(rows)}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.put("/shopping-checks")
+async def put_shopping_check(payload: Dict[str, Any] = Body(default={})):
+    """勾/取消勾一个食材。同一 (device, plan, item) 只留一行。"""
+    device_id = (payload.get("deviceId") or "").strip()
+    plan_key = (payload.get("planKey") or "").strip()
+    item = (payload.get("itemName") or "").strip()
+    if not device_id or not plan_key or not item:
+        raise HTTPException(status_code=400, detail="deviceId / planKey / itemName 必填")
+    checked = bool(payload.get("checked", True))
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = (await session.execute(
+            select(ShoppingCheck).where(
+                ShoppingCheck.device_id == device_id,
+                ShoppingCheck.plan_key == plan_key,
+                ShoppingCheck.item_name == item))).scalar_one_or_none()
+        if row is None:
+            if not checked:
+                return {"itemName": item, "checked": False}
+            row = ShoppingCheck(device_id=device_id, plan_key=plan_key,
+                                item_name=item, checked=True)
+            session.add(row)
+        else:
+            row.checked = checked
+        await session.commit()
+        return {"itemName": item, "checked": checked}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.get("/takeout-spots")
+async def list_takeout_spots(device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        rows = (await session.execute(
+            select(TakeoutSpot).where(TakeoutSpot.device_id == device_id)
+            .order_by(TakeoutSpot.created_at.desc()))).scalars().all()
+        return {"items": [{"id": r.id, "name": r.name, "category": r.category,
+                           "note": r.note} for r in rows], "count": len(rows)}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.post("/takeout-spots")
+async def create_takeout_spot(payload: Dict[str, Any] = Body(default={})):
+    device_id = (payload.get("deviceId") or "").strip()
+    name = (payload.get("name") or "").strip()
+    if not device_id or not name:
+        raise HTTPException(status_code=400, detail="deviceId / name 必填")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        exists = (await session.execute(
+            select(TakeoutSpot.id).where(TakeoutSpot.device_id == device_id,
+                                        TakeoutSpot.name == name))).scalar_one_or_none()
+        if exists:
+            raise HTTPException(status_code=409, detail="这个常点已经有了")
+        row = TakeoutSpot(device_id=device_id, name=name,
+                          category=(payload.get("category") or "全部"),
+                          note=payload.get("note"))
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return {"id": row.id, "name": row.name, "category": row.category, "note": row.note}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.delete("/takeout-spots/{spot_id}")
+async def delete_takeout_spot(spot_id: int, device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        res = await session.execute(
+            delete(TakeoutSpot).where(TakeoutSpot.id == spot_id,
+                                      TakeoutSpot.device_id == device_id))
+        await session.commit()
+        if not res.rowcount:
+            raise HTTPException(status_code=404, detail="常点不存在")
+        return {"success": True, "deleted": spot_id}
     finally:
         await session.close()
         await engine.dispose()

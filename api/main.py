@@ -38,7 +38,7 @@ import config as config_module
 from .routers import (crawler_router, data_router, websocket_router, export_router, env_router,
                       config_router, story_router, discover_router, accounts_router,
                       scheduler_router, stance_tags_router, s3_backup_router,
-                      recipe_router, media_router, app_config_router,
+                      recipe_router, media_router, app_config_router, life_router,
                       emoji_assets_router)
 
 # Project root directory (used for running subprocesses like uv run main.py)
@@ -295,6 +295,7 @@ app.include_router(emoji_assets_router, prefix="/api")
 app.include_router(recipe_router, prefix="/api")
 app.include_router(media_router, prefix="/api")
 app.include_router(app_config_router, prefix="/api")
+app.include_router(life_router, prefix="/api")
 app.include_router(env_router, prefix="/api")
 
 # 服务名路由兼容（2026-11-04 拆分后）：

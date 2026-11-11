@@ -161,6 +161,24 @@ GET /api/recipes?category=蒸菜&difficulty=L3 → 粉蒸肉、酱香小河虾
 `POST /meal-log` 关联了菜谱时会把对应 `recipe.cooked_count` +1——这是「做过几次」的
 唯一来源，所以编辑（PATCH）刻意不碰计数，避免改个错别字把热度刷上去。
 
+### 做饭页 / 采购 / 常点（v3）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/recipe-notes/{id}?deviceId=` | 这道菜的备注，没写过返回 `note: null` |
+| PUT | `/recipe-notes/{id}` | `{"deviceId","content"}`，一人一菜一条，再存即覆盖（≤2000 字） |
+| GET | `/shopping-checks?deviceId=&planKey=` | 这一桌已买齐的食材名 |
+| PUT | `/shopping-checks` | `{"deviceId","planKey","itemName","checked"}`，`(device,plan,item)` 唯一 |
+| GET | `/takeout-spots?deviceId=` | 我的常点 |
+| POST | `/takeout-spots` | `{"deviceId","name","category","note"}`，同名返回 409 |
+| DELETE | `/takeout-spots/{id}?deviceId=` | 删除常点 |
+
+`planKey` 由客户端按「日期 + 菜谱集合」算，同一桌反复进出勾选状态不丢；换一桌就是新 key，
+旧勾选自然作废，不会把上一桌的进度串过来。
+
+> 图片源：`s3_config.endpoint` 已改成 `http://www.joyeuse.cn:3900`（公网），
+> 本地后端 + 远端 PG（`www.joyeuse.cn:4321`）即可直接取图，不再需要 `S3_ENDPOINT_OVERRIDE`。
+
 ### 配置
 
 | 方法 | 路径 | 说明 |

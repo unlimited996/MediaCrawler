@@ -26,7 +26,7 @@ from .gateway import router as gateway_router
 from .routers import (accounts_router, app_config_router, config_router,
                       emoji_assets_router,
                       data_router, discover_router, env_router, export_router,
-                      media_router, recipe_router, s3_backup_router,
+                      life_router, media_router, recipe_router, s3_backup_router,
                       scheduler_router, stance_tags_router, story_router,
                       websocket_router)
 from .routers.internal import router as internal_router
@@ -67,6 +67,7 @@ app.include_router(emoji_assets_router, prefix=API_PREFIX)
 app.include_router(recipe_router, prefix=API_PREFIX)
 app.include_router(media_router, prefix=API_PREFIX)
 app.include_router(app_config_router, prefix=API_PREFIX)
+app.include_router(life_router, prefix=API_PREFIX)
 app.include_router(internal_router, prefix=API_PREFIX)
 
 # ---- 管理类接口（配置 / 定时任务 / 账号池）----

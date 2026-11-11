@@ -19,8 +19,8 @@ create_all 只作用于本文件的表，不会碰到故事/采集相关的 44 �
   子表全部 ON DELETE CASCADE；分类用 RESTRICT，防止误删还有菜谱的分类。
 """
 from sqlalchemy import (
-    BigInteger, CheckConstraint, Column, DateTime, ForeignKey, Index, Integer,
-    Numeric, SmallInteger, String, Text, UniqueConstraint, func,
+    BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, ForeignKey,
+    Index, Integer, Numeric, SmallInteger, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -111,6 +111,20 @@ class Recipe(BaseRecipe, TimestampMixin):
     sort_order = Column(SmallInteger, nullable=False, server_default="0")
     ext = Column(JsonType, nullable=False, default=dict)
     schema_ver = Column(Integer, nullable=False, server_default="1")
+
+    # --- v2：对齐「菜品 / 收藏榜 / 发现」三个页面 ---
+    # 每份热量（kcal），由 cooking.estimate_calories 按食材克数 + 营养表估算，可为空
+    calories_kcal = Column(Integer)
+    # 菜系：家常综合 / 川菜 / 粤菜 / 湘菜 / 东北菜 …（从标签推导，可人工覆盖）
+    cuisine = Column(String(24))
+    # 收藏总数：由 recipe_feedback 聚合维护，供「收藏榜」排序
+    favorite_count = Column(Integer, nullable=False, server_default="0")
+    # 被做过的次数（记食里关联到本菜谱时 +1）
+    cooked_count = Column(Integer, nullable=False, server_default="0")
+    # 来源：NULL=自家菜谱；非空表示「发现」页里别人贡献的菜（如「小厨」「村吕」）
+    source = Column(String(32))
+    # 上新时间：发现页「最新」排序用
+    published_at = Column(DateTime(timezone=True))
 
     category = relationship("RecipeCategory", back_populates="recipes", lazy="noload")
     ingredients = relationship(
@@ -261,8 +275,181 @@ class AppConfig(BaseRecipe, TimestampMixin):
     )
 
 
+# ---------------------------------------------------------------------------
+# 8. 用户反馈：收藏 / 不想吃（设备维度，无需登录）
+# ---------------------------------------------------------------------------
+class RecipeFeedback(BaseRecipe):
+    """一道菜对一个设备的反馈。收藏数即 favorite 行数，不另存冗余计数表。
+
+    ``device_id`` 由 App 首次启动生成并持久化，换设备视为另一个人——
+    在没有账号体系前，这是最轻的做法；接入账号后把 device_id 换成 user_id 即可。
+    """
+
+    __tablename__ = "recipe_feedback"
+
+    recipe_id = Column(String(64),
+                       ForeignKey(f"{SCHEMA}.recipe.id", ondelete="CASCADE"),
+                       primary_key=True)
+    device_id = Column(String(64), primary_key=True)
+    kind = Column(String(12), primary_key=True)      # favorite / dislike
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('favorite','dislike')", name="ck_feedback_kind"),
+        Index("idx_feedback_kind_recipe", "kind", "recipe_id"),
+        Index("idx_feedback_device", "device_id"),
+        {"schema": SCHEMA},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. 记食：一天的饭桌记录（照片 / 一句话 / 关联菜谱）
+# ---------------------------------------------------------------------------
+class MealLog(BaseRecipe):
+    """一条饮食记录。同一天可以有早/午/晚多条（截图里「已记 0 / 3 条」）。"""
+
+    __tablename__ = "meal_log"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False)
+    eaten_on = Column(Date, nullable=False)
+    meal = Column(String(12), nullable=False, server_default="dinner")
+    note = Column(Text)
+    image_key = Column(String(255))
+    recipe_ids = Column(JsonType, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "meal IN ('breakfast','lunch','dinner','snack')",
+            name="ck_meal_log_meal_enum"),
+        Index("idx_meal_log_device_date", "device_id", "eaten_on"),
+        {"schema": SCHEMA},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. 我的餐桌：配好的整桌方案（最多 20 桌）
+# ---------------------------------------------------------------------------
+class TablePlanRecord(BaseRecipe, TimestampMixin):
+    """用户保存的餐桌。``recipe_ids`` 存 [(role, recipeId)] 结构。"""
+
+    __tablename__ = "table_plan"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False)
+    title = Column(String(64))
+    people = Column(SmallInteger, nullable=False, server_default="2")
+    taste = Column(String(16), nullable=False, server_default="SAVORY")
+    recipe_ids = Column(JsonType, nullable=False, default=list)
+    is_favorite = Column(Boolean, nullable=False, server_default="false")
+
+    __table_args__ = (
+        Index("idx_table_plan_device", "device_id", "created_at"),
+        {"schema": SCHEMA},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11. 食材营养表：算每份热量用
+# ---------------------------------------------------------------------------
+class IngredientNutrition(BaseRecipe):
+    """按关键词匹配的千卡/100g。只做估算，够「471 kcal/份」这种展示精度。
+
+    匹配规则：食材名包含 keyword 即命中，取最长命中（「五花肉」优先于「肉」）。
+    """
+
+    __tablename__ = "ingredient_nutrition"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    keyword = Column(String(32), nullable=False, unique=True)
+    kcal_per_100g = Column(Numeric(7, 1), nullable=False)
+    category = Column(String(16))
+
+    __table_args__ = {"schema": SCHEMA}
+
+
+# ---------------------------------------------------------------------------
+# 12. 菜品备注：做饭页里「点备注」记自己的手感/提醒
+# ---------------------------------------------------------------------------
+class RecipeNote(BaseRecipe, TimestampMixin):
+    """一道菜在某个设备上的一条备注。
+
+    一个人对一道菜通常只要一条「自己的做法」备注（截图里「点备注 → 之前的备注页
+    或新建备注」），所以主键是 (recipe_id, device_id)，再次保存即覆盖。
+    """
+
+    __tablename__ = "recipe_note"
+
+    recipe_id = Column(String(64),
+                       ForeignKey(f"{SCHEMA}.recipe.id", ondelete="CASCADE"),
+                       primary_key=True)
+    device_id = Column(String(64), primary_key=True)
+    content = Column(Text, nullable=False, server_default="")
+
+    __table_args__ = (
+        Index("idx_recipe_note_device", "device_id"),
+        {"schema": SCHEMA},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 13. 买菜勾选：这一桌的采购清单谁已经买了
+# ---------------------------------------------------------------------------
+class ShoppingCheck(BaseRecipe):
+    """一条「这个食材已买」的记录。
+
+    按 (device_id, plan_key, item_name) 唯一。``plan_key`` 由客户端按
+    「日期 + 菜谱集合」算，同一桌反复进出勾选状态不丢；换一桌就是新的 key，
+    旧勾选自然作废，不会把上一桌的进度串过来。
+    """
+
+    __tablename__ = "shopping_check"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False)
+    plan_key = Column(String(64), nullable=False)
+    item_name = Column(String(64), nullable=False)
+    checked = Column(Boolean, nullable=False, server_default="true")
+    updated_at = Column(DateTime(timezone=True), nullable=False,
+                        server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("device_id", "plan_key", "item_name",
+                         name="uq_shopping_check_item"),
+        Index("idx_shopping_check_plan", "device_id", "plan_key"),
+        {"schema": SCHEMA},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 14. 我的常点：外卖/常去店的个人清单
+# ---------------------------------------------------------------------------
+class TakeoutSpot(BaseRecipe):
+    """「我的常点」里的一条：店名 + 分类 + 备注（截图 图5）。"""
+
+    __tablename__ = "takeout_spot"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False)
+    name = Column(String(64), nullable=False)
+    category = Column(String(16), nullable=False, server_default="全部")
+    note = Column(String(120))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("device_id", "name", name="uq_takeout_spot_name"),
+        Index("idx_takeout_spot_device", "device_id"),
+        {"schema": SCHEMA},
+    )
+
+
 #: 建表/校验时按依赖顺序使用
 ALL_TABLES = (
     RecipeCategory, RecipeTag, Recipe, RecipeIngredient, RecipeStep,
     RecipeTagLink, AppConfig,
+    # v2：菜品页 / 记食 / 我的餐桌
+    RecipeFeedback, MealLog, TablePlanRecord, IngredientNutrition,
+    # v3：做饭页备注 / 采购勾选 / 我的常点
+    RecipeNote, ShoppingCheck, TakeoutSpot,
 )
