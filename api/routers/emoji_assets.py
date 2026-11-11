@@ -50,19 +50,29 @@ async def _session():
 
 
 async def ensure_table() -> None:
-    """幂等建表（首次请求兜底，正常由 startup 建好）。"""
-    from database.models_v2 import BaseV2
+    """**只读**检查表情包表是否就绪，绝不在容器里建表。
 
-    engine = await _engine()
-    if engine is None:
-        return
+    表由部署时用数据库账号直接执行 ``deploy/sql/emoji_asset.sql`` 建立——
+    容器只连业务库、不持有 DDL 权限，也不该在启动时改 schema。
+    表缺失时给明确指引，避免用户看到一句莫名其妙的 UndefinedTable。
+    """
+    from sqlalchemy import text
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(
-                lambda sync_conn: EmojiAsset.__table__.create(
-                    bind=sync_conn, checkfirst=True))
+        await session.execute(text("SELECT 1 FROM emoji_asset LIMIT 1"))
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=("表情包库表 emoji_asset 不存在，请用数据库账号执行 "
+                    "deploy/sql/emoji_asset.sql 建表（容器不会自动建）："
+                    f"{type(e).__name__}")) from e
     finally:
-        await engine.dispose()
+        await session.close()
+        if engine is not None:
+            await engine.dispose()
 
 
 def _asset_out(r: EmojiAsset, story_titles: Optional[Dict[int, str]] = None) -> Dict[str, Any]:
@@ -92,6 +102,7 @@ async def list_assets(
     keyword: Optional[str] = None,
 ):
     """表情包库列表（按使用次数倒序）。"""
+    await ensure_table()
     engine, session = await _session()
     if session is None:
         return {"items": [], "total": 0}
@@ -355,6 +366,7 @@ async def detect(payload: DetectPayload = Body(default=DetectPayload())):
 @router.delete("/{asset_id}")
 async def remove(asset_id: int):
     """移出表情包库（软删，图片本身不动）。"""
+    await ensure_table()
     engine, session = await _session()
     if session is None:
         raise HTTPException(status_code=503, detail="配置库不可用")

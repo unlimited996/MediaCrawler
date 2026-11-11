@@ -401,12 +401,14 @@ export function S3BackupView() {
                     `（${dedupQ.data.last_run.delete_errors[0]?.error || ''}）` : ''}
                 {dedupQ.data.last_run.delete_protected
                   ? ` · ${dedupQ.data.last_run.delete_protected} 个仍被引用跳过` : ''}
+                {dedupQ.data.last_run.emoji_preferred_groups
+                  ? ` · 优先保留表情包库 ${dedupQ.data.last_run.emoji_preferred_groups} 组` : ''}
               </div>
             )}
             {dedupOpen && dedupQ.data?.groups?.length ? (
               <div className="mt-2">
                 <div className="flex items-center justify-between px-1 text-[10px] text-cyber-text-muted">
-                  <span>点整行展开：组内所有重复图片并排显示（点图可放大）；勾「保留」的副本不会被清理</span>
+                  <span>展开看重复图；标「表情包优先」的组会保留表情包库对象；勾「保留」的副本不会被清理</span>
                   {excludedKeys.size > 0 && (
                     <button type="button" onClick={() => setExcludedKeys(new Set())}
                             className="text-cyber-neon-cyan hover:underline">
@@ -471,6 +473,12 @@ export function S3BackupView() {
                           <span className="text-[10px] text-cyber-text-secondary">
                             可收回 {fmtBytes(g.reclaimable_bytes)}
                           </span>
+                          {g.emoji_preferred && (
+                            <span className="rounded border border-cyber-neon-orange/40 bg-cyber-neon-orange/10 px-1 font-mono text-[9px] text-cyber-neon-orange"
+                                  title="该组规范键来自表情包库，执行去重时会优先保留这份对象">
+                              表情包优先
+                            </span>
+                          )}
                           <span className="ml-auto flex items-center gap-1"
                                 onClick={(e) => e.stopPropagation()}>
                             <input type="checkbox" checked={allKept}

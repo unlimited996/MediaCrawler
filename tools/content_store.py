@@ -42,6 +42,29 @@ _CHECKSUM_LOCKS: Dict[str, asyncio.Lock] = {}
 _LOCK_GUARD = asyncio.Lock()
 
 
+async def emoji_reference_keys(session):
+    """返回 (按 checksum 的规范键映射, 表情包库引用的全部对象键集合)。
+
+    「执行去重时优先保留表情包库的数据」：去重按此结果把表情包对象选为
+    规范键，并把它加入删除保护集，任何情况下都不删这些对象。
+    表不存在（尚未执行 deploy/sql/emoji_asset.sql）时返回空，不阻断去重。
+    """
+    by_csum: Dict[str, str] = {}
+    protected: Set[str] = set()
+    try:
+        rows = (await session.execute(
+            select(EmojiAsset.checksum, EmojiAsset.object_key)
+            .where(EmojiAsset.deleted_at.is_(None))
+        )).all()
+        for csum, key in rows:
+            if csum and key:
+                by_csum[csum] = key
+                protected.add(key)
+    except Exception:
+        return {}, set()
+    return by_csum, protected
+
+
 async def checksum_lock(checksum: str) -> asyncio.Lock:
     """取该内容的进程内锁（同 checksum 串行，不同 checksum 并行）。"""
     async with _LOCK_GUARD:

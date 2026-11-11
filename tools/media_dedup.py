@@ -48,6 +48,7 @@ from database.models_v2 import MediaBackup, Story
 CANON_PREFIX = "dedup"
 
 
+
 def canonical_key_for(checksum: str, media_type: str) -> str:
     """内容寻址规范键：``dedup/{media_type}/{sha256}``。"""
     mt = media_type if media_type in ("image", "video", "audio") else "image"
@@ -82,7 +83,12 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
     # 归档动作会把同 checksum 的备份行收敛到同一个 emoji/ 规范键；
     # 本函数按「不同 object_key」统计，收敛后的组自然只剩 1 个键。
     # 只有确实还残留多个键的组才需要去重，避免靠豁免掩盖真实冗余。
-    from tools.content_store import is_canonical_key
+    from tools.content_store import emoji_reference_keys, is_canonical_key
+
+    # 「执行去重时优先保留表情包库的数据」：按 checksum 拿到表情包库已入库
+    # 的规范对象键，去重时优先选它；同时这些键进入删除保护集。
+    emoji_by_csum, emoji_keys = await emoji_reference_keys(session)
+    # emoji_keys 在执行阶段会再查一次（并发安全，不共享进程内可变状态）
 
     by_csum: Dict[str, List[MediaBackup]] = {}
     for r in rows:
@@ -105,11 +111,18 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
         size_by_key: Dict[str, int] = {}
         for k, sz in zip(keys, sizes):
             size_by_key.setdefault(k, sz)
-        # 若组内已存在规范键（上次去重留下的），优先复用，避免反复拷贝
-        existing = [i for i in items if is_canonical_key(i.object_key)]
-        canonical = existing[0] if existing else items[0]
-        canon_key = canonical.object_key
-        canon_size = size_by_key.get(canon_key, int(canonical.size_bytes or 0))
+        # 规范键优先级：表情包库已入库对象 > 组内已有的内容寻址键 > 首行。
+        # 表情包库是用户主动归档的权威副本，绝不能因为「恰好不是第一行」被删。
+        preferred = emoji_by_csum.get(csum)
+        if preferred and preferred in distinct:
+            canon_key = preferred
+        else:
+            existing = [i for i in items if is_canonical_key(i.object_key)]
+            canon_key = (existing[0] if existing else items[0]).object_key
+        canon_size = size_by_key.get(canon_key, 0)
+        if not canon_size:
+            fallback = next((i for i in items if i.object_key == canon_key), None)
+            canon_size = int(fallback.size_bytes or 0) if fallback is not None else 0
         total = sum(size_by_key.values())
         reclaimable_bytes += (total - canon_size)
         redundant_objects += (len(distinct) - 1)
@@ -119,6 +132,7 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
             "count": len(distinct),
             "canonical_key": canon_key,
             "canonical_already": is_canonical_key(canon_key),
+            "emoji_preferred": bool(preferred and preferred in distinct),
             "size_bytes": canon_size,
             "reclaimable_bytes": total - canon_size,
             "keys": distinct,
@@ -173,10 +187,16 @@ async def dedup_backups(session, settings, dry_run: bool = True,
     exclude_keys = set(exclude_keys or set())
     report = await analyze_duplicates(session)
     groups = report["groups"]
+    # 表情包库的权威对象键：既优先作为规范键，也绝不删除
+    from tools.content_store import emoji_reference_keys, is_canonical_key
+
+    emoji_by_csum, emoji_keys = await emoji_reference_keys(session)
     stats: Dict[str, Any] = {
         "groups": 0, "merged_rows": 0, "objects_deleted": 0,
         "bytes_reclaimed": 0, "errors": [], "skipped": 0,
         "protected": 0, "delete_errors": [], "delete_protected": 0,
+        # 规范键来自表情包库的组数 / 因表情包库保护而未删的对象数
+        "emoji_preferred_groups": 0, "emoji_protected": 0,
     }
 
     if dry_run:
@@ -189,9 +209,13 @@ async def dedup_backups(session, settings, dry_run: bool = True,
                 continue
             merged += 1
             objs += (len(non_ex) - 1)
-            # 规范键：组内 dedup/ 键（且未排除）优先，否则首个非排除键
-            canon_keys = [k for k in non_ex if is_canonical_key(k)]
-            canon = canon_keys[0] if canon_keys else non_ex[0]
+            # 规范键：表情包库对象 > 内容寻址键 > 首个非排除键
+            preferred = emoji_by_csum.get(g["checksum"])
+            if preferred and preferred in non_ex:
+                canon = preferred
+            else:
+                canon_keys = [k for k in non_ex if is_canonical_key(k)]
+                canon = canon_keys[0] if canon_keys else non_ex[0]
             size_by_key = dict(zip(g["keys"], g["sizes"]))
             total = sum(size_by_key[k] for k in non_ex)
             reclaim += (total - size_by_key.get(canon, 0))
@@ -223,11 +247,18 @@ async def dedup_backups(session, settings, dry_run: bool = True,
                 stats["protected"] += (len(items) - len(non_excluded))
                 continue
 
-            # 规范键：优先组内已存在的 dedup/ 键（且未被排除），否则取首个非排除键
-            existing = [i for i in non_excluded
-                        if is_canonical_key(i.object_key)]
-            canonical = existing[0] if existing else non_excluded[0]
-            target_canonical = canonical.object_key
+            # 规范键：优先表情包库已入库对象（且未被排除），其次内容寻址键，
+            # 最后取首个非排除键。表情包库是权威副本，不能因为排序靠后被删。
+            preferred = emoji_by_csum.get(csum)
+            pref_row = next((i for i in non_excluded
+                             if i.object_key == preferred), None) if preferred else None
+            if pref_row is not None:
+                target_canonical = pref_row.object_key
+            else:
+                existing = [i for i in non_excluded
+                            if is_canonical_key(i.object_key)]
+                canonical = existing[0] if existing else non_excluded[0]
+                target_canonical = canonical.object_key
 
             # 记录每行的原始键与体积（含被排除的，便于防御性核对）
             originals = {r.id: (r.object_key, int(r.size_bytes or 0))
@@ -262,8 +293,15 @@ async def dedup_backups(session, settings, dry_run: bool = True,
             #    无人引用）。被删除的恰好是「非排除副本数-1」个。
             dels = [orig for orig in originals.values()
                     if orig[0] not in exclude_keys
+                    and orig[0] not in emoji_keys        # 表情包库对象永不删
                     and orig[0] != target_canonical]
-            deleted = await _delete_redundant(session, settings, sem, dels)
+            if target_canonical in emoji_keys:
+                stats["emoji_preferred_groups"] += 1
+            stats["emoji_protected"] += sum(
+                1 for orig in originals.values()
+                if orig[0] in emoji_keys and orig[0] != target_canonical)
+            deleted = await _delete_redundant(
+                session, settings, sem, dels, protected_keys=emoji_keys)
             stats["objects_deleted"] += deleted["deleted"]
             stats["bytes_reclaimed"] += deleted["bytes"]
             stats["delete_errors"].extend(deleted["errors"])
@@ -307,16 +345,22 @@ async def _ensure_canonical(settings, src_key: str, dest_key: str) -> None:
     await upload_bytes(settings, data, dest_key)
 
 
-async def _delete_redundant(session, settings, sem, dels: List[Tuple[str, int]]
-                            ) -> Dict[str, int]:
-    """删除冗余对象；删前确认该键已无任何 media_backup 行引用。"""
+async def _delete_redundant(session, settings, sem, dels: List[Tuple[str, int]],
+                            protected_keys: Optional[set] = None) -> Dict[str, int]:
+    """删除冗余对象；删前确认该键已无任何 media_backup 行引用。
+
+    :param protected_keys: 表情包库引用等权威对象键，无条件跳过不删。
+    """
     from tools.s3_client import delete_object
 
     deleted, bytes_total, protected = 0, 0, 0
     errors: List[Dict[str, str]] = []
     # 同一个键可能因重抓出现多次，只删一次，否则第二次必然报「对象不存在」
+    protected_keys = set(protected_keys or set())
     unique: Dict[str, int] = {}
     for key, size in dels:
+        if key in protected_keys:
+            continue
         unique.setdefault(key, int(size or 0))
     async with sem:
         for key, size in unique.items():

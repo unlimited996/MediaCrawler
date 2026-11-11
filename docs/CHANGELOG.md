@@ -5,6 +5,57 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-11] 去重优先保留表情包库；表情包表改为直接连库建
+
+### 1. 执行去重时优先保留表情包库的数据
+用户要求：去重合并时，已归档进表情包库的对象应作为**权威副本**留下，
+不能因为「恰好不是组内第一行」被删掉。
+
+- `tools/content_store.py::emoji_reference_keys()`：按 checksum 取未软删的
+  `EmojiAsset.object_key`，同时返回全部受保护对象键集合。表不存在时返回空，
+  不阻断去重（向后兼容）。
+- `analyze_duplicates()`：规范键优先级改为
+  **表情包库对象 > 内容寻址键(emoji//dedup/) > 组内首行**；分组新增
+  `emoji_preferred` 标记，前端显示「表情包优先」徽标。
+- `dedup_backups()`：dry-run 估算与真实执行采用同一优先级；删除清单排除
+  所有表情包库引用的键，`_delete_redundant` 再加一道 `protected_keys`
+  无条件跳过。新增统计 `emoji_preferred_groups` / `emoji_protected`，
+  「上次执行」栏显示「优先保留表情包库 N 组」。
+- 表里的 `EmojiAsset.object_key` 可以是业务键（历史归档未收敛），也能被
+  正确选为规范键；收敛过的 `emoji/` 键同样优先。
+
+### 2. 表情包表不再由容器创建
+之前 `boot_tasks.start_emoji_library()` 在启动时会 `CREATE TABLE`，
+`emoji_assets.ensure_table()` 每个写接口还会再兜底建一次。实际部署中
+容器只该连业务库、不该持有 DDL 权限，且线上库实测该表**根本没建出来**
+（接口查表直接 UndefinedTable）。
+
+- 新增 `deploy/sql/emoji_asset.sql`（`CREATE TABLE IF NOT EXISTS` +
+  3 个索引，含 `idx_emoji_checksum_alive` 部分索引），列定义与
+  `database/models_v2.py::EmojiAsset` 完全一致。
+- 用用户提供的数据库账号 `192.168.10.38:4321 / im / Ccs@0625 / imdb`
+  （本机经公网映射 `www.joyeuse.cn:4321` 连的是同一个库）**直接执行建表**；
+  线上实测 15 列 / 5 索引齐全、写入读取自测通过、事务回滚无残留。
+- 删除 `boot_tasks.start_emoji_library()` 与 `library_app.py` 的启动调用；
+  `ensure_table()` 改成**只读** `SELECT 1 FROM emoji_asset LIMIT 1`，
+  表缺失时返回 503 并明确提示去执行 SQL 脚本，容器不再执行任何 DDL。
+- `find_canonical()` / `emoji_reference_keys()` 本来就对「表不存在」做了
+  静默降级，容器启动、抓取、去重都不会因为表缺失而崩。
+
+> 部署步骤：升级镜像**之前或之后**用数据库账号执行一次
+> `deploy/sql/emoji_asset.sql`（幂等，重复执行安全）。群晖可用
+> `psql "postgresql://im:<密码>@192.168.10.38:4321/imdb" -f ...`
+> 或在 phpPgAdmin / DBeaver 里粘贴执行。
+
+### 验证
+```
+模拟：表情包键 xhs/b/1.webp 非首行 -> 报告 canonical 选中它、
+      emoji_preferred=True；dry-run 预计删 2；实际删 2、
+      表情包对象保留、其余行全部改指它；无表情包库时退回原规则
+线上：emoji_asset 15 列与模型一致、写读自测通过、回滚无残留
+tsc / npm run build / py_compile / main.py --help 全通过
+```
+
 ## [2026-11-11] 写入时内容去重：归档不再豁免，重复图入库即引用表情包对象
 
 ### 需求
@@ -81,8 +132,9 @@ errors:0}` —— 合并了 46 行却只删 24 个对象且无错误记录。原
 
 ### 2. 表情包库
 - 新表 `emoji_asset`（按 sha256 唯一）：规范键 / 来源 / 使用次数 / 原始键 /
-  关联帖子 / 体积。`boot_tasks.start_emoji_library()` 启动时幂等建表，
-  历史库无需手工跑 `init_v2`。
+  关联帖子 / 体积。~~启动时幂等建表~~（此做法已撤销，见最上方
+  [2026-11-11 直连建表] 条目：现在由部署时用数据库账号执行
+  `deploy/sql/emoji_asset.sql` 建立，容器不持有 DDL 权限）。
 - 新 `api/routers/emoji_assets.py`：`GET /emoji-assets`、
   `POST /archive`（按 keys / item_ids / checksums 批量、幂等）、
   `POST /detect`（识别评论表情包，可 `auto_archive`）、`DELETE /{id}`。

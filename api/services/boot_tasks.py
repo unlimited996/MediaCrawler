@@ -135,31 +135,6 @@ def start_stance_library() -> None:
         _log("stance", f"标签库启动失败（不影响 API）：{e}")
 
 
-def start_emoji_library() -> None:
-    """表情包库：幂等建表（历史库无需手工跑 init_v2）。"""
-    async def _bg():
-        try:
-            from database.models_v2 import BaseV2, EmojiAsset
-            from config.db_config import resolve_config_db_type
-            from database.db_session import get_async_engine
-
-            engine = get_async_engine(resolve_config_db_type())
-            if engine is None:
-                return
-            try:
-                async with engine.begin() as conn:
-                    await conn.run_sync(
-                        lambda sync_conn: EmojiAsset.__table__.create(
-                            bind=sync_conn, checkfirst=True))
-                _log("emoji", "表情包库表已就绪")
-            finally:
-                await engine.dispose()
-        except Exception as e:
-            _log("emoji", f"表情包库建表失败（不影响 API）：{e}")
-
-    asyncio.create_task(_bg())
-
-
 def start_s3_backup() -> None:
     """S3 媒体备份：建表 + 种子配置，然后起 60s 循环。"""
     try:

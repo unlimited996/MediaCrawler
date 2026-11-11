@@ -133,7 +133,6 @@ async def _on_startup() -> None:
     boot_tasks.start_stance_backfill()
     boot_tasks.start_stance_library()
     boot_tasks.start_s3_backup()
-    boot_tasks.start_emoji_library()
     boot_tasks.start_recipe_boot()
     # 实时日志桥：tail 共享的 logs/scheduler_live.jsonl 并广播给 WS 客户端。
     # 不启动的话前端连上 /library/api/ws/logs 只会收到历史补发、没有实时日志。
