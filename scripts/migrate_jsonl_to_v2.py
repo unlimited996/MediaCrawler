@@ -25,6 +25,8 @@ from database.models_v2 import (  # noqa: E402
     Author, Comment, MediaAttachment, SourceSite, Story, StoryChapter, StoryTag, Tag,
 )
 from tools.crawler_util import safe_int  # noqa: E402
+# 作者字段刷新规则与实时抓取共用一份实现（头像为空 → 全字段更新）
+from tools.v2_sync import apply_author_refresh  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
@@ -73,7 +75,7 @@ class Migrator:
         self._chapter_by_content: Dict[str, int] = {}
 
     async def get_author(self, anon_hash: str, nickname: str,
-                         avatar: str = "") -> Optional[int]:
+                         avatar: str = "", profile_url: str = "") -> Optional[int]:
         if not anon_hash:
             return None
         if anon_hash in self._author_cache:
@@ -85,12 +87,14 @@ class Migrator:
         if not row:
             row = Author(source_site_id=self.site_id, anon_hash=anon_hash,
                          nickname=nickname or None,
-                         avatar_url=avatar or None)
+                         avatar_url=avatar or None,
+                         profile_url=profile_url or None)
             self.s.add(row)
             await self.s.flush()
             self.stats["author"] += 1
-        elif avatar and not row.avatar_url:
-            row.avatar_url = avatar
+        else:
+            # 与实时抓取同一规则：头像为空 → 全字段刷新，否则只补空字段
+            apply_author_refresh(row, nickname, avatar, profile_url)
         self._author_cache[anon_hash] = row.id
         return row.id
 
@@ -131,7 +135,8 @@ class Migrator:
 
         author_id = await self.get_author(str(item.get("creator_hash") or ""),
                                           str(item.get("nickname") or ""),
-                                          str(item.get("author_avatar") or ""))
+                                          str(item.get("author_avatar") or ""),
+                                          str(item.get("author_url") or ""))
         like_count = safe_int(item.get("liked_count") or item.get("voteup_count") or 0)
         comment_count = safe_int(item.get("comment_count") or 0)
         publish_ts = safe_int(item.get("time") or item.get("create_time") or 0)
@@ -230,7 +235,8 @@ class Migrator:
 
         author_id = await self.get_author(str(item.get("creator_hash") or ""),
                                           str(item.get("nickname") or ""),
-                                          str(item.get("author_avatar") or ""))
+                                          str(item.get("author_avatar") or ""),
+                                          str(item.get("author_url") or ""))
         self.s.add(Comment(
             story_id=story_id,
             chapter_id=chapter_id,

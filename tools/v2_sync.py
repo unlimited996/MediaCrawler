@@ -431,6 +431,8 @@ _IMAGE_KEYS = ("image_list",)
 _TAG_KEYS = ("tag_list",)
 _AVATAR_KEYS = ("author_avatar", "avatar_url")
 _NICKNAME_KEYS = ("nickname", "user_nickname")
+# 作者粉丝数：目前只有部分平台在作品/用户信息里带，取不到就是 None（不覆盖库里的值）
+_FOLLOWER_KEYS = ("follower_count", "fans", "fans_count")
 
 
 def _pick(item: Dict[str, Any], keys, default: Any = "") -> Any:
@@ -439,6 +441,15 @@ def _pick(item: Dict[str, Any], keys, default: Any = "") -> Any:
         if v not in (None, ""):
             return v
     return default
+
+
+def _pick_follower(item: Dict[str, Any]) -> Optional[int]:
+    """作者粉丝数：store 拍平时有就带上，取不到返回 None（表示「本次没这个信息」，
+    不是「粉丝数为 0」，避免把库里已有的值冲成 0）。"""
+    v = _pick(item, _FOLLOWER_KEYS, None)
+    if v in (None, ""):
+        return None
+    return safe_int(v)
 
 
 # 热度公式与 scripts/recompute_heat.py 保持一致（单一事实来源）：
@@ -1129,19 +1140,76 @@ async def refresh_comment_completeness(platform_code: str,
         return 0
 
 
+def _is_blank(v) -> bool:
+    """空值判定：None / 空串 / 纯空白 / 字面 null 都算「库里没有这项数据」。"""
+    if v is None:
+        return True
+    s = str(v).strip()
+    return not s or s.lower() in ("null", "none", "undefined")
+
+
+def apply_author_refresh(row, nickname: str = "", avatar: str = "",
+                         profile_url: str = "",
+                         follower_count: Optional[int] = None) -> List[str]:
+    """按统一规则刷新一个已存在的作者行，返回实际变动的字段名。
+
+    规则（两种情形，差别只在头像）：
+      * **头像为空**：这行是残缺快照（导入 / 列表页抓取时平台没返回头像）。
+        本次抓到的数据更完整 → 全字段更新（昵称/头像/主页/粉丝数）。
+        只补头像会留下「新头像 + 旧昵称」这类半新半旧的脏数据。
+      * 头像已有：只补空字段，绝不覆盖已有值（防止某次抓取缺字段把好数据冲成空）。
+
+    抓取链路（`_get_or_create_author`）与 JSONL 导入（`scripts/migrate_jsonl_to_v2.py`）
+    共用这一个实现，避免两边策略漂移。
+    """
+    nickname = (nickname or "")[:128]
+    updates: Dict[str, Any] = {}
+
+    if avatar and _is_blank(getattr(row, "avatar_url", None)):
+        if nickname:
+            updates["nickname"] = nickname
+        updates["avatar_url"] = avatar
+        if profile_url:
+            updates["profile_url"] = profile_url
+        if follower_count is not None:
+            updates["follower_count"] = follower_count
+    else:
+        if nickname and _is_blank(getattr(row, "nickname", None)):
+            updates["nickname"] = nickname
+        if profile_url and _is_blank(getattr(row, "profile_url", None)):
+            updates["profile_url"] = profile_url
+        if follower_count is not None and getattr(row, "follower_count", None) is None:
+            updates["follower_count"] = follower_count
+
+    changed: List[str] = []
+    for field, value in updates.items():
+        if getattr(row, field, None) != value:
+            setattr(row, field, value)
+            changed.append(field)
+    return changed
+
+
 async def _get_or_create_author(session: AsyncSession, site_id: int,
                                 anon_hash: str, nickname: str = "",
                                 avatar: str = "",
-                                profile_url: str = "") -> Optional[int]:
-    """取/建作者，并尽力回填缺失字段（头像 / 主页）。
+                                profile_url: str = "",
+                                follower_count: Optional[int] = None) -> Optional[int]:
+    """取/建作者，并尽力回填缺失字段（头像 / 昵称 / 主页 / 粉丝数）。
 
     身份匹配优先级：
       1) anon_hash（实时抓取与导入通常一致）
       2) profile_url（实时重抓必带真实主页链接；可救回「导入时哈希不一致」
          或「导入时头像/主页缺失」的历史作者 —— 这是"重新抓取自动恢复"的关键）
 
-    命中后：头像/主页为空则回填；若以 profile_url 命中但与现有 anon_hash 不符，
-    统一为本次（实时）哈希，避免下次再走 profile_url 分支。
+    回填策略（两条，差别只在头像）：
+      * **库里这位用户的头像为空** → 说明这行是残缺快照（导入 / 列表页抓取时
+        平台没返回头像）。此时本次抓到的数据是更完整的一份，按「全字段更新」
+        覆盖昵称 / 头像 / 主页 / 粉丝数；只补头像会留下「新头像 + 旧昵称」
+        这种半新半旧的脏数据。
+      * 头像已有 → 只补空字段，不覆盖已有值（防止某次抓取缺字段把好数据冲成空）。
+
+    若以 profile_url 命中但与现有 anon_hash 不符，统一为本次（实时）哈希，
+    避免下次再走 profile_url 分支。
 
     若同一 profile_url 下存在多条作者（重复导入导致，例如同一人既有空头像行
     又有带头像行），自动合并：评论迁到「规范行」（优先有头像、否则 id 最小），
@@ -1149,6 +1217,7 @@ async def _get_or_create_author(session: AsyncSession, site_id: int,
     """
     anon_hash = anon_hash or ""
     profile_url = profile_url or ""
+    nickname = (nickname or "")[:128]
 
     # 1) 优先按 anon_hash 匹配
     row = None
@@ -1175,7 +1244,8 @@ async def _get_or_create_author(session: AsyncSession, site_id: int,
     if row is None:
         row = Author(source_site_id=site_id, anon_hash=anon_hash,
                      nickname=nickname or None, avatar_url=avatar or None,
-                     profile_url=profile_url or None)
+                     profile_url=profile_url or None,
+                     follower_count=follower_count)
         session.add(row)
         await session.flush()
         return row.id
@@ -1185,11 +1255,13 @@ async def _get_or_create_author(session: AsyncSession, site_id: int,
     if profile_url:
         await _merge_duplicate_authors(session, site_id, profile_url, row.id)
 
-    # 回填空字段
-    if avatar and not row.avatar_url:
-        row.avatar_url = avatar
-    if profile_url and not row.profile_url:
-        row.profile_url = profile_url
+    # ---------- 回填 / 全字段刷新（规则见 apply_author_refresh） ----------
+    changed = apply_author_refresh(row, nickname, avatar, profile_url, follower_count)
+    if changed:
+        utils.logger.info(
+            f"[v2_sync] 作者 {row.id} 字段更新：{', '.join(changed)}"
+            f"（{'头像补齐，全字段刷新' if 'avatar_url' in changed else '头像已有，仅补空字段'}）")
+
     # 以 profile_url 命中但哈希不一致 → 统一为实时哈希，后续直连命中
     if anon_hash and row.anon_hash != anon_hash:
         row.anon_hash = anon_hash
@@ -1268,6 +1340,7 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 str(_pick(item, _NICKNAME_KEYS) or ""),
                 str(_pick(item, _AVATAR_KEYS) or ""),
                 str(item.get("author_url") or ""),
+                _pick_follower(item),
             )
             like_count = safe_int(_pick(item, _LIKE_KEYS) or 0)
             comment_count = safe_int(_pick(item, _COMMENT_COUNT_KEYS) or 0)
@@ -1891,6 +1964,7 @@ async def sync_comment_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                 str(_pick(item, _NICKNAME_KEYS) or ""),
                 str(_pick(item, _AVATAR_KEYS) or ""),
                 str(item.get("author_url") or ""),
+                _pick_follower(item),
             )
 
             # 评论所属内容 ID（笔记 note_id）：两分支共用
