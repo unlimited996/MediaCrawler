@@ -137,10 +137,16 @@ async def find_canonical_by_url(session, source_url: str,
         if exclude_media_id is not None:
             conds.append(MediaBackup.media_id != exclude_media_id)
         q = (select(MediaBackup).where(*conds)
-             .order_by(MediaBackup.id).limit(1))
-        row = (await session.execute(q)).scalar_one_or_none()
+             .order_by(MediaBackup.id).limit(10))
+        rows = (await session.execute(q)).scalars().all()
     except Exception:
         return None
+    # 历史数据的 checksum 可能是 S3 ETag（不是 sha256）。拿它当内容指纹会
+    # 把同一张图拆成两个「不同内容」的组，反而制造冗余，因此只认标准 sha256。
+    import re
+
+    row = next((r for r in rows
+                if r.checksum and re.fullmatch(r"[0-9a-f]{64}", r.checksum)), None)
     if row is None or not row.object_key:
         return None
     return {
