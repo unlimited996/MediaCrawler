@@ -792,3 +792,33 @@ class MediaBackup(BaseV2, TimestampMixin):
         Index("idx_backup_story", "story_id"),
         Index("idx_backup_platform", "platform", "status"),
     )
+
+
+class EmojiAsset(BaseV2, TimestampMixin, SoftDeleteMixin):
+    """表情包库：把重复出现、疑似表情包的图片单独归档管理。
+
+    一个 checksum 一条（内容寻址）。归档后该 checksum 不再进入 S3 去重
+    的「冗余」统计，也不会被删除——避免把有价值的表情包误清理。
+    """
+    __tablename__ = "emoji_asset"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    checksum = Column(String(64), nullable=False, unique=True)
+    # 展示用的规范对象键（优先 dedup/ 前缀），预览走 /s3-backup/object/{key}
+    object_key = Column(Text, nullable=False)
+    name = Column(String(128))
+    # manual(手动/批量) / auto(自动识别) / dedup(去重分组转入)
+    source = Column(String(16), nullable=False, server_default="manual")
+    use_count = Column(Integer, nullable=False, server_default="0")
+    size_bytes = Column(BigInteger)
+    mime_type = Column(String(64))
+    # 出现过的原始对象键、关联帖子（对象链展示用）
+    origin_keys = Column(JsonType, nullable=False, default=list)
+    story_ids = Column(JsonType, nullable=False, default=list)
+    ext = Column(JsonType, nullable=False, default=dict)
+    schema_ver = Column(Integer, nullable=False, server_default="1")
+
+    __table_args__ = (
+        Index("idx_emoji_source", "source"),
+        Index("idx_emoji_use", "use_count"),
+    )

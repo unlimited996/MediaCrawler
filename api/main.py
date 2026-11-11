@@ -38,7 +38,8 @@ import config as config_module
 from .routers import (crawler_router, data_router, websocket_router, export_router, env_router,
                       config_router, story_router, discover_router, accounts_router,
                       scheduler_router, stance_tags_router, s3_backup_router,
-                      recipe_router, media_router, app_config_router)
+                      recipe_router, media_router, app_config_router,
+                      emoji_assets_router)
 
 # Project root directory (used for running subprocesses like uv run main.py)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -289,6 +290,7 @@ app.include_router(accounts_router, prefix="/api")
 app.include_router(scheduler_router, prefix="/api")
 app.include_router(stance_tags_router, prefix="/api")
 app.include_router(s3_backup_router, prefix="/api")
+app.include_router(emoji_assets_router, prefix="/api")
 # 菜谱域（KitchenHelper）：/api/recipes、/api/media、/api/app-config
 app.include_router(recipe_router, prefix="/api")
 app.include_router(media_router, prefix="/api")

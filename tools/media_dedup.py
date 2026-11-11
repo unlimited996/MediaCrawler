@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, select
 
-from database.models_v2 import MediaBackup
+from database.models_v2 import EmojiAsset, MediaBackup, Story
 
 
 #: 规范键前缀（与 object_key 现有前缀不冲突）
@@ -73,6 +73,15 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
         )
     )).scalars().all()
 
+    # 已归档进表情包库的内容不再当「冗余」处理，也不参与删除
+    emoji_csums: set = set()
+    try:
+        emoji_csums = set((await session.execute(
+            select(EmojiAsset.checksum).where(EmojiAsset.deleted_at.is_(None))
+        )).scalars().all())
+    except Exception:
+        pass  # 表还没建好时忽略
+
     by_csum: Dict[str, List[MediaBackup]] = {}
     for r in rows:
         by_csum.setdefault(r.checksum, []).append(r)
@@ -81,7 +90,7 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
     redundant_objects = 0
     reclaimable_bytes = 0
     for csum, items in by_csum.items():
-        if len(items) < 2:
+        if csum in emoji_csums or len(items) < 2:
             continue
         sizes = [int(i.size_bytes or 0) for i in items]
         keys = [i.object_key for i in items]
@@ -114,7 +123,20 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
             "sizes": [size_by_key[k] for k in distinct],  # 与 keys 一一对应
             # 涉及的帖/评论（按 content_id 去重），便于判断合并范围
             "content_ids": sorted({i.content_id for i in items if i.content_id}),
+            "story_ids": list(dict.fromkeys(
+                [int(i.story_id) for i in items if i.story_id])),
         })
+    all_sids = {sid for g in dup_groups for sid in g["story_ids"]}
+    story_titles: Dict[int, str] = {}
+    if all_sids:
+        try:
+            story_titles = {sid: (title or "") for sid, title in (await session.execute(
+                select(Story.id, Story.title).where(Story.id.in_(all_sids)))).all()}
+        except Exception:
+            pass
+    for g in dup_groups:
+        g["story_titles"] = [story_titles[s] for s in g["story_ids"]
+                             if s in story_titles]
     dup_groups.sort(key=lambda g: g["reclaimable_bytes"], reverse=True)
     return {
         "analyzed_rows": len(rows),
@@ -152,7 +174,7 @@ async def dedup_backups(session, settings, dry_run: bool = True,
     stats: Dict[str, Any] = {
         "groups": 0, "merged_rows": 0, "objects_deleted": 0,
         "bytes_reclaimed": 0, "errors": [], "skipped": 0,
-        "protected": 0,
+        "protected": 0, "delete_errors": [], "delete_protected": 0,
     }
 
     if dry_run:
@@ -243,10 +265,11 @@ async def dedup_backups(session, settings, dry_run: bool = True,
             deleted = await _delete_redundant(session, settings, sem, dels)
             stats["objects_deleted"] += deleted["deleted"]
             stats["bytes_reclaimed"] += deleted["bytes"]
+            stats["delete_errors"].extend(deleted["errors"])
+            stats["delete_protected"] += deleted["protected"]
             stats["protected"] += (len(items) - len(non_excluded))
-            if deleted["deleted"] or len(dels):
-                stats["groups"] += 1
-                stats["merged_rows"] += len(non_excluded)
+            stats["groups"] += 1
+            stats["merged_rows"] += len(non_excluded)
         except Exception as e:
             await _safe_rollback(session)
             stats["errors"].append(
@@ -288,24 +311,32 @@ async def _delete_redundant(session, settings, sem, dels: List[Tuple[str, int]]
     """删除冗余对象；删前确认该键已无任何 media_backup 行引用。"""
     from tools.s3_client import delete_object
 
-    deleted, bytes_total = 0, 0
+    deleted, bytes_total, protected = 0, 0, 0
+    errors: List[Dict[str, str]] = []
+    # 同一个键可能因重抓出现多次，只删一次，否则第二次必然报「对象不存在」
+    unique: Dict[str, int] = {}
+    for key, size in dels:
+        unique.setdefault(key, int(size or 0))
     async with sem:
-        for key, size in dels:
-            # 防御：仍被引用则不删（理论上改键后不会，但稳妥）
+        for key, size in unique.items():
+            # 防御：仍被引用则不删
             ref = (await session.execute(
                 select(func.count(MediaBackup.id)).where(
                     MediaBackup.object_key == key)
             )).scalar() or 0
             if ref > 0:
+                protected += 1
                 continue
             try:
                 await delete_object(settings, key)
                 deleted += 1
                 bytes_total += size
-            except Exception:
-                # 删除失败不阻断其它组，留给后台重试/手动清理
-                pass
-    return {"deleted": deleted, "bytes": bytes_total}
+            except Exception as e:
+                # 之前静默吞掉，导致「合并了但没删掉、errors 还是 0」
+                errors.append({"key": key,
+                               "error": f"{type(e).__name__}: {str(e)[:160]}"})
+    return {"deleted": deleted, "bytes": bytes_total,
+            "errors": errors, "protected": protected}
 
 
 async def _safe_rollback(session) -> None:

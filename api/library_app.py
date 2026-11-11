@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import config
 from .gateway import router as gateway_router
 from .routers import (accounts_router, app_config_router, config_router,
+                      emoji_assets_router,
                       data_router, discover_router, env_router, export_router,
                       media_router, recipe_router, s3_backup_router,
                       scheduler_router, stance_tags_router, story_router,
@@ -62,6 +63,7 @@ app.include_router(discover_router, prefix=API_PREFIX)
 app.include_router(export_router, prefix=API_PREFIX)
 app.include_router(stance_tags_router, prefix=API_PREFIX)
 app.include_router(s3_backup_router, prefix=API_PREFIX)
+app.include_router(emoji_assets_router, prefix=API_PREFIX)
 app.include_router(recipe_router, prefix=API_PREFIX)
 app.include_router(media_router, prefix=API_PREFIX)
 app.include_router(app_config_router, prefix=API_PREFIX)
@@ -131,6 +133,7 @@ async def _on_startup() -> None:
     boot_tasks.start_stance_backfill()
     boot_tasks.start_stance_library()
     boot_tasks.start_s3_backup()
+    boot_tasks.start_emoji_library()
     boot_tasks.start_recipe_boot()
     # 实时日志桥：tail 共享的 logs/scheduler_live.jsonl 并广播给 WS 客户端。
     # 不启动的话前端连上 /library/api/ws/logs 只会收到历史补发、没有实时日志。

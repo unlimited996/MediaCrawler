@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { QrCode, X, Loader2 } from 'lucide-react'
 import { crawlerApi } from '@/lib/api'
+import { useDraggableFloat } from '@/hooks/useDraggableFloat'
 
 /**
  * 扫码登录二维码（浮动可收纳）。
@@ -16,6 +17,12 @@ import { crawlerApi } from '@/lib/api'
 export function LoginQrcodeFab() {
   const { t } = useTranslation('config')
   const [open, setOpen] = useState(true)
+  const { pos, dragHandlers, consumeDragClick } = useDraggableFloat('qrcode', {
+    left: typeof window !== 'undefined' && window.innerWidth < 768
+      ? 8 : Math.max(0, (typeof window !== 'undefined' ? window.innerWidth : 1400) - 290),
+    top: typeof window !== 'undefined' && window.innerWidth < 768
+      ? 8 : Math.max(0, (typeof window !== 'undefined' ? window.innerHeight : 900) - 330),
+  })
 
   const q = useQuery({
     queryKey: ['crawlerQrcode'],
@@ -30,7 +37,9 @@ export function LoginQrcodeFab() {
   const src = qr.startsWith('data:') ? qr : `data:image/png;base64,${qr}`
 
   return (
-    <div className="fixed left-2 top-2 z-[70] flex flex-col items-start gap-2 sm:bottom-5 sm:left-auto sm:right-5 sm:top-auto sm:items-end">
+    <div {...dragHandlers}
+         style={{ left: pos.left, top: pos.top }}
+         className="fixed z-[70] flex cursor-grab touch-none select-none flex-col items-start gap-2 active:cursor-grabbing sm:items-end">
       {open && (
         <div className="w-52 rounded-lg glass-panel float-panel border border-cyber-border-subtle p-2 shadow-lg animate-slide-up sm:w-64 sm:p-3">
           <div className="mb-2 flex items-center justify-between">
@@ -40,7 +49,8 @@ export function LoginQrcodeFab() {
             </span>
             <button
               type="button"
-              onClick={() => setOpen(false)}
+              data-no-drag
+              onClick={() => { if (!consumeDragClick()) setOpen(false) }}
               className="text-cyber-text-muted transition-colors hover:text-cyber-text-primary"
               title={t('queue.qrcodeCollapse', '收起')}
             >
@@ -63,7 +73,7 @@ export function LoginQrcodeFab() {
       {/* 收起态：小方框按钮 */}
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => { if (!consumeDragClick()) setOpen((v) => !v) }}
         title={open ? t('queue.qrcodeCollapse', '收起') : t('queue.qrcodeExpand', '展开登录二维码')}
         className={`relative flex h-11 w-11 items-center justify-center rounded-lg border transition-all ${
           open

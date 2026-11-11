@@ -5,6 +5,54 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-11] 表情包库 + 去重删除链路修复 + 备份页交互升级
+
+### 1. 去重「重复图片处理失败」根因
+线上 `last_run = {execute:true, groups:17, merged_rows:46, objects_deleted:24,
+errors:0}` —— 合并了 46 行却只删 24 个对象且无错误记录。原因：
+- `_delete_redundant` 的 `dels` 未按 object_key 去重（重抓会让同键多行出现），
+  第二次删同一键必然报「对象不存在」；
+- 删除异常被 `except: pass` **静默吞掉**，`errors` 永远是 0，用户只看到「没删掉」。
+
+修复：按 key 去重、失败记录进 `delete_errors`、仍被引用的计入
+`delete_protected`，`groups/merged_rows` 按实际处理组数统计；前端 `last_run`
+展示删除失败数、首条错误与保护跳过数。
+
+### 2. 表情包库
+- 新表 `emoji_asset`（按 sha256 唯一）：规范键 / 来源 / 使用次数 / 原始键 /
+  关联帖子 / 体积。`boot_tasks.start_emoji_library()` 启动时幂等建表，
+  历史库无需手工跑 `init_v2`。
+- 新 `api/routers/emoji_assets.py`：`GET /emoji-assets`、
+  `POST /archive`（按 keys / item_ids / checksums 批量、幂等）、
+  `POST /detect`（识别评论表情包，可 `auto_archive`）、`DELETE /{id}`。
+  单体与 library 均已挂载。
+- 判定：同一 checksum 出现在 ≥3 个不同 content_id，且评论来源占比 ≥0.5
+  （或复用 ≥5 次），体积 <200KB 加分。
+- **归档即豁免去重**：`analyze_duplicates` 跳过已入库 checksum，重复表情包
+  不再被当冗余删除，报告组数会随之下降。
+
+### 3. 页面交互
+- 去重分组：批量勾选副本（全选可见 / 清空）、「保留所选」「转为表情包」
+  两个批量按钮；分组显示关联帖子名；展示删除失败明细。
+- 表情包库面板：缩略图、使用次数、关联帖子名、移出、「自动识别并归档」。
+- 备份记录：对象键列加缩略图，**点击改 ImageViewer 弹窗（不再 `target=_blank`）**；
+  显示帖子名；操作栏新增「转为表情包」图标按钮；图片统一 `no-referrer`。
+- `GET /s3-backup/items` 返回 `story_title`（批量 join Story，无 N+1）。
+
+### 4. 浮窗可拖拽
+新增 `webui/src/hooks/useDraggableFloat.ts`：pointer 拖拽 + localStorage
+持久化 + 拖动后吞掉误触 click + `data-no-drag` 保护交互元素。
+「原版登录页」按钮与二维码浮窗均接入，位置可随意拖动避免遮挡。
+
+### 验证
+```
+后端模拟：归档幂等（新增2→再归档 updated1）、表情包识别（只命中评论高频图）
+          删除按 key 去重（x,y,bad 各一次）、失败记录 1 条
+          表情包豁免（2 组 → 1 组）、路由 library+单体均挂载
+前端：npx tsc --noEmit 通过、npm run build 通过
+py_compile / main.py --help 通过
+```
+
 ## [2026-11-09] S3 去重「执行了但可收回还是 17.6MB」= 只跑了分析 + 统计按行数
 
 ### 现象

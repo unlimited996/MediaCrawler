@@ -529,6 +529,7 @@ export interface S3BackupItem {
   id: number
   media_id: number
   story_id: number | null
+  story_title?: string
   platform: string | null
   content_id: string | null
   media_type: string
@@ -613,4 +614,46 @@ export const s3BackupApi = {
   storyStatus: (storyId: number) =>
     api.get<{ total: number; uploaded: number; complete: boolean }>(
       `/s3-backup/stories/${storyId}/status`),
+}
+
+/** 表情包库条目：按内容 sha256 去重归档的复用型图片 */
+export interface EmojiAssetItem {
+  id: number
+  checksum: string
+  object_key: string
+  preview_url: string
+  name: string
+  source: string
+  use_count: number
+  size_bytes: number
+  mime_type: string
+  origin_keys: string[]
+  story_ids: number[]
+  story_titles: string[]
+  created_at: string | null
+}
+
+export interface EmojiCandidate {
+  checksum: string
+  use_count: number
+  rows: number
+  comment_ratio: number
+  size_bytes: number
+  score: number
+  keys: string[]
+  story_ids: number[]
+}
+
+export const emojiAssetsApi = {
+  list: (params: { page?: number; page_size?: number; keyword?: string } = {}) =>
+    api.get<{ items: EmojiAssetItem[]; total: number }>(
+      '/emoji-assets', { params }),
+  archive: (payload: { keys?: string[]; item_ids?: number[]; checksums?: string[];
+                       name?: string; source?: string }) =>
+    api.post<{ archived: number; updated: number; matched_rows: number; groups: number }>(
+      '/emoji-assets/archive', payload),
+  detect: (payload: { min_uses?: number; limit?: number; auto_archive?: boolean }) =>
+    api.post<{ items: EmojiCandidate[]; total: number; archived: number }>(
+      '/emoji-assets/detect', payload),
+  remove: (id: number) => api.delete<{ ok: boolean; id: number }>(`/emoji-assets/${id}`),
 }

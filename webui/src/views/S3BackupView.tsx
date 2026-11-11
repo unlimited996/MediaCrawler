@@ -18,6 +18,7 @@ import api from '@/lib/api'
 import {
   CloudUpload, Crosshair, DatabaseBackup, HardDriveDownload, Layers, Play, Plus,
   Power, RefreshCw, RotateCcw, Trash2, Wifi, X, Zap,
+  Smile, Sparkles, CheckSquare,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -29,7 +30,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog'
 import {
-  S3ConfigRow, S3BackupItem, S3BackupStats,
+  S3ConfigRow, S3BackupItem, S3BackupStats, emojiAssetsApi,
 } from '@/lib/api'
 import { useImageViewer } from '@/components/data/platform/ImageViewer'
 
@@ -106,8 +107,14 @@ export function S3BackupView() {
   const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set())
   // 已展开的分组（按 checksum）
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  // 批量勾选的副本（用于「保留」/「转为表情包」）
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   // 看图器：展开分组后点缩略图可放大查看（复用「本地→远程→S3」候选源）
   const viewer = useImageViewer()
+  const emojiQ = useQuery({
+    queryKey: ['emojiAssets'],
+    queryFn: async () => (await emojiAssetsApi.list({ page_size: 60 })).data,
+  })
 
   const toggleExpand = (c: string) =>
     setExpanded((prev) => {
@@ -127,6 +134,22 @@ export function S3BackupView() {
       keys.forEach((k) => (on ? n.add(k) : n.delete(k)))
       return n
     })
+  const toggleKeySelect = (k: string) =>
+    setSelectedKeys((prev) => {
+      const n = new Set(prev)
+      n.has(k) ? n.delete(k) : n.add(k)
+      return n
+    })
+  const keepSelected = () => {
+    if (!selectedKeys.size) return
+    setExcludedKeys((prev) => {
+      const n = new Set(prev)
+      selectedKeys.forEach((k) => n.add(k))
+      return n
+    })
+    toast.success(`已保留 ${selectedKeys.size} 个副本，去重时不会删除`)
+    setSelectedKeys(new Set())
+  }
 
   const invalidateAll = () => {
     qc.invalidateQueries({ queryKey: ['s3Configs'] })
@@ -230,6 +253,36 @@ export function S3BackupView() {
       }
     },
     onError: (e: any) => toast.error(`启动失败：${e?.response?.data?.detail || e?.message}`),
+  })
+
+  const emojiArchiveM = useMutation({
+    mutationFn: async (payload: { keys: string[]; source: string }) =>
+      (await emojiAssetsApi.archive(payload)).data,
+    onSuccess: (d: any) => {
+      toast.success(`已归档 ${d.archived} 个新表情包（更新 ${d.updated} 个）`)
+      qc.invalidateQueries({ queryKey: ['emojiAssets'] })
+      dedupQ.refetch()
+      setSelectedKeys(new Set())
+    },
+    onError: (e: any) => toast.error(`归档失败：${e?.response?.data?.detail || e?.message}`),
+  })
+  const emojiDetectM = useMutation({
+    mutationFn: async () => (await emojiAssetsApi.detect({
+      auto_archive: true, limit: 200,
+    })).data,
+    onSuccess: (d: any) => {
+      toast.success(`识别到 ${d.total} 个候选，已自动归档 ${d.archived} 个`)
+      qc.invalidateQueries({ queryKey: ['emojiAssets'] })
+      dedupQ.refetch()
+    },
+    onError: (e: any) => toast.error(`识别失败：${e?.response?.data?.detail || e?.message}`),
+  })
+  const emojiRemoveM = useMutation({
+    mutationFn: async (id: number) => (await emojiAssetsApi.remove(id)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['emojiAssets'] })
+      dedupQ.refetch()
+    },
   })
 
   const stats = statsQ.data
@@ -338,6 +391,11 @@ export function S3BackupView() {
                   : `上次运行失败：${dedupQ.data.last_run.error || ''}`}
                 {dedupQ.data.last_run.errors?.length
                   ? `（${dedupQ.data.last_run.errors.length} 组跳过）` : ''}
+                {dedupQ.data.last_run.delete_errors?.length
+                  ? ` · ${dedupQ.data.last_run.delete_errors.length} 个对象删除失败` +
+                    `（${dedupQ.data.last_run.delete_errors[0]?.error || ''}）` : ''}
+                {dedupQ.data.last_run.delete_protected
+                  ? ` · ${dedupQ.data.last_run.delete_protected} 个仍被引用跳过` : ''}
               </div>
             )}
             {dedupOpen && dedupQ.data?.groups?.length ? (
@@ -348,6 +406,38 @@ export function S3BackupView() {
                     <button type="button" onClick={() => setExcludedKeys(new Set())}
                             className="text-cyber-neon-cyan hover:underline">
                       清空排除({excludedKeys.size})
+                    </button>
+                  )}
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 rounded border border-cyber-border-subtle bg-cyber-bg-tertiary/40 px-2 py-1.5">
+                  <CheckSquare className="h-3.5 w-3.5 text-cyber-neon-cyan" />
+                  <span className="text-[10px] font-mono text-cyber-text-secondary">
+                    已选 {selectedKeys.size} 个副本
+                  </span>
+                  <Button size="sm" variant="outline" className="h-6 font-mono text-[10px]"
+                          disabled={!selectedKeys.size}
+                          onClick={() => {
+                            const all = (dedupQ.data?.groups || []).slice(0, 300)
+                              .flatMap((g: any) => g.keys as string[])
+                            setSelectedKeys(new Set(all))
+                          }}>
+                    全选可见
+                  </Button>
+                  <Button size="sm" variant="outline" className="h-6 font-mono text-[10px]"
+                          disabled={!selectedKeys.size} onClick={keepSelected}>
+                    保留所选
+                  </Button>
+                  <Button size="sm" className="h-6 font-mono text-[10px]"
+                          disabled={!selectedKeys.size || emojiArchiveM.isPending}
+                          onClick={() => emojiArchiveM.mutate({
+                            keys: [...selectedKeys], source: 'dedup',
+                          })}>
+                    <Smile className="mr-1 h-3 w-3" />转为表情包
+                  </Button>
+                  {selectedKeys.size > 0 && (
+                    <button type="button" onClick={() => setSelectedKeys(new Set())}
+                            className="text-[10px] text-cyber-text-muted hover:underline">
+                      清空选择
                     </button>
                   )}
                 </div>
@@ -386,13 +476,20 @@ export function S3BackupView() {
                         </div>
                         {exp && (
                           <div className="border-t border-cyber-border-subtle/60 p-2">
-                            <div className="mb-1.5 text-[10px] text-cyber-text-muted">
+                            <div className="mb-1 text-[10px] text-cyber-text-muted">
                               涉及 {g.content_ids?.length ?? 0} 个对象(content_id)：
                               <span className="ml-1 font-mono text-cyber-text-secondary">
                                 {(g.content_ids || []).slice(0, 10).join('、')}
                                 {(g.content_ids || []).length > 10 ? ' …' : ''}
                               </span>
                             </div>
+                            {(g.story_titles || []).length > 0 && (
+                              <div className="mb-1.5 truncate text-[10px] text-cyber-neon-cyan"
+                                   title={(g.story_titles || []).join('、')}>
+                                关联帖子：{(g.story_titles || []).slice(0, 3).join('、')}
+                                {(g.story_titles || []).length > 3 ? ' …' : ''}
+                              </div>
+                            )}
                             {/* 所有副本横向并排、不换行、可左右滑动，方便直接比对；点图放大 */}
                             <div className="flex gap-2 overflow-x-auto pb-1">
                               {g.keys.map((k: string, i: number) => {
@@ -418,9 +515,17 @@ export function S3BackupView() {
                                       )}
                                     </div>
                                     <div className="mt-1 flex items-center gap-1">
-                                      <input type="checkbox" checked={kept}
-                                             onChange={() => toggleKeyExclude(k)}
-                                             className="h-3 w-3 accent-emerald-400" />
+                                      <input type="checkbox" checked={selectedKeys.has(k)}
+                                             onChange={() => toggleKeySelect(k)}
+                                             title="勾选用于批量操作"
+                                             className="h-3 w-3 accent-cyan-400" />
+                                      <label className="flex items-center gap-0.5"
+                                             title="保留：去重时不会删除该副本">
+                                        <input type="checkbox" checked={kept}
+                                               onChange={() => toggleKeyExclude(k)}
+                                               className="h-3 w-3 accent-emerald-400" />
+                                        <span className="text-[9px] text-cyber-text-muted">留</span>
+                                      </label>
                                       <span className="truncate font-mono text-[9px] text-cyber-text-muted"
                                             title={k}>{k.split('/').pop()}</span>
                                     </div>
@@ -439,6 +544,46 @@ export function S3BackupView() {
                 </div>
               </div>
             ) : null}
+          </div>
+
+          {/* 表情包库：归档的复用型图片，不再参与去重删除 */}
+          <div className="glass-panel flex-shrink-0 rounded-lg px-3 py-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <Smile className="h-4 w-4 text-cyber-neon-orange" />
+              <span className="font-mono text-xs font-bold text-cyber-text-primary">表情包库</span>
+              <span className="text-[11px] text-cyber-text-muted">
+                共 {emojiQ.data?.total ?? 0} 个 · 归档后不再被去重删除
+              </span>
+              <Button size="sm" variant="outline" className="ml-auto h-6 font-mono text-[10px]"
+                      onClick={() => emojiDetectM.mutate()} disabled={emojiDetectM.isPending}>
+                <Sparkles className="mr-1 h-3 w-3" />自动识别并归档
+              </Button>
+            </div>
+            <div className="mt-2 flex max-h-[132px] gap-2 overflow-x-auto pb-1">
+              {(emojiQ.data?.items || []).length === 0 ? (
+                <div className="py-3 text-[11px] text-cyber-text-muted">
+                  暂无表情包。可在上方勾选重复副本点「转为表情包」，或点「自动识别并归档」。
+                </div>
+              ) : (emojiQ.data?.items || []).map((a: any) => (
+                <div key={a.id}
+                     className="w-20 flex-shrink-0 rounded border border-cyber-border-subtle p-1">
+                  <img src={a.preview_url} alt="" loading="lazy"
+                       referrerPolicy="no-referrer"
+                       onClick={() => viewer?.open([[a.preview_url]], 0)}
+                       className="aspect-square w-full cursor-zoom-in rounded bg-cyber-bg-tertiary object-cover"
+                       onError={(e) => {
+                         (e.currentTarget as HTMLImageElement).style.visibility = 'hidden'
+                       }} />
+                  <div className="mt-0.5 font-mono text-[9px] text-cyber-neon-cyan">×{a.use_count}</div>
+                  <div className="truncate font-mono text-[9px] text-cyber-text-muted"
+                       title={(a.story_titles || []).join('、')}>
+                    {a.name || (a.story_titles || [])[0] || '表情包'}
+                  </div>
+                  <button type="button" onClick={() => emojiRemoveM.mutate(a.id)}
+                          className="text-[9px] text-rose-300 hover:underline">移出</button>
+                </div>
+              ))}
+            </div>
           </div>
 
           {/* 统计卡片 */}
@@ -567,11 +712,29 @@ export function S3BackupView() {
               <tbody>
                 {items.map((it) => (
                   <tr key={it.id} className="border-b border-cyber-border-subtle/50 hover:bg-cyber-bg-tertiary/50">
-                    <td className="max-w-[220px] truncate px-2 py-1.5 text-cyber-text-secondary" title={it.object_key}>
-                      <a href={it.object_url} target="_blank" rel="noopener noreferrer"
-                         className="hover:text-cyber-neon-cyan hover:underline">
-                        {it.object_key}
-                      </a>
+                    <td className="max-w-[260px] px-2 py-1.5 text-cyber-text-secondary">
+                      <div className="flex items-center gap-1.5">
+                        <img src={it.object_url} alt="" loading="lazy"
+                             referrerPolicy="no-referrer"
+                             onClick={() => viewer?.open([[it.object_url]], 0)}
+                             className="h-8 w-8 flex-shrink-0 cursor-zoom-in rounded border border-cyber-border-subtle bg-cyber-bg-tertiary object-cover"
+                             onError={(e) => {
+                               (e.currentTarget as HTMLImageElement).style.visibility = 'hidden'
+                             }} />
+                        <div className="min-w-0">
+                          <button type="button" title={it.object_key}
+                                  onClick={() => viewer?.open([[it.object_url]], 0)}
+                                  className="block max-w-[190px] truncate text-left font-mono hover:text-cyber-neon-cyan hover:underline">
+                            {it.object_key}
+                          </button>
+                          {it.story_title && (
+                            <div className="max-w-[190px] truncate text-[10px] text-cyber-neon-cyan"
+                                 title={it.story_title}>
+                              {it.story_title}
+                            </div>
+                          )}
+                        </div>
+                      </div>
                     </td>
                     <td className="px-2 py-1.5 text-cyber-text-secondary">{it.platform || '-'}</td>
                     <td className="px-2 py-1.5">
@@ -592,6 +755,15 @@ export function S3BackupView() {
                             <Crosshair className="h-3 w-3 text-cyber-neon-purple" />
                           </Button>
                         ) : null}
+                        <Button size="icon" variant="ghost"
+                                title="转为表情包（归档进表情包库，去重时不再删除）"
+                                className="h-6 w-6"
+                                disabled={emojiArchiveM.isPending}
+                                onClick={() => emojiArchiveM.mutate({
+                                  keys: [it.object_key], source: 'manual',
+                                })}>
+                          <Smile className="h-3 w-3 text-cyber-neon-orange" />
+                        </Button>
                         {(it.status === 'failed' || it.status === 'pending') && (
                           <Button size="icon" variant="ghost" title="重试" className="h-6 w-6"
                                   onClick={() => retryItemM.mutate(it.id)}>

@@ -45,6 +45,7 @@ _ROUTER_EXPORTS = {
     "env_router": ("env", "router"),
     "login_session_router": ("login_session", "router"),
     "captcha_session_router": ("captcha_session", "router"),
+    "emoji_assets_router": ("emoji_assets", "router"),
 }
 
 

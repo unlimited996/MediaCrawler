@@ -389,8 +389,15 @@ async def list_items(
             q.order_by(MediaBackup.id.desc())
             .offset((page - 1) * page_size).limit(page_size)
         )).scalars().all()
+        story_ids = {r.story_id for r in rows if r.story_id}
+        titles: Dict[int, str] = {}
+        if story_ids:
+            from database.models_v2 import Story
+
+            titles = {sid: (title or "") for sid, title in (await session.execute(
+                select(Story.id, Story.title).where(Story.id.in_(story_ids)))).all()}
         return {
-            "items": [_item_out(r) for r in rows],
+            "items": [_item_out(r, titles.get(r.story_id)) for r in rows],
             "total": total, "page": page, "page_size": page_size,
         }
     finally:
@@ -398,11 +405,12 @@ async def list_items(
         await engine.dispose()
 
 
-def _item_out(r: MediaBackup) -> Dict[str, Any]:
+def _item_out(r: MediaBackup, story_title: Optional[str] = None) -> Dict[str, Any]:
     return {
         "id": r.id,
         "media_id": r.media_id,
         "story_id": r.story_id,
+        "story_title": story_title or "",
         "platform": r.platform,
         "content_id": r.content_id,
         "media_type": r.media_type,

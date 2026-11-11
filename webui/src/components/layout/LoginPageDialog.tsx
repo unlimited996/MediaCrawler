@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Monitor, X, Loader2, CheckCircle2, ChevronUp, ChevronDown } from 'lucide-react'
 import { toast } from 'sonner'
 import { loginSessionApi, type LoginSessionStatus } from '@/lib/api'
+import { useDraggableFloat } from '@/hooks/useDraggableFloat'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 
@@ -21,6 +22,10 @@ export function LoginPageDialog() {
   const [fit, setFit] = useState(
     typeof window !== 'undefined' ? window.innerWidth >= 768 : true)
   const imgRef = useRef<HTMLImageElement>(null)
+  const { pos, dragHandlers, consumeDragClick } = useDraggableFloat('login-page', {
+    left: typeof window !== 'undefined' ? Math.max(0, window.innerWidth - 210) : 1200,
+    top: typeof window !== 'undefined' ? Math.max(0, window.innerHeight - 64) : 800,
+  })
 
   // 截图刷新：加时间戳绕开浏览器缓存
   useEffect(() => {
@@ -101,10 +106,12 @@ export function LoginPageDialog() {
   if (!open) {
     return (
       <button
-        onClick={start}
+        onClick={() => { if (!consumeDragClick()) void start() }}
+        {...dragHandlers}
+        style={{ left: pos.left, top: pos.top }}
         disabled={busy}
-        title="打开原版登录页（扫码 / 手机号短信验证码）"
-        className="fixed bottom-5 right-[5.5rem] z-50 flex h-11 items-center gap-2 rounded-lg border border-cyber-border-DEFAULT bg-cyber-bg-panel px-3 text-xs font-mono text-cyber-text-primary shadow-lg hover:border-cyber-neon-cyan/60 disabled:opacity-50"
+        title="打开原版登录页（可拖动位置）；扫码 / 手机号短信验证码"
+        className="fixed z-50 flex h-11 cursor-grab touch-none select-none items-center gap-2 rounded-lg border border-cyber-border-DEFAULT bg-cyber-bg-panel px-3 text-xs font-mono text-cyber-text-primary shadow-lg hover:border-cyber-neon-cyan/60 active:cursor-grabbing disabled:opacity-50"
       >
         {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Monitor className="h-4 w-4" />}
         原版登录页
