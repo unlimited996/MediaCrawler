@@ -30,9 +30,11 @@
 from __future__ import annotations
 
 import gzip
+import os
 import hashlib
 import json
 import time
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -42,8 +44,9 @@ from sqlalchemy import case, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models_recipe import (
-    AppConfig, DIFFICULTY_VALUES, RECIPE_STATUS_VALUES, Recipe, RecipeCategory,
-    RecipeIngredient, RecipeStep, RecipeTag, RecipeTagLink,
+    SCHEMA, AppConfig, DIFFICULTY_VALUES, RECIPE_STATUS_VALUES, MealLog, Recipe,
+    RecipeCategory, RecipeFeedback, RecipeIngredient, RecipeStep, RecipeTag,
+    RecipeTagLink, TablePlanRecord,
 )
 from .story import _session
 
@@ -118,6 +121,13 @@ def _recipe_brief(r: Recipe, category_name: Optional[str],
         "durationMinutes": r.duration_minutes,
         "difficulty": r.difficulty,
         "tags": list(tags),
+        # v2：菜品页/收藏榜/发现页需要
+        "caloriesKcal": r.calories_kcal,
+        "cuisine": r.cuisine,
+        "favoriteCount": r.favorite_count or 0,
+        "cookedCount": r.cooked_count or 0,
+        "source": r.source,
+        "publishedAt": r.published_at.isoformat() if r.published_at else None,
     }
 
 
@@ -262,6 +272,12 @@ async def _build_bundle(session: AsyncSession) -> Dict[str, Any]:
             "durationMinutes": r.duration_minutes,
             "difficulty": r.difficulty,
             "variants": r.variants or [],
+            "caloriesKcal": r.calories_kcal,
+            "cuisine": r.cuisine,
+            "favoriteCount": r.favorite_count or 0,
+            "cookedCount": r.cooked_count or 0,
+            "source": r.source,
+            "publishedAt": r.published_at.isoformat() if r.published_at else None,
             "tags": tags_by_recipe.get(r.id, []),
         } for r in recipes],
         "ingredients": [{
@@ -434,6 +450,171 @@ async def _tags_for(session: AsyncSession,
     for rid, name in rows:
         out.setdefault(rid, []).append(name)
     return out
+
+
+# ---------------------------------------------------------------------------
+# v2：菜系 / 收藏榜 / 发现 / 反馈
+# 注意：这些静态路径必须声明在 /{recipe_id:path} 之前，否则会被详情路由吞掉
+# ---------------------------------------------------------------------------
+@router.get("/cuisines")
+async def list_cuisines():
+    """菜系列表 + 数量，供菜品页顶部的筛选 chips。"""
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        rows = (await session.execute(
+            select(Recipe.cuisine, func.count())
+            .where(Recipe.status == "published")
+            .group_by(Recipe.cuisine)
+            .order_by(func.count().desc()))).all()
+        return {
+            "items": [{"name": name or "未分类", "count": n} for name, n in rows],
+            "total": sum(n for _, n in rows),
+        }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/ranking/favorites")
+async def favorite_ranking(limit: int = Query(20, ge=1, le=100)):
+    """收藏榜：按真实收藏数排序。
+
+    没有接入用户体系时收藏数会很小（甚至为 0），这里不做任何假数据填充；
+    并列时用「做过次数 → 家常度」做次级排序，保证榜单顺序稳定可解释。
+    """
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        rows = (await session.execute(
+            select(Recipe)
+            .where(Recipe.status == "published")
+            .order_by(Recipe.favorite_count.desc(),
+                      Recipe.cooked_count.desc(),
+                      Recipe.sort_order, Recipe.id)
+            .limit(limit))).scalars().all()
+        cat_map = dict((await session.execute(
+            select(RecipeCategory.id, RecipeCategory.name))).all())
+        tag_map = await _tags_for(session, [r.id for r in rows])
+        items = []
+        for index, r in enumerate(rows, start=1):
+            item = _recipe_brief(r, cat_map.get(r.category_id), tag_map.get(r.id, []))
+            item["rank"] = index
+            items.append(item)
+        return {"items": items, "total": len(items)}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/discover")
+async def discover(
+    sort: str = Query("latest", pattern="^(latest|hot)$"),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """发现页：``latest`` 按上新时间，``hot`` 按收藏数。
+
+    「偷个菜」= 把别人贡献的菜复制进自己的餐桌，因此这里会带上 ``source``
+    （菜谱来源，如「小厨」「村吕」），App 在卡片上标出来源。
+    """
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        stmt = select(Recipe).where(Recipe.status == "published")
+        if sort == "latest":
+            stmt = stmt.order_by(Recipe.published_at.desc().nullslast(), Recipe.id)
+        else:
+            stmt = stmt.order_by(Recipe.favorite_count.desc(),
+                                 Recipe.cooked_count.desc(), Recipe.id)
+        rows = (await session.execute(stmt.limit(limit))).scalars().all()
+        cat_map = dict((await session.execute(
+            select(RecipeCategory.id, RecipeCategory.name))).all())
+        tag_map = await _tags_for(session, [r.id for r in rows])
+        return {
+            "items": [_recipe_brief(r, cat_map.get(r.category_id), tag_map.get(r.id, []))
+                      for r in rows],
+            "sort": sort,
+        }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/feedback")
+async def list_feedback(device_id: str = Query(..., alias="deviceId")):
+    """某台设备的收藏 / 不想吃列表，App 启动时同步一次。"""
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        rows = (await session.execute(
+            select(RecipeFeedback.recipe_id, RecipeFeedback.kind)
+            .where(RecipeFeedback.device_id == device_id))).all()
+        favorites = [rid for rid, kind in rows if kind == "favorite"]
+        dislikes = [rid for rid, kind in rows if kind == "dislike"]
+        return {"favorites": favorites, "dislikes": dislikes}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.post("/{recipe_id:path}/feedback")
+async def set_feedback(recipe_id: str, payload: Dict[str, Any] = Body(default={})):
+    """收藏 / 取消收藏 / 不想吃。
+
+    body: ``{"deviceId": "...", "kind": "favorite|dislike", "action": "add|remove"}``
+    ``favorite_count`` 每次都在同一事务里重算，避免并发下计数漂移。
+    """
+    device_id = (payload.get("deviceId") or "").strip()
+    kind = (payload.get("kind") or "favorite").strip()
+    action = (payload.get("action") or "add").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+    if kind not in ("favorite", "dislike"):
+        raise HTTPException(status_code=400, detail="kind 只能是 favorite / dislike")
+    if action not in ("add", "remove"):
+        raise HTTPException(status_code=400, detail="action 只能是 add / remove")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        exists = (await session.execute(
+            select(Recipe.id).where(Recipe.id == recipe_id))).scalar()
+        if not exists:
+            raise HTTPException(status_code=404, detail=f"菜谱不存在：{recipe_id}")
+
+        if action == "add":
+            await session.execute(
+                text("""
+                    INSERT INTO kitchenhelper.recipe_feedback (recipe_id, device_id, kind)
+                    VALUES (:r, :d, :k) ON CONFLICT DO NOTHING
+                """), {"r": recipe_id, "d": device_id, "k": kind})
+        else:
+            await session.execute(
+                text("""
+                    DELETE FROM kitchenhelper.recipe_feedback
+                    WHERE recipe_id = :r AND device_id = :d AND kind = :k
+                """), {"r": recipe_id, "d": device_id, "k": kind})
+
+        # 同一事务内重算，读到的就是最新值
+        count = (await session.execute(
+            select(func.count()).select_from(RecipeFeedback)
+            .where(RecipeFeedback.recipe_id == recipe_id,
+                   RecipeFeedback.kind == "favorite"))).scalar() or 0
+        await session.execute(
+            text("UPDATE kitchenhelper.recipe SET favorite_count = :c WHERE id = :r"),
+            {"c": count, "r": recipe_id})
+        await session.commit()
+        invalidate_bundle_cache()
+        return {"success": True, "recipeId": recipe_id, "kind": kind,
+                "action": action, "favoriteCount": int(count)}
+    finally:
+        await session.close()
+        await engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +951,14 @@ async def _serve_media(key: str, request: Request):
             raise HTTPException(status_code=503, detail="未配置可用的 S3 存储")
         settings = cfg["settings"]
 
+        # 本地联调：DB 里存的是 NAS 内网地址（192.168.x.x），从办公网访问不到。
+        # 设 S3_ENDPOINT_OVERRIDE=http://<公网主机>:3900 即可临时改走公网，
+        # 不动库里的配置，也不影响线上进程。
+        override = os.getenv("S3_ENDPOINT_OVERRIDE", "").strip()
+        if override:
+            from dataclasses import replace as _replace
+            settings = _replace(settings, endpoint=override)
+
         meta: Dict[str, Any] = {}
         try:
             meta = await call(settings, "head_object",
@@ -910,6 +1099,268 @@ async def delete_app_config(cfg_key: str):
         if not res.rowcount:
             raise HTTPException(status_code=404, detail=f"配置不存在：{cfg_key}")
         return {"success": True, "deleted": cfg_key}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+# ===========================================================================
+# v2：生活流（记食 / 我的餐桌）
+# ===========================================================================
+life_router = APIRouter(prefix="", tags=["life"])
+
+
+def _meal_log_json(row: MealLog) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "deviceId": row.device_id,
+        "eatenOn": row.eaten_on.isoformat() if row.eaten_on else None,
+        "meal": row.meal,
+        "note": row.note,
+        "imageKey": row.image_key,
+        "imageUrl": _media_url(row.image_key),
+        "recipeIds": row.recipe_ids or [],
+        "createdAt": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@life_router.get("/meal-log")
+async def list_meal_log(
+    device_id: str = Query(..., alias="deviceId"),
+    month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$"),
+    day: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    """记食列表。
+
+    - 传 ``day``：返回那一天的记录（首页「今天的饭桌」用）
+    - 传 ``month``：返回整月 + 按天聚合的计数（日历上打点用）
+    """
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        stmt = select(MealLog).where(MealLog.device_id == device_id)
+        if day:
+            stmt = stmt.where(MealLog.eaten_on == date.fromisoformat(day))
+        elif month:
+            start = date.fromisoformat(f"{month}-01")
+            end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+            stmt = stmt.where(MealLog.eaten_on >= start, MealLog.eaten_on < end)
+        rows = (await session.execute(
+            stmt.order_by(MealLog.eaten_on.desc(), MealLog.id.desc()))).scalars().all()
+
+        by_day: Dict[str, int] = {}
+        for r in rows:
+            key = r.eaten_on.isoformat()
+            by_day[key] = by_day.get(key, 0) + 1
+
+        return {
+            "items": [_meal_log_json(r) for r in rows],
+            "count": len(rows),
+            "byDay": by_day,
+            "mealSlots": 3,  # 早/午/晚，截图里的「已记 0 / 3 条」
+        }
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.post("/meal-log")
+async def create_meal_log(payload: Dict[str, Any] = Body(default={})):
+    """记一顿：照片/一句话 + 可选关联菜谱。
+
+    关联了菜谱时，把这些菜的 ``cooked_count`` +1 ——「做过多少次」是真实行为数据，
+    收藏榜与发现的「最热」都靠它。
+    """
+    device_id = (payload.get("deviceId") or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+    eaten_on = payload.get("eatenOn") or date.today().isoformat()
+    meal = (payload.get("meal") or "dinner").strip()
+    if meal not in ("breakfast", "lunch", "dinner", "snack"):
+        raise HTTPException(status_code=400, detail="meal 只能是 breakfast/lunch/dinner/snack")
+    note = payload.get("note")
+    if not note and not payload.get("imageKey") and not payload.get("recipeIds"):
+        raise HTTPException(status_code=400, detail="至少要写一句、传一张图或选一道菜")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = MealLog(
+            device_id=device_id,
+            eaten_on=date.fromisoformat(str(eaten_on)),
+            meal=meal,
+            note=note,
+            image_key=payload.get("imageKey"),
+            recipe_ids=list(payload.get("recipeIds") or []),
+        )
+        session.add(row)
+        await session.flush()
+        for recipe_id in row.recipe_ids:
+            await session.execute(
+                text(f'UPDATE "{SCHEMA}".recipe SET cooked_count = cooked_count + 1 '
+                     f'WHERE id = :r'), {"r": recipe_id})
+        await session.commit()
+        await session.refresh(row)
+        invalidate_bundle_cache()
+        return _meal_log_json(row)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.delete("/meal-log/{log_id}")
+async def delete_meal_log(log_id: int, device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        res = await session.execute(
+            delete(MealLog).where(MealLog.id == log_id, MealLog.device_id == device_id))
+        await session.commit()
+        if not res.rowcount:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        return {"success": True, "deleted": log_id}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.patch("/meal-log/{log_id}")
+async def update_meal_log(log_id: int, payload: Dict[str, Any] = Body(default={})):
+    """改一顿（餐次 / 日期 / 心情 / 这桌菜）。
+
+    App 的编辑页（图5）会走这里；只传变了的字段即可。
+    菜谱列表变化时**不重复累加** cooked_count —— 计数只认「新建」那一刻，
+    编辑只修正内容，避免改个错别字把「做过几次」刷上去。
+    """
+    device_id = (payload.get("deviceId") or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = (await session.execute(
+            select(MealLog).where(MealLog.id == log_id,
+                                  MealLog.device_id == device_id))).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="记录不存在")
+
+        if "meal" in payload:
+            meal = (payload.get("meal") or "").strip()
+            if meal not in ("breakfast", "lunch", "dinner", "snack"):
+                raise HTTPException(status_code=400, detail="meal 只能是 breakfast/lunch/dinner/snack")
+            row.meal = meal
+        if "eatenOn" in payload:
+            row.eaten_on = date.fromisoformat(str(payload["eatenOn"]))
+        if "note" in payload:
+            row.note = payload.get("note")
+        if "imageKey" in payload:
+            row.image_key = payload.get("imageKey")
+        if "recipeIds" in payload:
+            row.recipe_ids = list(payload.get("recipeIds") or [])
+
+        await session.commit()
+        await session.refresh(row)
+        invalidate_bundle_cache()
+        return _meal_log_json(row)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+#: 「我的餐桌」上限，与截图上「最多 20 桌」一致
+MAX_TABLE_PLANS = 20
+
+
+def _table_plan_json(row: TablePlanRecord) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "title": row.title,
+        "people": row.people,
+        "taste": row.taste,
+        "dishes": row.recipe_ids or [],
+        "isFavorite": bool(row.is_favorite),
+        "createdAt": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@life_router.get("/table-plans")
+async def list_table_plans(
+    device_id: str = Query(..., alias="deviceId"),
+    favorite: Optional[bool] = None,
+):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        stmt = select(TablePlanRecord).where(TablePlanRecord.device_id == device_id)
+        if favorite is not None:
+            stmt = stmt.where(TablePlanRecord.is_favorite == favorite)
+        rows = (await session.execute(
+            stmt.order_by(TablePlanRecord.is_favorite.desc(),
+                          TablePlanRecord.created_at.desc()))).scalars().all()
+        return {"items": [_table_plan_json(r) for r in rows],
+                "limit": MAX_TABLE_PLANS, "count": len(rows)}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.post("/table-plans")
+async def create_table_plan(payload: Dict[str, Any] = Body(default={})):
+    """保存一桌（「帮我整一桌」之后点保存）。超过 20 桌返回 409，让用户先删。"""
+    device_id = (payload.get("deviceId") or "").strip()
+    dishes = payload.get("dishes") or []
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+    if not dishes:
+        raise HTTPException(status_code=400, detail="dishes 不能为空")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        used = (await session.execute(
+            select(func.count()).select_from(TablePlanRecord)
+            .where(TablePlanRecord.device_id == device_id))).scalar() or 0
+        if used >= MAX_TABLE_PLANS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"最多保存 {MAX_TABLE_PLANS} 桌，请先删掉一些")
+        row = TablePlanRecord(
+            device_id=device_id,
+            title=payload.get("title"),
+            people=int(payload.get("people") or 2),
+            taste=(payload.get("taste") or "SAVORY"),
+            recipe_ids=dishes,
+            is_favorite=bool(payload.get("isFavorite")),
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return _table_plan_json(row)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.delete("/table-plans/{plan_id}")
+async def delete_table_plan(plan_id: int, device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        res = await session.execute(
+            delete(TablePlanRecord)
+            .where(TablePlanRecord.id == plan_id, TablePlanRecord.device_id == device_id))
+        await session.commit()
+        if not res.rowcount:
+            raise HTTPException(status_code=404, detail="餐桌不存在")
+        return {"success": True, "deleted": plan_id}
     finally:
         await session.close()
         await engine.dispose()

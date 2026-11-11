@@ -141,6 +141,25 @@ GET /api/recipes?category=蒸菜&difficulty=L3 → 粉蒸肉、酱香小河虾
 - `Cache-Control: public, max-age=604800, stale-while-revalidate=86400`
 - 分块吐流（256KB），不整包读进内存
 - 这是绕开「Garage 私有桶不支持匿名读」的正式方案，替代了之前的本地 `remote_proxy.py`
+- 本地联调：`s3_config.endpoint` 存的是 NAS 内网地址（`192.168.x.x`），办公网访问不到，
+  起服务时加 `S3_ENDPOINT_OVERRIDE=http://<公网主机>:3900` 即可临时改走公网，
+  不动库里的配置、也不影响线上进程
+
+### 记食 / 我的餐桌（v2）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/meal-log?deviceId=&month=2026-11` | 按月取记录，附 `byDay` 打点计数 |
+| GET | `/meal-log?deviceId=&day=2026-11-11` | 单日记录 |
+| POST | `/meal-log` | `{"deviceId","eatenOn","meal","note","imageKey","recipeIds"}` |
+| PATCH | `/meal-log/{id}` | 改餐次/日期/心情/这桌菜（**不重复累加** `cooked_count`） |
+| DELETE | `/meal-log/{id}?deviceId=` | 删除 |
+| GET | `/table-plans?deviceId=&favorite=` | 我的餐桌（上限 20，超了 POST 返回 409） |
+| POST | `/table-plans` | `{"deviceId","title","people","taste","dishes":[...]}` |
+| DELETE | `/table-plans/{id}?deviceId=` | 删除 |
+
+`POST /meal-log` 关联了菜谱时会把对应 `recipe.cooked_count` +1——这是「做过几次」的
+唯一来源，所以编辑（PATCH）刻意不碰计数，避免改个错别字把热度刷上去。
 
 ### 配置
 
