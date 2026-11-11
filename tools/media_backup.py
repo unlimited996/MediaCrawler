@@ -10,6 +10,10 @@
 即按平台、文件类型分文件夹，帖子删除后仍可按 key 取回。
 
 可靠性：
+- **入库前内容校验**：先算 sha256，查内容寻址仓库（tools/content_store.py）。
+  命中已入库对象（表情包库 / 其它帖子的同图）就只改 object_key 引用，不再上传；
+  未命中则直接上传到 emoji/{media_type}/{sha256}{ext} 规范键，后续同内容天然命中。
+  这样 S3 里同一份内容永远只有一个对象，从源头避免冗余。
 - 每张媒体一行 media_backup（uq media_id 幂等），pending → uploaded / failed
 - 失败指数退避（60s × 2^n，最多 max_retries 次），耗尽转 failed 待手动重试
 - 本地文件没了自动从 source_url 直取（httpx，带平台 Referer）
@@ -26,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import select
 
 from database.models_v2 import MediaAttachment, MediaBackup, S3Config
+from tools.content_store import MAX_INLINE_HASH_BYTES
 
 #: 启动时种子的默认配置（用户提供的 garage 实例）
 SEED_S3_CONFIG: Dict[str, str] = {
@@ -198,16 +203,52 @@ async def enqueue_backup(session, media: MediaAttachment, platform: str,
     if exists is not None:
         return exists
     cfg = await active_settings(session)
+    media_type = media.media_type or "image"
+    default_key = backup_key_for_media(media, platform, content_id)
+
+    # 入库前校验（快速路径）：本地图片能读就直接算内容指纹，若内容寻址仓库
+    # 里已有规范对象，只建一条引用记录，连 pending 都不产生。规范键由本项目
+    # 固化过，最可靠；业务键仍交给 backup_one 做 head 校验后再引用。
+    checksum = ""
+    try:
+        if media_type == "image" and media.local_path:
+            lp = Path(media.local_path)
+            if lp.is_file() and lp.stat().st_size <= MAX_INLINE_HASH_BYTES:
+                checksum = await asyncio.to_thread(_sha256_file, str(lp))
+    except Exception:
+        checksum = ""
+    if checksum:
+        from tools import content_store as cs
+
+        canon = await cs.find_canonical(session, checksum)
+        if (canon and cs.is_canonical_key(canon["object_key"])
+                and await cs.object_exists(
+                    cfg["settings"] if cfg else None, canon["object_key"])):
+            row = MediaBackup(
+                media_id=media.id, story_id=story_id,
+                s3_config_id=cfg["config_id"] if cfg else None,
+                platform=platform, content_id=str(content_id or ""),
+                media_type=media_type,
+                object_key=canon["object_key"],
+                source_url=media.source_url, mime_type=media.mime_type,
+                checksum=checksum, size_bytes=canon["size_bytes"] or None,
+                status="uploaded", uploaded_at=_now(),
+                ext={"dedup_ref": True, "ref_source": canon["source"]},
+            )
+            session.add(row)
+            return row
+
     row = MediaBackup(
         media_id=media.id,
         story_id=story_id,
         s3_config_id=cfg["config_id"] if cfg else None,
         platform=platform,
         content_id=str(content_id or ""),
-        media_type=media.media_type or "image",
-        object_key=backup_key_for_media(media, platform, content_id),
+        media_type=media_type,
+        object_key=default_key,
         source_url=media.source_url,
         mime_type=media.mime_type,
+        checksum=checksum or None,
         status="pending",
     )
     session.add(row)
@@ -359,7 +400,19 @@ async def _fetch_remote(url: str, platform: str) -> bytes:
 
 
 async def backup_one(session, row: MediaBackup, settings) -> Tuple[bool, str]:
-    """备份单条媒体。返回 (成功?, 错误信息)。"""
+    """备份单条媒体：**入库前先按内容校验**，命中已入库对象就只引用不上传。
+
+    流程：
+      1. 算内容 sha256（本地流式 / 远端先查同 URL 已备份、否则取回字节）
+      2. find_canonical 查内容寻址仓库（表情包库 > 已 uploaded 记录）
+      3. 命中且对象确实存在 → 把 object_key 指向规范对象，标记 dedup_ref，
+         不产生任何新 S3 对象；详情页 backup_url 由 object_key 拼出，于是
+         帖子里的图片自动导向已入库的表情包
+      4. 未命中 → 直接上传到内容寻址键 emoji/{media_type}/{sha256}{ext}，
+         后续同内容天然命中，S3 里始终只有一份
+    同一 checksum 的处理用进程内锁串行，避免并发批次各自上传同一张图。
+    """
+    from tools import content_store as cs
     from tools.s3_client import head_object, upload_bytes, upload_file
 
     media = (await session.execute(
@@ -370,41 +423,97 @@ async def backup_one(session, row: MediaBackup, settings) -> Tuple[bool, str]:
     await session.commit()
 
     checksum = ""
+    size = 0
+    local_path = ""
+    data: Optional[bytes] = None
+    url_hit: Optional[Dict[str, Any]] = None
     try:
         if media is not None and media.local_path and Path(media.local_path).is_file():
-            # 1) 本地副本优先
-            result = await upload_file(settings, media.local_path,
-                                       row.object_key, row.mime_type)
-            checksum = _sha256_file(media.local_path)
-            size = result["size"]
+            local_path = str(media.local_path)
+            checksum = await asyncio.to_thread(_sha256_file, local_path)
+            size = Path(local_path).stat().st_size
         elif row.source_url:
-            # 2) 本地没了（如帖子删过本地文件）→ 从平台远程直取
-            data = await _fetch_remote(row.source_url, row.platform or "")
-            result = await upload_bytes(settings, data, row.object_key,
-                                        row.mime_type)
-            checksum = hashlib.sha256(data).hexdigest()
-            size = result["size"]
+            # 同一 CDN 地址已备份过：直接复用，连远端字节都不用再下
+            url_hit = await cs.find_canonical_by_url(
+                session, row.source_url, exclude_media_id=row.media_id)
+            if url_hit and await cs.object_exists(settings, url_hit["object_key"]):
+                checksum = url_hit.get("checksum") or ""
+            else:
+                url_hit = None
+                data = await _fetch_remote(row.source_url, row.platform or "")
+                checksum = hashlib.sha256(data).hexdigest()
+                size = len(data)
         else:
             raise RuntimeError("无本地文件且无远端地址，无法备份")
 
-        # 3) 上传后校验：对象必须存在且大小一致
-        head = await head_object(settings, row.object_key)
-        if head is None:
-            raise RuntimeError("上传后 head_object 查无此对象")
-        if head.get("ContentLength") is not None and int(head["ContentLength"]) != int(size):
-            raise RuntimeError(
-                f"大小不一致：本地 {size} / 远端 {head.get('ContentLength')}")
+        async with await cs.checksum_lock(checksum):
+            # 二次查库：拿锁期间可能已有别的 worker 上传了同一份内容
+            canon = (url_hit or await cs.find_canonical(
+                session, checksum, exclude_media_id=row.media_id))
+            if canon and await cs.object_exists(settings, canon["object_key"]):
+                row.object_key = canon["object_key"]
+                row.status = "uploaded"
+                row.checksum = checksum
+                row.size_bytes = int(canon["size_bytes"] or size) or size
+                row.uploaded_at = _now()
+                row.last_error = None
+                row.next_retry_at = None
+                ext = dict(row.ext or {})
+                ext["dedup_ref"] = True
+                ext["ref_source"] = canon.get("source") or "backup"
+                ext["original_key"] = backup_key_for_media(
+                    media, row.platform or "", row.content_id or "") if media else row.object_key
+                row.ext = ext
+                await session.commit()
+                return True, ""
+
+            key = cs.canonical_object_key(
+                checksum, row.media_type or "image", row.mime_type)
+            row.object_key = key
+            if local_path:
+                result = await upload_file(settings, local_path, key, row.mime_type)
+            else:
+                if data is None:
+                    raise RuntimeError("无内容可上传")
+                result = await upload_bytes(settings, data, key, row.mime_type)
+            size = result["size"]
+
+            # 上传后校验：对象必须存在且大小一致
+            head = await head_object(settings, key)
+            if head is None:
+                raise RuntimeError("上传后 head_object 查无此对象")
+            if head.get("ContentLength") is not None and int(head["ContentLength"]) != int(size):
+                raise RuntimeError(
+                    f"大小不一致：本地 {size} / 远端 {head.get('ContentLength')}")
 
         row.status = "uploaded"
         row.size_bytes = size
-        row.checksum = checksum or (head.get("ETag") or "").strip('"')
+        row.checksum = checksum
         row.uploaded_at = _now()
         row.last_error = None
         row.next_retry_at = None
+        ext = dict(row.ext or {})
+        ext.pop("dedup_ref", None)
+        row.ext = ext
+        # 自愈：历史表情包档案可能指着已被去重删掉的旧业务键。既然这次
+        # 把内容重新固化到了规范键，就同步修正档案，避免以后每次都重传。
+        try:
+            from database.models_v2 import EmojiAsset
+
+            stale = (await session.execute(
+                select(EmojiAsset).where(
+                    EmojiAsset.checksum == checksum,
+                    EmojiAsset.deleted_at.is_(None))
+            )).scalar_one_or_none()
+            if stale is not None and stale.object_key != key:
+                stale.object_key = key
+        except Exception:
+            pass
         await session.commit()
         return True, ""
     except Exception as e:
         return await _mark_failure(session, row, e)
+
 
 
 def _now():
@@ -581,6 +690,26 @@ async def purge_media_backups(session, media_ids: List[int],
         .group_by(MediaBackup.object_key)
     )).all()
     ref_keys = {k for k, n in ref_counts if (n or 0) > 0}
+
+    # 内容寻址规范对象（emoji/ 表情包库 / dedup/ 历史规范键）是**公共资产**：
+    # 即使本次删掉了最后一个引用它的媒体记录，也必须保留对象，否则表情包库
+    # 预览会 404，后续抓到同图还得重新上传。归档表还没建时静默降级。
+    from tools.content_store import is_canonical_key
+
+    for r in rows:
+        if is_canonical_key(r.object_key):
+            ref_keys.add(r.object_key)
+    try:
+        from database.models_v2 import EmojiAsset
+
+        asset_keys = set((await session.execute(
+            select(EmojiAsset.object_key).where(
+                EmojiAsset.object_key.in_(list({r.object_key for r in rows})),
+                EmojiAsset.deleted_at.is_(None))
+        )).scalars().all())
+        ref_keys |= asset_keys
+    except Exception:
+        pass
 
     cfg = await active_settings(session)
 

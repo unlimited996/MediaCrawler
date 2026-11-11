@@ -7,10 +7,15 @@
 同一张图只要出现在不同帖子/评论里，就会被存成 N 个内容一致、键不同的 S3 对象，
 白白占用存储。
 
+定位：**事后补救**。新数据应在 tools/content_store.py 的「入库前内容校验」
+阶段就被引用收敛，本模块负责历史残留（写入时校验上线前已上传的重复对象），
+以及归档失败时的兜底清理。
+
 去重策略（按内容，而非按链接）：
 - 以 ``media_backup.checksum``（上传时算的 sha256）为分组键——相同 checksum 即
   相同字节，物理去重 100% 安全（sha256 碰撞可忽略）。
-- 每组选一个**规范键**作为唯一留存副本：优先复用组内已有的 ``dedup/`` 规范键
+- 每组选一个**规范键**作为唯一留存副本：优先复用组内已有的 ``emoji/``
+  （表情包内容寻址对象）或 ``dedup/`` 规范键
   （上次去重留下的），否则直接取组内首行的现有键（``{platform}/{type}/{cid}/...``）
   作为规范键。把组内所有行的 ``object_key`` 改指向它，删除其余冗余对象，腾出空间。
   不新建额外对象，因此「保留 1 份、删除 行数-1 份」与报告完全对应。
@@ -36,7 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, select
 
-from database.models_v2 import EmojiAsset, MediaBackup, Story
+from database.models_v2 import MediaBackup, Story
 
 
 #: 规范键前缀（与 object_key 现有前缀不冲突）
@@ -73,14 +78,11 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
         )
     )).scalars().all()
 
-    # 已归档进表情包库的内容不再当「冗余」处理，也不参与删除
-    emoji_csums: set = set()
-    try:
-        emoji_csums = set((await session.execute(
-            select(EmojiAsset.checksum).where(EmojiAsset.deleted_at.is_(None))
-        )).scalars().all())
-    except Exception:
-        pass  # 表还没建好时忽略
+    # 注意：归档**不是**豁免。表情包库里的对象同样是规范对象，
+    # 归档动作会把同 checksum 的备份行收敛到同一个 emoji/ 规范键；
+    # 本函数按「不同 object_key」统计，收敛后的组自然只剩 1 个键。
+    # 只有确实还残留多个键的组才需要去重，避免靠豁免掩盖真实冗余。
+    from tools.content_store import is_canonical_key
 
     by_csum: Dict[str, List[MediaBackup]] = {}
     for r in rows:
@@ -90,7 +92,7 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
     redundant_objects = 0
     reclaimable_bytes = 0
     for csum, items in by_csum.items():
-        if csum in emoji_csums or len(items) < 2:
+        if len(items) < 2:
             continue
         sizes = [int(i.size_bytes or 0) for i in items]
         keys = [i.object_key for i in items]
@@ -104,7 +106,7 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
         for k, sz in zip(keys, sizes):
             size_by_key.setdefault(k, sz)
         # 若组内已存在规范键（上次去重留下的），优先复用，避免反复拷贝
-        existing = [i for i in items if i.object_key.startswith(f"{CANON_PREFIX}/")]
+        existing = [i for i in items if is_canonical_key(i.object_key)]
         canonical = existing[0] if existing else items[0]
         canon_key = canonical.object_key
         canon_size = size_by_key.get(canon_key, int(canonical.size_bytes or 0))
@@ -116,7 +118,7 @@ async def analyze_duplicates(session) -> Dict[str, Any]:
             "media_type": items[0].media_type,
             "count": len(distinct),
             "canonical_key": canon_key,
-            "canonical_already": canon_key.startswith(f"{CANON_PREFIX}/"),
+            "canonical_already": is_canonical_key(canon_key),
             "size_bytes": canon_size,
             "reclaimable_bytes": total - canon_size,
             "keys": distinct,
@@ -188,9 +190,8 @@ async def dedup_backups(session, settings, dry_run: bool = True,
             merged += 1
             objs += (len(non_ex) - 1)
             # 规范键：组内 dedup/ 键（且未排除）优先，否则首个非排除键
-            dedup_keys = [k for k in non_ex
-                          if k.startswith(f"{CANON_PREFIX}/")]
-            canon = dedup_keys[0] if dedup_keys else non_ex[0]
+            canon_keys = [k for k in non_ex if is_canonical_key(k)]
+            canon = canon_keys[0] if canon_keys else non_ex[0]
             size_by_key = dict(zip(g["keys"], g["sizes"]))
             total = sum(size_by_key[k] for k in non_ex)
             reclaim += (total - size_by_key.get(canon, 0))
@@ -224,7 +225,7 @@ async def dedup_backups(session, settings, dry_run: bool = True,
 
             # 规范键：优先组内已存在的 dedup/ 键（且未被排除），否则取首个非排除键
             existing = [i for i in non_excluded
-                        if i.object_key.startswith(f"{CANON_PREFIX}/")]
+                        if is_canonical_key(i.object_key)]
             canonical = existing[0] if existing else non_excluded[0]
             target_canonical = canonical.object_key
 
@@ -234,7 +235,7 @@ async def dedup_backups(session, settings, dry_run: bool = True,
 
             # 1) 规范对象是 ``dedup/`` 键且 S3 上不存在时，先从某源对象拷贝过来；
             #    其余情况（复用组内首行现有键 / 已存在的 dedup 键）无需拷贝。
-            if target_canonical.startswith(f"{CANON_PREFIX}/"):
+            if is_canonical_key(target_canonical):
                 head = await _head(settings, target_canonical)
                 if head is None:
                     src = next((ok for ok in originals.values()

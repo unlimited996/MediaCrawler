@@ -5,6 +5,67 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-11] 写入时内容去重：归档不再豁免，重复图入库即引用表情包对象
+
+### 需求
+用户明确纠正上一版设计：**归档不能作为「免死金牌」豁免去重**。
+正确做法是「重复的图片在入库的时候就校验从而避免入库」，并「将帖子里的
+图片备份导向我们自己已入库的表情包」，从源头消除图片数据冗余。
+
+### 架构调整：从事后删除 → 写入时引用
+原链路是「每张图都上传成业务键 → 事后按 checksum 分组 → 改键 + 删冗余」，
+冗余对象先产生再清理，清理失败就一直堆着（前几轮反复报障的根因）。
+
+新增 `tools/content_store.py`（内容寻址仓库）：
+- 规范键 ``emoji/{media_type}/{sha256}{ext}``，一份内容永远一个键；
+- `find_canonical()`：EmojiAsset(表情包库) > 已 uploaded 的 MediaBackup；
+- `find_canonical_by_url()`：同一 CDN 地址已备份过则连下载都省掉；
+- `object_exists()`：引用前确认对象真实存在，避免 404 引用；
+- `ensure_canonical_object()`：服务端 copy_object 固化规范对象，不耗带宽；
+- `converge_to_canonical()`：把同 checksum 全部备份行改指规范键并删冗余对象；
+- `checksum_lock()`：同 checksum 进程内串行，避免并发批次各自上传同一张图。
+
+### 入库链路改造（两条路径都覆盖）
+- `enqueue_backup()`：本地图片 ≤8MB 时先算 sha256，命中规范对象就直接建
+  `status=uploaded` 的引用记录，**连 pending 都不产生**。
+- `backup_one()` 重写：上传前算指纹 → 查规范对象 → 命中则只改
+  `object_key` / 标 `dedup_ref`、**不产生任何新 S3 对象**；未命中才上传，
+  且直接传到内容寻址规范键（后续同内容天然命中）。上传成功后还会自愈历史
+  EmojiAsset 里指向已失效业务键的档案。
+
+详情页 `backup_url` 由 `MediaBackup.object_key` 拼出，因此改键后**帖子里的
+图片备份自动导向已入库的表情包对象**，前端无需改动。
+
+### 归档改为引用收敛，撤销豁免
+- `api/routers/emoji_assets.py::archive_rows`：不再只是登记一条资产记录，
+  而是调用 `converge_to_canonical()` 把该 checksum 的**全部**备份行（含
+  pending/failed，避免引用检查挡住删除）统一改指规范对象，并删掉不再被
+  引用的旧对象；返回 `linked_rows` / `objects_deleted` / `delete_errors`。
+  `converge=false` 可只登记不动 S3（排查用）。
+- `tools/media_dedup.py`：**删掉 `emoji_csums` 豁免判断**。归档不是豁免——
+  收敛后同 checksum 只剩一个 object_key，按「不同键」统计自然归零；若
+  归档失败仍有多个键，去重照常把它算成冗余并清理。规范键选取改为优先
+  `emoji/` 或 `dedup/` 内容寻址键。
+- `purge_media_backups()`：规范键（emoji/、dedup/）以及被 EmojiAsset 引用的
+  键视为**公共资产**，删帖时即使最后一个媒体引用被删也保留对象，避免
+  表情包预览 404 / 后续同图重新上传。
+- 前端文案全面更正：「归档后不再被去重删除」→「归档即收敛引用，重复入库
+  自动指向这里」；归档 toast 显示改指向条数与清理对象数。
+
+### 验证（模拟 + 构建）
+```
+A 首次入库        -> 上传到 emoji/image/<sha>.webp，S3 对象 1 个
+B 第二张相同图    -> 命中引用，新增对象 0，S3 仍 1 个，dedup_ref=True
+C 归档收敛 3 份   -> linked=3，删除 3 个旧对象，仅剩规范对象
+   加 pending/failed 行 -> linked=4、只删 2 个有对象的键，统计口径正确
+D 收敛后去重报告  -> 0 组 / 0 字节；归档但未收敛 -> 1 组（证明不再豁免）
+E archive_rows    -> 首次 archived=1/linked=2，二次 linked=0（幂等）
+前端 npx tsc --noEmit + npm run build 通过；py_compile + main.py --help 通过
+```
+
+> 存量数据（本版上线前已上传的重复对象）仍需跑一次「执行去重」，或在
+> 表情包库点「自动识别并归档」触发收敛；新抓取的数据不会再产生冗余。
+
 ## [2026-11-11] 表情包库 + 去重删除链路修复 + 备份页交互升级
 
 ### 1. 去重「重复图片处理失败」根因
@@ -28,8 +89,9 @@ errors:0}` —— 合并了 46 行却只删 24 个对象且无错误记录。原
   单体与 library 均已挂载。
 - 判定：同一 checksum 出现在 ≥3 个不同 content_id，且评论来源占比 ≥0.5
   （或复用 ≥5 次），体积 <200KB 加分。
-- **归档即豁免去重**：`analyze_duplicates` 跳过已入库 checksum，重复表情包
-  不再被当冗余删除，报告组数会随之下降。
+- ~~归档即豁免去重~~（**该设计已被下一版撤销**：豁免只是把冗余藏起来，
+  对象仍在 S3 里重复占用空间）。现行做法是「入库前内容校验 + 归档引用收敛」，
+  见本文件最上方 [2026-11-11 写入时去重] 条目。
 
 ### 3. 页面交互
 - 去重分组：批量勾选副本（全选可见 / 清空）、「保留所选」「转为表情包」
@@ -48,7 +110,7 @@ errors:0}` —— 合并了 46 行却只删 24 个对象且无错误记录。原
 ```
 后端模拟：归档幂等（新增2→再归档 updated1）、表情包识别（只命中评论高频图）
           删除按 key 去重（x,y,bad 各一次）、失败记录 1 条
-          表情包豁免（2 组 → 1 组）、路由 library+单体均挂载
+          表情包豁免（2 组 → 1 组，此行为后续已撤销）、路由 library+单体均挂载
 前端：npx tsc --noEmit 通过、npm run build 通过
 py_compile / main.py --help 通过
 ```

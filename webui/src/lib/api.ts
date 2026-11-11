@@ -616,7 +616,7 @@ export const s3BackupApi = {
       `/s3-backup/stories/${storyId}/status`),
 }
 
-/** 表情包库条目：按内容 sha256 去重归档的复用型图片 */
+/** 表情包库条目：按内容 sha256 收敛成唯一 S3 对象，供所有帖子引用 */
 export interface EmojiAssetItem {
   id: number
   checksum: string
@@ -649,11 +649,13 @@ export const emojiAssetsApi = {
     api.get<{ items: EmojiAssetItem[]; total: number }>(
       '/emoji-assets', { params }),
   archive: (payload: { keys?: string[]; item_ids?: number[]; checksums?: string[];
-                       name?: string; source?: string }) =>
-    api.post<{ archived: number; updated: number; matched_rows: number; groups: number }>(
+                       name?: string; source?: string; converge?: boolean }) =>
+    api.post<{ archived: number; updated: number; matched_rows: number; groups: number;
+               linked_rows: number; objects_deleted: number }>(
       '/emoji-assets/archive', payload),
   detect: (payload: { min_uses?: number; limit?: number; auto_archive?: boolean }) =>
-    api.post<{ items: EmojiCandidate[]; total: number; archived: number }>(
+    api.post<{ items: EmojiCandidate[]; total: number; archived: number;
+               linked_rows: number; objects_deleted: number }>(
       '/emoji-assets/detect', payload),
   remove: (id: number) => api.delete<{ ok: boolean; id: number }>(`/emoji-assets/${id}`),
 }

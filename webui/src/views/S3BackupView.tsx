@@ -259,7 +259,10 @@ export function S3BackupView() {
     mutationFn: async (payload: { keys: string[]; source: string }) =>
       (await emojiAssetsApi.archive(payload)).data,
     onSuccess: (d: any) => {
-      toast.success(`已归档 ${d.archived} 个新表情包（更新 ${d.updated} 个）`)
+      const linked = d.linked_rows ? `，${d.linked_rows} 条备份改指向表情包` : ''
+      const deleted = d.objects_deleted ? `，清理 ${d.objects_deleted} 个冗余对象` : ''
+      toast.success(
+        `已归档 ${d.archived} 个新表情包（更新 ${d.updated} 个）${linked}${deleted}`)
       qc.invalidateQueries({ queryKey: ['emojiAssets'] })
       dedupQ.refetch()
       setSelectedKeys(new Set())
@@ -271,7 +274,9 @@ export function S3BackupView() {
       auto_archive: true, limit: 200,
     })).data,
     onSuccess: (d: any) => {
-      toast.success(`识别到 ${d.total} 个候选，已自动归档 ${d.archived} 个`)
+      toast.success(
+        `识别到 ${d.total} 个候选，归档 ${d.archived} 个；` +
+        `${d.linked_rows ?? 0} 条备份已改指向表情包，清理 ${d.objects_deleted ?? 0} 个冗余对象`)
       qc.invalidateQueries({ queryKey: ['emojiAssets'] })
       dedupQ.refetch()
     },
@@ -546,13 +551,13 @@ export function S3BackupView() {
             ) : null}
           </div>
 
-          {/* 表情包库：归档的复用型图片，不再参与去重删除 */}
+          {/* 表情包库：内容寻址规范对象，所有帖子的同图备份都指向这里 */}
           <div className="glass-panel flex-shrink-0 rounded-lg px-3 py-2.5">
             <div className="flex flex-wrap items-center gap-2">
               <Smile className="h-4 w-4 text-cyber-neon-orange" />
               <span className="font-mono text-xs font-bold text-cyber-text-primary">表情包库</span>
               <span className="text-[11px] text-cyber-text-muted">
-                共 {emojiQ.data?.total ?? 0} 个 · 归档后不再被去重删除
+                共 {emojiQ.data?.total ?? 0} 个 · 归档即收敛引用，重复入库自动指向这里
               </span>
               <Button size="sm" variant="outline" className="ml-auto h-6 font-mono text-[10px]"
                       onClick={() => emojiDetectM.mutate()} disabled={emojiDetectM.isPending}>
@@ -562,7 +567,7 @@ export function S3BackupView() {
             <div className="mt-2 flex max-h-[132px] gap-2 overflow-x-auto pb-1">
               {(emojiQ.data?.items || []).length === 0 ? (
                 <div className="py-3 text-[11px] text-cyber-text-muted">
-                  暂无表情包。可在上方勾选重复副本点「转为表情包」，或点「自动识别并归档」。
+                  暂无表情包。勾选重复副本点「转为表情包」会把同图收敛成一份；也可「自动识别并归档」。
                 </div>
               ) : (emojiQ.data?.items || []).map((a: any) => (
                 <div key={a.id}
@@ -756,7 +761,7 @@ export function S3BackupView() {
                           </Button>
                         ) : null}
                         <Button size="icon" variant="ghost"
-                                title="转为表情包（归档进表情包库，去重时不再删除）"
+                                title="转为表情包（收敛同图为一份，帖子图片改指向表情包对象）"
                                 className="h-6 w-6"
                                 disabled={emojiArchiveM.isPending}
                                 onClick={() => emojiArchiveM.mutate({
