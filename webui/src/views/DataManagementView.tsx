@@ -143,7 +143,7 @@ function StoryCard({
 
       <div className="flex min-w-0 flex-1 flex-col gap-1 p-2">
         <h3
-          className="line-clamp-2 text-xs font-normal leading-5 text-cyber-text-primary"
+          className="line-clamp-2 break-anywhere text-xs font-normal leading-5 text-cyber-text-primary"
           title={title}
         >
           {title}
@@ -901,8 +901,12 @@ export function DataManagementView({
                     className="text-[11px] font-mono text-cyber-text-secondary"
                   />
                 </span>
-                {/* 标题里的小红书话题（#论文排版[话题]#）不进标题栏 */}
-                <span className="text-sm text-cyber-text-primary truncate" title={it.title}>
+                {/* 标题里的小红书话题（#论文排版[话题]#）不进标题栏；
+                    单行固定省略：长标题只截自己，不把行内其他信息挤出容器 */}
+                <span
+                  className="title-one-line min-w-0 flex-1 text-sm text-cyber-text-primary"
+                  title={it.title}
+                >
                   {splitTopics(it.title).clean || it.title}
                 </span>
               </div>

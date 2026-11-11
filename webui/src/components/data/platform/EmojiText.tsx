@@ -88,5 +88,7 @@ export function renderEmoji(text: string, map: Record<string, string> | null): R
 export function RichText({ content, className }: { content?: string; className?: string }) {
   const map = useEmojiMap()
   if (!content) return null
-  return <span className={className}>{renderEmoji(content, map)}</span>
+  // break-anywhere：评论/正文里的超长链接、无空格英文长串也能断行，
+  // 避免把评论卡片撑出横向溢出（外层 overflow-hidden 会把内容直接裁掉）
+  return <span className={`break-anywhere ${className || ''}`}>{renderEmoji(content, map)}</span>
 }

@@ -382,8 +382,10 @@ export function PlatformStoryDetail({
 
   return (
     <div className="h-full flex flex-col gap-3">
-      {/* 顶部返回栏：平台徽标使用平台品牌色 */}
-      <div className="flex flex-shrink-0 items-center gap-2">
+      {/* 顶部返回栏：平台徽标使用平台品牌色。
+          允许换行（flex-wrap）：窗口窄或标题很长时按钮折到第二行，
+          而不是把标题/按钮挤出可视区被外层 overflow-hidden 裁掉。 */}
+      <div className="flex flex-shrink-0 flex-wrap items-center gap-2">
         <Button variant="ghost" size="sm" className="h-8 font-mono" onClick={onBack}>
           <ArrowLeft className="mr-1 h-3.5 w-3.5" />
           {t('manage.back')}
@@ -557,15 +559,22 @@ export function PlatformStoryDetail({
             {t('manage.hiddenBadge') || '原贴已隐藏'}
           </span>
         )}
-        {/* 标题栏只显示去掉话题后的纯标题 */}
-        <span className="truncate text-sm text-cyber-text-primary">{d.title || ''}</span>
+        {/* 标题栏只显示去掉话题后的纯标题。
+            定宽可收缩 + 单行省略：超长标题只截断自己，不挤占按钮和徽标；
+            hover 用原生 title 看全文。 */}
+        <span
+          className="title-one-line min-w-0 flex-1 basis-[10rem] text-sm text-cyber-text-primary"
+          title={d.title || ''}
+        >
+          {d.title || ''}
+        </span>
         {detailQ.isFetching && (
           <Loader2 className="ml-auto h-3.5 w-3.5 animate-spin text-cyber-text-muted" />
         )}
       </div>
 
-      {/* 详情主体 */}
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto pb-4">
+      {/* 详情主体：overflow-x-hidden 兜底，任何超长内容都不会把页面撑宽 */}
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-4">
         {detailQ.isLoading ? (
           <div className="py-10 text-center font-mono text-cyber-text-muted animate-pulse">
             {t('manage.loading')}

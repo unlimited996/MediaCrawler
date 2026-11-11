@@ -63,7 +63,7 @@ export function DouyinLayout({ d, comments, commentsTotal, commentsToolbar, t, t
               <span className="ml-auto text-[10px] text-white/40">{theme.label}</span>
             </div>
             {d?.title && (
-              <h2 className="mt-2.5 text-[15px] font-medium leading-snug">{d.title}</h2>
+              <h2 className="mt-2.5 break-anywhere text-[15px] font-medium leading-snug">{d.title}</h2>
             )}
             {content && (
               <p className="mt-1.5 line-clamp-4 whitespace-pre-wrap text-xs leading-6 text-white/60">

@@ -33,7 +33,7 @@ export function ZhihuLayout({ d, comments, commentsTotal, commentsToolbar, t, th
           <span className="ml-auto text-[11px] text-cyber-text-muted">{theme.label}</span>
         </div>
 
-        <h2 className="mt-3 text-lg font-bold leading-snug text-cyber-text-primary">
+        <h2 className="mt-3 break-anywhere text-lg font-bold leading-snug text-cyber-text-primary">
           {d?.title || '-'}
         </h2>
 

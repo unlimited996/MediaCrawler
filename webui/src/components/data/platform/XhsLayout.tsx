@@ -90,9 +90,9 @@ export function XhsLayout({ d, comments, commentsTotal, commentsToolbar, t, them
           )}
         </header>
 
-        {/* 标题 */}
+        {/* 标题：break-anywhere 兜底，超长无空格标题（长链接/连续符号）也不会撑破卡片 */}
         {d?.title && (
-          <h2 className="mt-4 text-lg font-bold leading-snug text-[#333] sm:text-xl">
+          <h2 className="mt-4 break-anywhere text-lg font-bold leading-snug text-[#333] sm:text-xl">
             {d.title}
           </h2>
         )}

@@ -38,7 +38,7 @@ export function DefaultLayout({ d, comments, commentsTotal, commentsToolbar, t, 
         </div>
 
         {d?.title && (
-          <h2 className="mt-4 text-base font-bold leading-snug text-cyber-text-primary">
+          <h2 className="mt-4 break-anywhere text-base font-bold leading-snug text-cyber-text-primary">
             {d.title}
           </h2>
         )}

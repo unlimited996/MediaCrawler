@@ -5,6 +5,44 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-11] 修复超长标题撑破页面样式
+
+用户反馈：某条数据标题特别长，打开后页面样式错乱（标题溢出卡片、
+顶栏元素被挤出可视区后被外层 `overflow-hidden` 直接裁掉）。
+
+根因有两处：
+1. 各平台详情卡的标题 `<h2>` 没有断行策略。中文能自动换行，但只要标题里
+   出现不含空格的连续串（长链接、连续英文/数字、连续符号），整段就变成
+   一个不可断的"单词"，把卡片撑宽；实测 520px 卡片被撑到 1468px。
+2. 详情页顶栏是不换行的 `flex`（`flex-shrink-0`），窄窗口下按钮和标题
+   互相挤压，标题被压到只剩几十像素，其余元素被根容器的 `overflow-hidden` 裁掉。
+
+### 1. 全局兜底
+- `index.css` 的 `body` 增加 `overflow-wrap: break-word`，任意位置遇到超长
+  不可断串就地断行，不再依赖每个组件各自加类。
+- 新增两个工具类：
+  - `.break-anywhere`（`overflow-wrap: anywhere` + `word-break: break-word`）；
+  - `.title-one-line`（`min-width: 0` + 单行省略），给需要"只占一行、
+    长了自己截断"的标题用。
+
+### 2. 各平台详情卡标题
+`XhsLayout` / `ZhihuLayout` / `BiliLayout` / `DouyinLayout` / `KuaishouLayout` /
+`TwitterLayout` / `FacebookLayout` / `RedditLayout` / `DefaultLayout` 的标题统一加
+`break-anywhere`；`TiebaLayout` 是单行标题条，补 `title` 属性以便 hover 看全文。
+评论/正文组件 `RichText` 默认带 `break-anywhere`，长链接不再顶出评论卡。
+
+### 3. 详情页顶栏
+- 顶栏改为 `flex-wrap`：窄窗口或标题过长时按钮折行，不再被裁掉。
+- 标题改为 `.title-one-line min-w-0 flex-1 basis-[10rem]` + 原生 `title`：
+  只截断自己、不挤占按钮，hover 看全文。
+- 详情滚动容器加 `overflow-x-hidden` 双保险。
+
+### 4. 列表与访客页
+数据管理列表行标题、网格卡片标题、访客页卡片标题同样改为「可收缩 + 单行
+省略 / 两行截断 + 任意断行」，长标题只影响自身那一行，不再影响整页排版。
+
+> 本次仅改前端（`webui/src`），**未重新构建/推送镜像**。
+
 ## [2026-11-11] 去重优先保留表情包库；表情包表改为直接连库建
 
 ### 1. 执行去重时优先保留表情包库的数据

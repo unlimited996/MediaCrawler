@@ -49,7 +49,7 @@ export function FacebookLayout({ d, comments, commentsTotal, commentsToolbar, t,
         </header>
 
         {d?.title && (
-          <h2 className="mt-2 px-4 text-[15px] font-semibold leading-snug text-cyber-text-primary">
+          <h2 className="mt-2 break-anywhere px-4 text-[15px] font-semibold leading-snug text-cyber-text-primary">
             {d.title}
           </h2>
         )}

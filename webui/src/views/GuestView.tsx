@@ -316,7 +316,7 @@ function GuestStoryCard({ it, onOpen }: { it: StoryRow; onOpen: () => void }) {
         )}
       </div>
       <div className="flex min-w-0 flex-1 flex-col gap-1 p-2">
-        <h3 className="line-clamp-2 text-xs font-normal leading-5 text-cyber-text-primary" title={it.title}>
+        <h3 className="line-clamp-2 break-anywhere text-xs font-normal leading-5 text-cyber-text-primary" title={it.title}>
           {it.title}
         </h3>
         <div className="mt-auto flex items-center gap-1.5 pt-0.5">

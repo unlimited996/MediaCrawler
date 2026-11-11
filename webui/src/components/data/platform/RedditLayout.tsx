@@ -61,7 +61,7 @@ export function RedditLayout({ d, comments, commentsTotal, commentsToolbar, t, t
           </div>
 
           {d?.title && (
-            <h2 className="mt-1 text-[18px] font-bold leading-snug text-cyber-text-primary">
+            <h2 className="mt-1 break-anywhere text-[18px] font-bold leading-snug text-cyber-text-primary">
               {d.title}
             </h2>
           )}

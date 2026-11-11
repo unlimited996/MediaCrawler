@@ -46,7 +46,7 @@ export function KuaishouLayout({ d, comments, commentsTotal, commentsToolbar, t,
         <div className="p-5">
           {/* 标题 */}
           {d?.title && (
-            <h2 className="text-base font-bold leading-snug text-cyber-text-primary">
+            <h2 className="break-anywhere text-base font-bold leading-snug text-cyber-text-primary">
               {d.title}
             </h2>
           )}

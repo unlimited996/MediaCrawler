@@ -134,6 +134,9 @@
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    /* 全局兜底：任意位置遇到超长无空格串（长链接/连续英文/数字）
+       就地断行，而不是把卡片或顶栏撑出容器后被裁掉。 */
+    overflow-wrap: break-word;
   }
 }
 
@@ -474,6 +477,26 @@
 ::-moz-selection {
   background: rgb(var(--cyber-neon-cyan) / 0.3);
   color: rgb(var(--cyber-text-primary));
+}
+
+/* ============================
+   Long Text Safety
+   ============================ */
+
+/* 标题/正文里的超长串（无空格英文、URL、连续标点）默认不换行，
+   会把卡片撑破、把顶栏按钮挤出视口。anywhere 让它在任意位置断行。 */
+.break-anywhere {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 单行标题：不换行 + 省略号，且允许 flex 子项收缩到 0（min-width:0），
+   否则长标题会把同一行内的其他元素挤出容器。 */
+.title-one-line {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ============================

@@ -51,7 +51,7 @@ export function TwitterLayout({ d, comments, commentsTotal, commentsToolbar, t, 
             </div>
 
             {d?.title && (
-              <h2 className="mt-1.5 text-[15px] font-bold leading-snug text-cyber-text-primary">
+              <h2 className="mt-1.5 break-anywhere text-[15px] font-bold leading-snug text-cyber-text-primary">
                 {d.title}
               </h2>
             )}

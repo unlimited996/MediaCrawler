@@ -23,7 +23,10 @@ export function TiebaLayout({ d, comments, commentsTotal, commentsToolbar, t, th
       <article className="overflow-hidden rounded-xl border border-cyber-border-subtle bg-cyber-bg-panel shadow-sm">
         {/* 标题条 */}
         <div className="flex items-center gap-2 border-b border-cyber-border-subtle px-5 py-3">
-          <h2 className="min-w-0 flex-1 truncate text-base font-bold text-cyber-text-primary">
+          <h2
+            className="min-w-0 flex-1 truncate text-base font-bold text-cyber-text-primary"
+            title={d?.title || ''}
+          >
             {d?.title || '-'}
           </h2>
           <span

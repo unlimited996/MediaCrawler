@@ -47,7 +47,7 @@ export function BiliLayout({ d, comments, commentsTotal, commentsToolbar, t, the
 
         <div className="p-5">
           {/* 标题 */}
-          <h2 className="text-base font-medium leading-snug text-cyber-text-primary hover:text-[color:var(--bili-accent)]">
+          <h2 className="break-anywhere text-base font-medium leading-snug text-cyber-text-primary hover:text-[color:var(--bili-accent)]">
             {d?.title || '-'}
           </h2>
 
