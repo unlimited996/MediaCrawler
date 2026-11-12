@@ -532,6 +532,26 @@ class CollabVote(BaseRecipe):
     )
 
 
+# ---------------------------------------------------------------------------
+# 17. 反馈：用户提交 / 我的反馈（App「设置 → 意见反馈」）
+# ---------------------------------------------------------------------------
+class FeedbackEntry(BaseRecipe, TimestampMixin):
+    """一条用户反馈。status: open（待处理）/ done（已处理）。"""
+
+    __tablename__ = "feedback"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False)
+    content = Column(String(500), nullable=False)
+    status = Column(String(8), nullable=False, server_default="open")
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open','done')", name="ck_feedback_status"),
+        Index("idx_feedback_entry_device", "device_id", "created_at"),
+        {"schema": SCHEMA},
+    )
+
+
 #: 建表/校验时按依赖顺序使用
 ALL_TABLES = (
     RecipeCategory, RecipeTag, Recipe, RecipeIngredient, RecipeStep,
@@ -542,4 +562,6 @@ ALL_TABLES = (
     RecipeNote, ShoppingCheck, TakeoutSpot,
     # v4：用户档案 + 协作配餐
     UserProfile, CollabRoom, CollabMember, CollabVote,
+    # v4.1：反馈（提交 / 我的反馈）
+    FeedbackEntry,
 )

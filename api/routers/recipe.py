@@ -48,7 +48,7 @@ from database.models_recipe import (
     SCHEMA, AppConfig, DIFFICULTY_VALUES, RECIPE_STATUS_VALUES, MealLog, Recipe,
     RecipeCategory, RecipeFeedback, RecipeIngredient, RecipeNote, RecipeStep,
     RecipeTag, RecipeTagLink, ShoppingCheck, TablePlanRecord, TakeoutSpot,
-    CollabMember, CollabRoom, CollabVote, UserProfile,
+    CollabMember, CollabRoom, CollabVote, FeedbackEntry, UserProfile,
 )
 from .story import _session
 
@@ -1830,6 +1830,57 @@ async def leave_collab_room(code: str, device_id: str = Query(..., alias="device
         if not res.rowcount:
             raise HTTPException(status_code=404, detail="你不在这一桌里")
         return {"success": True, "closed": False}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+# ===========================================================================
+# 反馈（v4.1）：提交 / 我的反馈
+# ===========================================================================
+
+def _feedback_json(row: FeedbackEntry) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "content": row.content,
+        "status": row.status,
+        "createdAt": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@life_router.post("/feedback")
+async def submit_feedback(payload: Dict[str, Any] = Body(default={})):
+    device_id = (payload.get("deviceId") or "").strip()
+    content = (payload.get("content") or "").strip()
+    if not device_id or not content:
+        raise HTTPException(status_code=400, detail="deviceId / content 必填")
+    if len(content) > 500:
+        raise HTTPException(status_code=400, detail="反馈最多 500 字")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = FeedbackEntry(device_id=device_id, content=content)
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return _feedback_json(row)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.get("/feedback")
+async def list_feedback(device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        rows = list((await session.execute(
+            select(FeedbackEntry).where(FeedbackEntry.device_id == device_id)
+            .order_by(FeedbackEntry.created_at.desc()).limit(50))).scalars())
+        return {"items": [_feedback_json(r) for r in rows]}
     finally:
         await session.close()
         await engine.dispose()
