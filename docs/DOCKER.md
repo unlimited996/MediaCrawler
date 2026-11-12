@@ -90,6 +90,8 @@ docker compose up -d
 ```
 
 > `IMAGE_TAG` 用固定版本号，别用 `latest` —— 否则回滚时说不清跑的是哪一版。
+> 这一条只针对**离线 tar 包交付**（`docker save/load`）；
+> CCR 上的拆分部署统一用 `:latest`，见 `docs/DEPLOY_SPLIT.md` 3.6。
 
 ---
 

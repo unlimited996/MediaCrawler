@@ -4,7 +4,7 @@
 # 用法：
 #   export TENCENT_REGISTRY_USERNAME=1000xxxxxxx
 #   export TENCENT_REGISTRY_PASSWORD=********
-#   ./deploy/build-push.sh                 # 构建 + 推送 latest 与 sha-xxxxxxx
+#   ./deploy/build-push.sh                 # 构建 + 推送 latest
 #   TAG=v1.0.0 ./deploy/build-push.sh      # 额外打版本 tag
 #   PUSH=0 ./deploy/build-push.sh          # 只构建不推送
 #   PLAYWRIGHT_BROWSER=chromium-headless-shell ./deploy/build-push.sh
@@ -22,7 +22,6 @@ PUSH="${PUSH:-1}"
 TAG="${TAG:-}"
 COMPOSE_FILE="docker-compose.split.yml"
 
-SHORT_SHA="$(git rev-parse --short=7 HEAD 2>/dev/null || echo dev)"
 CRAWLER="${REGISTRY}/${NAMESPACE}/mediacrawler-crawler"
 LIBRARY="${REGISTRY}/${NAMESPACE}/mediacrawler-library"
 
@@ -46,10 +45,10 @@ echo "${TENCENT_REGISTRY_PASSWORD}" | docker login "${REGISTRY}" \
     --username "${TENCENT_REGISTRY_USERNAME}" --password-stdin
 
 for img in "${CRAWLER}" "${LIBRARY}"; do
-    docker tag "${img}:latest" "${img}:sha-${SHORT_SHA}"
-    echo "==> push ${img}:latest  ${img}:sha-${SHORT_SHA}"
+    # 只推 latest：部署侧 compose 全部写死 :latest，额外的 sha 标签会在
+    # CCR 控制台和 latest 并列显示，容易被误认为跑的不是最新版。
+    echo "==> push ${img}:latest"
     docker push "${img}:latest"
-    docker push "${img}:sha-${SHORT_SHA}"
     if [ -n "${TAG}" ]; then
         docker tag "${img}:latest" "${img}:${TAG}"
         docker push "${img}:${TAG}"

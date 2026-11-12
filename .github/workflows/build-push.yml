@@ -51,8 +51,11 @@ jobs:
           CRAWLER="${REGISTRY}/${NAMESPACE}/mediacrawler-crawler"
           LIBRARY="${REGISTRY}/${NAMESPACE}/mediacrawler-library"
 
-          CTAGS="${CRAWLER}:latest,${CRAWLER}:sha-${SHORT_SHA}"
-          LTAGS="${LIBRARY}:latest,${LIBRARY}:sha-${SHORT_SHA}"
+          # 只打 latest：部署侧 compose 全部写死 :latest。
+          # 早期会额外打 :sha-xxxxxxx，但两个 tag 指向同一 manifest，
+          # CCR 控制台并列展示时容易被误认为「跑的不是最新版」。
+          CTAGS="${CRAWLER}:latest"
+          LTAGS="${LIBRARY}:latest"
           if echo "${GITHUB_REF_NAME}" | grep -qE '^v[0-9]'; then
             CTAGS="${CTAGS},${CRAWLER}:${GITHUB_REF_NAME}"
             LTAGS="${LTAGS},${LIBRARY}:${GITHUB_REF_NAME}"

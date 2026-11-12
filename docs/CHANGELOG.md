@@ -5,6 +5,38 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-12] 镜像构建统一只打并推送 latest，不再打 sha-xxxxxxx
+
+用户要求：镜像版本应该是 `latest`，构建脚本不该额外打 `sha-<commit>` 标签。
+背景：CCR 控制台会把 `latest` 与 `sha-bd1a00f` 并列展示，而两者指向**同一个
+manifest**，容易被误认为「跑的不是最新版」；又因为共享 manifest，Registry v2
+无法安全地只删 sha 标签（删 manifest 会连带破坏 latest）。
+
+### 变更
+- `deploy/server-update.sh`（服务器 `mc-update`）：去掉两次 `docker tag ...:sha-*`
+  和两次 `push_with_retry ...:sha-*`；完成日志只列 `:latest`。
+  `SHORT_SHA` 仍保留，用于日志、`short_sha` 状态与 commit 溯源。
+- `deploy/build-push.sh`（本地/Actions 不可用时的兜底通道）：同样只推 `latest`，
+  删掉不再使用的 `SHORT_SHA`；`TAG=v1.0.0` 的额外版本 tag 能力保留。
+- `.github/workflows/build-push.yml`（手动触发）：`CTAGS/LTAGS` 只含 `:latest`，
+  `short_sha` 输出保留供 summary 使用。
+- 部署侧 compose 本来就是 `:latest`，未改动：群晖模板与已填凭据版硬编码
+  `:latest`，`docker-compose.split.yml` 默认 `${IMAGE_TAG:-latest}`，
+  `.env` / `.env.example` 与 `server-update.sh` 都是 `IMAGE_TAG=latest`。
+
+### 文档
+- `docs/DEPLOY_SPLIT.md`：产物列表、build-push 用法、3.6 流程描述、拉取示例
+  四处同步为「只推 latest」，并说明 commit 溯源改看 `.build-state.json` 与日志。
+- `docs/DOCKER.md`：给「别用 latest」那句加限定 —— 只适用于离线 tar 包交付，
+  CCR 拆分部署统一 latest，避免两份文档互相打架。
+
+### 存量标签
+已推过的 `:sha-*` 标签与 `latest` 共享 manifest，**不要**用 Registry v2 的
+`DELETE manifest` 去删（会把 `latest` 一起删掉）；可在腾讯云 CCR 控制台按
+标签删除，或直接保留（不影响 `docker compose pull` 取到最新版）。
+
+> 本次只改构建脚本与文档，镜像内容未变，无需重新构建镜像。
+
 ## [2026-11-11] 重复作者合并 + story 引用重指向 + 遇到重复即全字段更新
 
 用户要求：作者要合并、story 引用要重指向新作者；而且**不管库里有没有头像**，

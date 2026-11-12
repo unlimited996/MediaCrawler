@@ -138,10 +138,13 @@ SERVICE_IP=127.0.0.1 SERVICE_PORT=8001 uvicorn api.crawler_app:app --host 127.0.
 
 ```
 ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
-ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:sha-<7位>
 ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:latest
-ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:sha-<7位>
 ```
+
+> 所有构建通道（服务器 `mc-update`、`deploy/build-push.sh`、Actions 手动触发）
+> **只打并推送 `latest`**，不再额外打 `sha-xxxxxxx`：部署侧 compose 写死
+> `:latest`，两个 tag 指向同一 manifest，CCR 控制台并列展示反而容易被误认为
+> 「跑的不是最新版」。commit 溯源看 `.build-state.json` 与构建日志。
 
 **构建内容**：两张镜像都在 Stage 1 用 Node 构建前端（`webui/` → `api/webui/`），
 所以镜像自带界面，不依赖宿主机是否跑过 `npm run build`。一个 job 顺序构建两张镜像，
@@ -183,7 +186,7 @@ SKIP_WEBUI_BUILD=1 docker compose -f docker-compose.split.yml build   # 跳过�
 ```bash
 export TENCENT_REGISTRY_USERNAME=1000xxxxxxx
 export TENCENT_REGISTRY_PASSWORD=********
-./deploy/build-push.sh                 # 构建 + 推 latest 与 sha-xxxxxxx
+./deploy/build-push.sh                 # 构建 + 只推 latest
 TAG=v1.0.0 ./deploy/build-push.sh      # 额外打版本 tag
 PUSH=0 ./deploy/build-push.sh          # 只构建不推送
 ```
@@ -350,7 +353,7 @@ mc-update
 
 `deploy/server-update.sh` 流程：API 取 sha → codeload 下 tarball →
 `rsync --delete` 覆盖代码（保留 `deploy/.env`、日志、数据、浏览器登录态）→
-**按变更范围决定建哪张镜像** → 打 `latest` + `sha-xxxxxxx` → 登录 CCR →
+**按变更范围决定建哪张镜像** → 打并推送 `latest` → 登录 CCR →
 推送（只推构建过的）→ 可选本机 `up -d`。
 
 | 环境变量 | 默认 | 用途 |
@@ -415,7 +418,7 @@ tail -f /var/log/mc-update.log         # 看进度
 # 1) 登录镜像仓库（密码就是上面那个 secret）
 docker login ccr.ccs.tencentyun.com -u 1000xxxxxxx
 
-# 2) 拉取（tag 用 latest 或具体的 sha-xxxxxxx）
+# 2) 拉取（统一用 latest）
 docker pull ccr.ccs.tencentyun.com/unlimited996/mediacrawler-crawler:latest
 docker pull ccr.ccs.tencentyun.com/unlimited996/mediacrawler-library:latest
 ```

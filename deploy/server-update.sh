@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 服务器一键更新：拉取代码 -> 构建 crawler/library 两张镜像 -> 打 tag
+# 服务器一键更新：拉取代码 -> 构建 crawler/library 两张镜像 -> 推送 latest
 #                 -> 登录腾讯云 CCR -> 推送 -> （可选）本机重启容器
 #
 # 为什么不用 git clone：国内服务器到 github.com:443 极不稳定（git ls-remote
@@ -231,8 +231,13 @@ if [ "$SKIP_PUSH" = "1" ]; then
     exit 0
 fi
 
+# 推送：只推 latest 这一个标签（部署侧 compose 全部写死 :latest）。
+# 早期版本会额外打 :sha-xxxxxxx 便于回滚，但 CCR 控制台会把两个标签并列展示，
+# 容易被误认为「跑的不是 latest」；且两个 tag 指向同一 manifest，单独删 sha
+# 标签反而会破坏 latest。按需求统一只保留 latest，commit 溯源交给
+# .build-state.json 与构建日志。
 # ---------------------------------------------------------------------------
-# 6) 登录 + 打 tag + 推送（只推本次构建过的）
+# 6) 登录 + 推送 latest（只推本次构建过的）
 # ---------------------------------------------------------------------------
 if [ -n "${TENCENT_REGISTRY_USERNAME:-}" ] && [ -n "${TENCENT_REGISTRY_PASSWORD:-}" ]; then
     log "登录 ${REGISTRY}"
@@ -258,15 +263,11 @@ push_with_retry() {
 
 PUSHED=()
 if [ "$BUILD_CRAWLER" = "1" ]; then
-    docker tag "${CRAWLER}:latest" "${CRAWLER}:sha-${SHORT_SHA}"
     push_with_retry "${CRAWLER}:latest"
-    push_with_retry "${CRAWLER}:sha-${SHORT_SHA}"
     PUSHED+=("${CRAWLER}")
 fi
 if [ "$BUILD_LIBRARY" = "1" ]; then
-    docker tag "${LIBRARY}:latest" "${LIBRARY}:sha-${SHORT_SHA}"
     push_with_retry "${LIBRARY}:latest"
-    push_with_retry "${LIBRARY}:sha-${SHORT_SHA}"
     PUSHED+=("${LIBRARY}")
 fi
 
@@ -283,7 +284,7 @@ fi
 
 log "完成 @ ${SHORT_SHA}（本次构建：${TARGETS}）"
 for img in ${PUSHED[@]+"${PUSHED[@]}"}; do
-    log "  ${img}:latest  + :sha-${SHORT_SHA}"
+    log "  ${img}:latest"
 done
 if [ "$APPLY_LOCAL" != "1" ]; then
     log "在运行服务的机器上执行：docker compose pull && docker compose up -d"
