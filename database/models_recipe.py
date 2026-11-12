@@ -444,6 +444,94 @@ class TakeoutSpot(BaseRecipe):
     )
 
 
+# ---------------------------------------------------------------------------
+# 15. 用户档案：device_id → 昵称 + 头像 emoji（轻量账号，无密码）
+# ---------------------------------------------------------------------------
+class UserProfile(BaseRecipe, TimestampMixin):
+    """App 设备的用户档案。身份仍然是 device_id（沿用现有体系），
+    这里只补展示信息，让协作房间里能认出彼此。"""
+
+    __tablename__ = "user_profile"
+
+    device_id = Column(String(64), primary_key=True)
+    nickname = Column(String(24), nullable=False)
+    avatar = Column(String(8), nullable=False, server_default="🙂")
+
+    __table_args__ = (
+        {"schema": SCHEMA},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 16. 协作配餐：房间（一桌菜 + 邀请码 + 成员 + 投票）
+# ---------------------------------------------------------------------------
+class CollabRoom(BaseRecipe, TimestampMixin):
+    """「一起定这桌」的房间。房主创建并带初始菜品，成员凭 6 位码加入，
+    对每道菜投「加/去」，房主定稿后房间关闭。
+
+    status: open（讨论中） / decided（已定稿） / closed（房主解散）
+    """
+
+    __tablename__ = "collab_room"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    code = Column(String(6), nullable=False, unique=True)
+    host_device_id = Column(String(64), nullable=False)
+    title = Column(String(48), nullable=False, server_default="这一桌")
+    recipe_ids = Column(JsonType, nullable=False, default=list)
+    people = Column(SmallInteger, nullable=False, server_default="2")
+    status = Column(String(8), nullable=False, server_default="open")
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open','decided','closed')",
+                        name="ck_collab_room_status"),
+        Index("idx_collab_room_host", "host_device_id"),
+        {"schema": SCHEMA},
+    )
+
+
+class CollabMember(BaseRecipe):
+    """房间成员。加入时把当时的昵称/头像快照存进来，房间展示不再依赖档案更新。"""
+
+    __tablename__ = "collab_member"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    room_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.collab_room.id", ondelete="CASCADE"),
+                     nullable=False)
+    device_id = Column(String(64), nullable=False)
+    nickname = Column(String(24), nullable=False)
+    avatar = Column(String(8), nullable=False, server_default="🙂")
+    joined_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("room_id", "device_id", name="uq_collab_member_once"),
+        Index("idx_collab_member_room", "room_id"),
+        {"schema": SCHEMA},
+    )
+
+
+class CollabVote(BaseRecipe):
+    """对某道菜的表态：add（加这道）/ remove（去这道）。
+    同一设备对同一道菜同 stance 只记一票；对同一道菜 add 与 remove 互斥（后投覆盖先投）。"""
+
+    __tablename__ = "collab_vote"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    room_id = Column(BigInteger, ForeignKey(f"{SCHEMA}.collab_room.id", ondelete="CASCADE"),
+                     nullable=False)
+    device_id = Column(String(64), nullable=False)
+    recipe_id = Column(String(120), nullable=False)
+    stance = Column(String(8), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("stance IN ('add','remove')", name="ck_collab_vote_stance"),
+        UniqueConstraint("room_id", "device_id", "recipe_id", name="uq_collab_vote_dish"),
+        Index("idx_collab_vote_room_dish", "room_id", "recipe_id"),
+        {"schema": SCHEMA},
+    )
+
+
 #: 建表/校验时按依赖顺序使用
 ALL_TABLES = (
     RecipeCategory, RecipeTag, Recipe, RecipeIngredient, RecipeStep,
@@ -452,4 +540,6 @@ ALL_TABLES = (
     RecipeFeedback, MealLog, TablePlanRecord, IngredientNutrition,
     # v3：做饭页备注 / 采购勾选 / 我的常点
     RecipeNote, ShoppingCheck, TakeoutSpot,
+    # v4：用户档案 + 协作配餐
+    UserProfile, CollabRoom, CollabMember, CollabVote,
 )

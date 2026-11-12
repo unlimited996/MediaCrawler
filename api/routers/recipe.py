@@ -33,6 +33,7 @@ import gzip
 import os
 import hashlib
 import json
+import secrets
 import time
 from datetime import date, timedelta
 from decimal import Decimal
@@ -47,6 +48,7 @@ from database.models_recipe import (
     SCHEMA, AppConfig, DIFFICULTY_VALUES, RECIPE_STATUS_VALUES, MealLog, Recipe,
     RecipeCategory, RecipeFeedback, RecipeIngredient, RecipeNote, RecipeStep,
     RecipeTag, RecipeTagLink, ShoppingCheck, TablePlanRecord, TakeoutSpot,
+    CollabMember, CollabRoom, CollabVote, UserProfile,
 )
 from .story import _session
 
@@ -1532,6 +1534,302 @@ async def delete_takeout_spot(spot_id: int, device_id: str = Query(..., alias="d
         if not res.rowcount:
             raise HTTPException(status_code=404, detail="常点不存在")
         return {"success": True, "deleted": spot_id}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+# ===========================================================================
+# 协作配餐（v4）：用户档案 + 房间（创建/加入/投票/定稿）
+#
+# 身份沿用 device_id（无密码轻量账号）；档案只补昵称+头像，
+# 协作房间靠 6 位邀请码拉人，每人对每道菜一个表态（加/去），房主定稿。
+# ===========================================================================
+
+#: 邀请码字符集：去掉 0/O/1/I 这些肉眼易混字符
+_ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _gen_room_code() -> str:
+    return "".join(secrets.choice(_ROOM_CODE_CHARS) for _ in range(6))
+
+
+def _profile_json(row: UserProfile) -> Dict[str, Any]:
+    return {"deviceId": row.device_id, "nickname": row.nickname, "avatar": row.avatar}
+
+
+@life_router.get("/profile")
+async def get_profile(device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = (await session.execute(
+            select(UserProfile).where(UserProfile.device_id == device_id))).scalar_one_or_none()
+        if row is None:
+            return {"deviceId": device_id, "nickname": "", "avatar": ""}
+        return _profile_json(row)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.post("/profile")
+async def save_profile(payload: Dict[str, Any] = Body(default={})): 
+    device_id = (payload.get("deviceId") or "").strip()
+    nickname = (payload.get("nickname") or "").strip()[:24]
+    avatar = (payload.get("avatar") or "🙂")[:8]
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+    if not nickname:
+        raise HTTPException(status_code=400, detail="nickname 必填")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = (await session.execute(
+            select(UserProfile).where(UserProfile.device_id == device_id))).scalar_one_or_none()
+        if row is None:
+            row = UserProfile(device_id=device_id, nickname=nickname, avatar=avatar)
+            session.add(row)
+        else:
+            row.nickname = nickname
+            row.avatar = avatar
+        await session.commit()
+        await session.refresh(row)
+        return _profile_json(row)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+async def _load_room(session: AsyncSession, code: str) -> CollabRoom:
+    room = (await session.execute(
+        select(CollabRoom).where(CollabRoom.code == code.upper()))).scalar_one_or_none()
+    if room is None:
+        raise HTTPException(status_code=404, detail="房间不存在，检查一下邀请码")
+    return room
+
+
+def _room_json(room: CollabRoom, members: List[CollabMember],
+               votes: List[CollabVote], my_device_id: str) -> Dict[str, Any]:
+    tally: Dict[str, Dict[str, Any]] = {
+        rid: {"recipeId": rid, "add": 0, "remove": 0, "mine": None}
+        for rid in (room.recipe_ids or [])
+    }
+    for v in votes:
+        slot = tally.get(v.recipe_id)
+        if slot is None:
+            continue
+        slot["add" if v.stance == "add" else "remove"] += 1
+        if v.device_id == my_device_id:
+            slot["mine"] = v.stance
+    return {
+        "code": room.code,
+        "title": room.title,
+        "status": room.status,
+        "people": room.people,
+        "isHost": room.host_device_id == my_device_id,
+        "members": [{
+            "deviceId": m.device_id,
+            "nickname": m.nickname,
+            "avatar": m.avatar,
+            "isHost": m.device_id == room.host_device_id,
+        } for m in members],
+        "dishes": list(tally.values()),
+    }
+
+
+async def _room_detail(session: AsyncSession, room: CollabRoom, my_device_id: str):
+    members = list((await session.execute(
+        select(CollabMember).where(CollabMember.room_id == room.id)
+        .order_by(CollabMember.joined_at))).scalars())
+    votes = list((await session.execute(
+        select(CollabVote).where(CollabVote.room_id == room.id))).scalars())
+    return _room_json(room, members, votes, my_device_id)
+
+
+@life_router.post("/collab/rooms")
+async def create_collab_room(payload: Dict[str, Any] = Body(default={})):
+    device_id = (payload.get("deviceId") or "").strip()
+    dish_ids = payload.get("dishIds") or []
+    title = (payload.get("title") or "这一桌").strip()[:48]
+    people = int(payload.get("people") or 2)
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+    if not dish_ids:
+        raise HTTPException(status_code=400, detail="先配好一桌菜再邀请")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        profile = (await session.execute(
+            select(UserProfile).where(UserProfile.device_id == device_id))).scalar_one_or_none()
+        nickname = (profile.nickname if profile else "") or f"房主{device_id[-4:]}"
+        avatar = (profile.avatar if profile else "") or "👨‍🍳"
+
+        # 邀请码去重：撞了就重摇，表里码基数很小，重摇即可
+        for _ in range(8):
+            code = _gen_room_code()
+            clash = (await session.execute(
+                select(CollabRoom.id).where(CollabRoom.code == code))).scalar_one_or_none()
+            if clash is None:
+                break
+        room = CollabRoom(code=code, host_device_id=device_id, title=title,
+                          recipe_ids=list(dict.fromkeys(dish_ids)), people=people)
+        session.add(room)
+        await session.flush()
+        session.add(CollabMember(room_id=room.id, device_id=device_id,
+                                 nickname=nickname, avatar=avatar))
+        await session.commit()
+        await session.refresh(room)
+        return await _room_detail(session, room, device_id)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.get("/collab/rooms/{code}")
+async def get_collab_room(code: str, device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        room = await _load_room(session, code)
+        return await _room_detail(session, room, device_id)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.post("/collab/rooms/{code}/join")
+async def join_collab_room(code: str, payload: Dict[str, Any] = Body(default={})):
+    device_id = (payload.get("deviceId") or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        room = await _load_room(session, code)
+        if room.status != "open":
+            raise HTTPException(status_code=409, detail="这一桌已经定稿了")
+        exists = (await session.execute(
+            select(CollabMember.id).where(CollabMember.room_id == room.id,
+                                          CollabMember.device_id == device_id))).scalar_one_or_none()
+        if exists is None:
+            profile = (await session.execute(
+                select(UserProfile).where(UserProfile.device_id == device_id))).scalar_one_or_none()
+            nickname = (payload.get("nickname")
+                        or (profile.nickname if profile else "")
+                        or f"饭友{device_id[-4:]}")[:24]
+            avatar = (payload.get("avatar")
+                      or (profile.avatar if profile else "") or "🙂")[:8]
+            session.add(CollabMember(room_id=room.id, device_id=device_id,
+                                     nickname=nickname, avatar=avatar))
+            await session.commit()
+        return await _room_detail(session, room, device_id)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.post("/collab/rooms/{code}/vote")
+async def vote_collab_dish(code: str, payload: Dict[str, Any] = Body(default={})):
+    device_id = (payload.get("deviceId") or "").strip()
+    recipe_id = (payload.get("recipeId") or "").strip()
+    stance = (payload.get("stance") or "").strip().lower()
+    if not device_id or not recipe_id:
+        raise HTTPException(status_code=400, detail="deviceId / recipeId 必填")
+    if stance not in ("add", "remove", "none"):
+        raise HTTPException(status_code=400, detail="stance 须是 add/remove/none")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        room = await _load_room(session, code)
+        if room.status != "open":
+            raise HTTPException(status_code=409, detail="这一桌已经定稿了")
+        member = (await session.execute(
+            select(CollabMember).where(CollabMember.room_id == room.id,
+                                       CollabMember.device_id == device_id))).scalar_one_or_none()
+        if member is None:
+            raise HTTPException(status_code=403, detail="先加入这一桌才能投票")
+        if recipe_id not in (room.recipe_ids or []):
+            raise HTTPException(status_code=404, detail="桌上没有这道菜")
+
+        vote = (await session.execute(
+            select(CollabVote).where(CollabVote.room_id == room.id,
+                                     CollabVote.device_id == device_id,
+                                     CollabVote.recipe_id == recipe_id))).scalar_one_or_none()
+        if stance == "none":
+            if vote is not None:
+                await session.delete(vote)
+        elif vote is None:
+            session.add(CollabVote(room_id=room.id, device_id=device_id,
+                                   recipe_id=recipe_id, stance=stance))
+        elif vote.stance != stance:
+            vote.stance = stance
+        await session.commit()
+        return await _room_detail(session, room, device_id)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.post("/collab/rooms/{code}/decide")
+async def decide_collab_room(code: str, payload: Dict[str, Any] = Body(default={})):
+    device_id = (payload.get("deviceId") or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId 必填")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        room = await _load_room(session, code)
+        if room.host_device_id != device_id:
+            raise HTTPException(status_code=403, detail="只有房主能定稿")
+        if room.status != "open":
+            raise HTTPException(status_code=409, detail="这一桌已经定稿了")
+        room.status = "decided"
+        await session.commit()
+        return await _room_detail(session, room, device_id)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.delete("/collab/rooms/{code}/leave")
+async def leave_collab_room(code: str, device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        room = await _load_room(session, code)
+        if room.host_device_id == device_id:
+            # 房主退出 = 解散房间（成员与选票级联清掉）
+            room.status = "closed"
+            await session.execute(
+                delete(CollabMember).where(CollabMember.room_id == room.id))
+            await session.execute(
+                delete(CollabVote).where(CollabVote.room_id == room.id))
+            await session.commit()
+            return {"success": True, "closed": True}
+        res = await session.execute(
+            delete(CollabMember).where(CollabMember.room_id == room.id,
+                                       CollabMember.device_id == device_id))
+        await session.execute(
+            delete(CollabVote).where(CollabVote.room_id == room.id,
+                                     CollabVote.device_id == device_id))
+        await session.commit()
+        if not res.rowcount:
+            raise HTTPException(status_code=404, detail="你不在这一桌里")
+        return {"success": True, "closed": False}
     finally:
         await session.close()
         await engine.dispose()
