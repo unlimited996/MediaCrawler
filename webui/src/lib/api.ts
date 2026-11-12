@@ -142,6 +142,16 @@ export interface CaptchaSessionStatus {
   started_at: string
   age_sec: number
   message: string
+  /** active=false 的原因：no_session / done / expired / active_json_broken / active */
+  reason?: string
+  /** 文件桥诊断：抓取侧说「已推送」但没弹窗时，直接访问 status 就能定位 */
+  debug?: {
+    session_dir: string
+    active_exists: boolean
+    done_exists: boolean
+    frame_exists: boolean
+    frame_bytes: number
+  }
 }
 
 export const captchaSessionApi = {

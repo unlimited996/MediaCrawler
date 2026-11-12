@@ -5,6 +5,56 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-12] 安全验证「日志说已推送、WebUI 却没弹窗」不再静默失败
+
+现象：定时任务 #27 在 11:37:32 命中小红书安全验证，日志明确打出
+`[captcha-bridge] 已推送验证会话到 WebUI`，但页面上既没有弹窗也没有滑块，
+干等 300s 后 `wait_for_human_verify` 超时，整轮以 `[MEDIACRAWLER_RISK_ABORT]`
+熔断（74 篇里 73 篇没抓到评论）。
+
+排查结论：文件桥 `logs/captcha_session/`、网关 `/crawler/api/**` 转发、
+`crawler_app` 路由前缀与前端 URL 拼接逐段核对**都是对的**。真正的问题在于
+**失败不可见**：`CaptchaDialog` 轮询 `status` 的 `catch { /* 忽略 */ }` 把
+404/502/超时全部吞掉，用户只看到「日志说推了、页面什么都没有」，无法判断是
+接口不通、旧前端、共享卷没生效还是截图没生成；另外弹窗只在非访客视图挂载，
+且 z-index(80) 低于其它模态。
+
+### 1. 后端：`status` 变成可诊断接口
+`api/routers/captcha_session.py` 的 `/status` 现在**无论 active 与否**都返回：
+- `reason`：`no_session` / `done` / `expired` / `active_json_broken` / `active`；
+- `debug`：`session_dir` 绝对路径、`active_exists` / `done_exists` /
+  `frame_exists` / `frame_bytes`。
+
+浏览器直接访问 `/crawler/api/crawler/captcha-session/status` 即可定位：
+`active_exists=true` 但前端没弹 → 前端/网关问题；`active_exists=false` 而抓取
+日志说已推送 → 共享卷或进程工作目录不一致。
+
+### 2. 前端：失败可见 + 日志兜底 + 截图兜底
+`webui/src/components/layout/CaptchaDialog.tsx`：
+- 轮询 2s → **1s**；连续 2 次请求失败显示**橙红色警告条**（`HTTP 404 / 网络不可达`
+  + 点击重试），不再静默；
+- **WS 日志兜底**：实时日志里出现 `[captcha-bridge] 已推送验证会话` 或
+  `触发小红书安全验证`（近 90s 内）就立即开窗并触发一次 status 检查。用户能看到
+  实时日志就说明 WS 通，即使 HTTP status 被挡也不会「什么都没有」。
+  用 `useCrawlerStore.subscribe` 而不是 selector，避免高频日志把弹窗反复重渲染；
+- 截图 `onError` 显示**可见原因 + 重试按钮 + 文件桥诊断摘要**，不再是空白一片
+  （用户描述的「没看到滑块」很可能就是弹窗开了但图 404）；
+- 弹窗工具条显示 `session_dir` 与 active/done/frame 状态；z-index 80 → **200**。
+
+`App.tsx`：`<CaptchaDialog />` 改为**全局挂载**，访客页/后台标签页同样能弹。
+
+### 3. 抓取侧日志
+`tools/captcha_bridge.py::start_session()` 把 `active.json` 的**绝对路径与 pid**
+打进实时日志，方便确认 worker 写到了哪个卷。
+
+### 验证
+- `py_compile` / `tsc -b` / `npm run build` 全过；
+- `_t_captcha_status.py` 用临时目录模拟 5 种文件桥状态（无会话 / active /
+  done / TTL 过期 / JSON 损坏），`reason` 与 `debug` 全部符合预期。
+
+> 部署侧：群晖必须 `docker compose pull && docker compose up -d` 拉到新镜像，
+> 上述前端改动才会生效。
+
 ## [2026-11-12] 镜像构建统一只打并推送 latest，不再打 sha-xxxxxxx
 
 用户要求：镜像版本应该是 `latest`，构建脚本不该额外打 `sha-<commit>` 标签。

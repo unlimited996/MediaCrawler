@@ -89,7 +89,8 @@ def start_session(url: str = "") -> None:
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "ts": time.time(),
     }, ensure_ascii=False), encoding="utf-8")
-    _log("已推送验证会话到 WebUI，请在「安全验证」弹窗中完成（滑块/扫码/点按）")
+    _log(f"已推送验证会话到 WebUI，请在「安全验证」弹窗中完成（滑块/扫码/点按）"
+         f"｜active={ACTIVE_FILE}｜pid={os.getpid()}")
 
 
 async def close() -> None:

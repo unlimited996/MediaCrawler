@@ -115,7 +115,8 @@ function App() {
         {/* 扫码登录二维码：全局浮动可收纳，任何页面都能扫（访客视图除外） */}
         {view !== 'guest' && <LoginQrcodeFab />}
         {view !== 'guest' && <LoginPageDialog />}
-        {view !== 'guest' && <CaptchaDialog />}
+        {/* 安全验证与当前视图无关：定时任务在访客页/后台标签页也会触发风控 */}
+        <CaptchaDialog />
 
         {/* Toast notifications - Theme-aware style */}
         <Toaster

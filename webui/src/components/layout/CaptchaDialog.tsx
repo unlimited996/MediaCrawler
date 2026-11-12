@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ShieldAlert, X, Loader2, ChevronUp, ChevronDown } from 'lucide-react'
+import { ShieldAlert, WifiOff, X, Loader2, ChevronUp, ChevronDown } from 'lucide-react'
 import { toast } from 'sonner'
 import { captchaSessionApi, type CaptchaSessionStatus } from '@/lib/api'
+import { useCrawlerStore } from '@/store/crawlerStore'
+import type { LogEntry } from '@/types/crawler'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 
@@ -20,35 +22,92 @@ export function CaptchaDialog() {
   const [status, setStatus] = useState<CaptchaSessionStatus | null>(null)
   const [text, setText] = useState('')
   const [tick, setTick] = useState(0)
+  const [imgError, setImgError] = useState(false)
+  /** 连续轮询失败次数：>=2 就显示可见的警告条，不再静默吞掉 404/502 */
+  const [pollError, setPollError] = useState<string | null>(null)
   const [fit, setFit] = useState(
     typeof window !== 'undefined' ? window.innerWidth >= 768 : true)
   const imgRef = useRef<HTMLImageElement>(null)
   const prevActive = useRef(false)
   const dragStart = useRef<{ x: number; y: number } | null>(null)
+  const failCount = useRef(0)
+  const handledLogs = useRef(new Set<string>())
   // 抓取主浏览器 launch_browser() 用的视口，坐标按它换算
   const viewport = { width: 1920, height: 1080 }
 
-  // 无论弹窗是否打开都轮询：active 由 false -> true 时自动弹出
-  useEffect(() => {
-    let alive = true
-    const poll = async () => {
-      try {
-        const { data } = await captchaSessionApi.status()
-        if (!alive) return
-        setStatus(data)
-        if (data.active && !prevActive.current) {
-          setOpen(true)
-          setTick((v) => v + 1)
-          toast.warning('抓取任务命中安全验证，请完成验证')
-        }
-        if (!data.active && prevActive.current) setOpen(false)
-        prevActive.current = data.active
-      } catch { /* 服务尚未启动 / 网络抖动时忽略 */ }
+  const describeError = (e: any) => {
+    const r = e?.response
+    if (r) return `HTTP ${r.status}${r.data?.detail ? ` · ${r.data.detail}` : ''}`
+    return e?.message || '网络不可达'
+  }
+
+  // 无论弹窗是否打开都轮询：active 由 false -> true 时自动弹出。
+  // 轮询接口异常必须可见：以前 catch 里什么都不做，接口 404/502 时用户只会
+  // 看到「日志说已推送验证页，页面上却没有弹窗」，完全无从下手。
+  const poll = useCallback(async () => {
+    try {
+      const { data } = await captchaSessionApi.status()
+      failCount.current = 0
+      setPollError(null)
+      setStatus(data)
+      if (data.active && !prevActive.current) {
+        setOpen(true)
+        setImgError(false)
+        setTick((v) => v + 1)
+        toast.warning('抓取任务命中安全验证，请完成验证')
+      }
+      if (!data.active && prevActive.current) setOpen(false)
+      prevActive.current = data.active
+    } catch (e: any) {
+      failCount.current += 1
+      if (failCount.current >= 2) setPollError(describeError(e))
     }
-    void poll()
-    const t = setInterval(poll, 2000)
-    return () => { alive = false; clearInterval(t) }
   }, [])
+
+  useEffect(() => {
+    void poll()
+    const t = setInterval(poll, 1000)
+    return () => clearInterval(t)
+  }, [poll])
+
+  // 兜底：实时日志 WS 出现「验证页已推送」就立刻开窗。
+  // 用户能看到实时日志说明 WS 是通的，即使 HTTP status 接口被网关/旧镜像
+  // 挡掉，也不会再出现「什么都没有」的静默失败。
+  useEffect(() => {
+    const isFresh = (ts: string) => {
+      if (!/^\d{2}:\d{2}:\d{2}$/.test(ts)) return false
+      const [h, m, s] = ts.split(':').map(Number)
+      const now = new Date()
+      const cur = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()
+      const target = h * 3600 + m * 60 + s
+      const diff = Math.abs(cur - target)
+      return Math.min(diff, 86400 - diff) <= 90
+    }
+    const onLogs = (logs: LogEntry[]) => {
+      for (const l of logs.slice(-8)) {
+        if (!l.timestamp || !isFresh(l.timestamp)) continue
+        const hit = (l.message.includes('[captcha-bridge]')
+                     && l.message.includes('已推送验证会话'))
+                 || l.message.includes('触发小红书安全验证')
+        if (!hit) continue
+        const key = `${l.timestamp}|${l.message}`
+        if (handledLogs.current.has(key)) continue
+        handledLogs.current.add(key)
+        if (handledLogs.current.size > 40) {
+          handledLogs.current = new Set([...handledLogs.current].slice(-20))
+        }
+        setOpen(true)
+        setImgError(false)
+        setTick((v) => v + 1)
+        toast.warning('抓取任务命中安全验证，正在打开验证窗口')
+        void poll()
+      }
+    }
+    // 用 store.subscribe 而不是 selector，避免高频日志让整个弹窗反复重渲染
+    return useCrawlerStore.subscribe((state, prev) => {
+      if (state.logs !== prev.logs) onLogs(state.logs)
+    })
+  }, [poll])
 
   // 截图刷新：加时间戳绕开浏览器缓存
   useEffect(() => {
@@ -116,21 +175,39 @@ export function CaptchaDialog() {
     }
   }, [])
 
-  // 会话还在但用户关了弹窗：留一个可重新打开的入口
+  // 会话还在但用户关了弹窗：留一个可重新打开的入口；
+  // 接口连不上时也要有可见提示（点击可立即重试并手动打开验证窗口）。
   if (!open) {
-    if (!status?.active) return null
     return (
-      <button
-        onClick={() => setOpen(true)}
-        className="fixed bottom-20 right-3 z-[80] flex h-11 items-center gap-2 rounded-lg border border-cyber-neon-orange bg-cyber-bg-panel px-3 text-xs font-mono text-cyber-neon-orange shadow-lg animate-pulse sm:bottom-5 sm:right-5"
-      >
-        <ShieldAlert className="h-4 w-4" /> 安全验证待处理
-      </button>
+      <>
+        {status?.active && (
+          <button
+            onClick={() => setOpen(true)}
+            className="fixed bottom-20 right-3 z-[200] flex h-11 items-center gap-2 rounded-lg border border-cyber-neon-orange bg-cyber-bg-panel px-3 text-xs font-mono text-cyber-neon-orange shadow-lg animate-pulse sm:bottom-5 sm:right-5"
+          >
+            <ShieldAlert className="h-4 w-4" /> 安全验证待处理
+          </button>
+        )}
+        {pollError && (
+          <button
+            onClick={() => {
+              setPollError(null)
+              failCount.current = 0
+              void poll()
+            }}
+            title="点击重试；若仍失败，检查 crawler 服务的 /crawler/captcha-session/status 是否可达"
+            className="fixed bottom-36 right-3 z-[200] flex max-w-[22rem] items-center gap-2 rounded-lg border border-rose-400 bg-cyber-bg-panel px-3 py-2 text-left text-[11px] font-mono text-rose-400 shadow-lg sm:bottom-20 sm:right-5"
+          >
+            <WifiOff className="h-4 w-4 shrink-0" />
+            <span>安全验证接口不可用：{pollError}<br />点击重试</span>
+          </button>
+        )}
+      </>
     )
   }
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 p-0 sm:p-4">
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80 p-0 sm:p-4">
       <div className="flex h-full w-full max-w-none flex-col overflow-hidden rounded-none border-2 border-cyber-neon-orange bg-cyber-bg-panel shadow-2xl sm:h-auto sm:max-h-[94vh] sm:max-w-5xl sm:rounded-lg">
         {/* 标题栏 */}
         <div className="flex items-center gap-2 border-b border-cyber-border-subtle px-3 py-2 sm:px-4 sm:py-2.5">
@@ -145,18 +222,38 @@ export function CaptchaDialog() {
           </Button>
         </div>
 
-        {/* 验证页截图：轻点=点击，按住拖动=滑块 */}
-        <div className="min-h-0 flex-1 overflow-auto overscroll-contain bg-[#0d1117] p-1 sm:p-2">
+        {/* 验证页截图：轻点=点击，按住拖动=滑块；加载失败要给出可见原因，
+            否则用户会以为「弹窗有了但没有滑块」 */}
+        <div className="relative min-h-0 flex-1 overflow-auto overscroll-contain bg-[#0d1117] p-1 sm:p-2">
           <img
             ref={imgRef}
             src={`/crawler/api/crawler/captcha-session/screenshot?t=${tick}`}
             alt="安全验证页面"
             onPointerDown={onPointerDown}
             onPointerUp={onPointerUp}
+            onLoad={() => setImgError(false)}
+            onError={() => setImgError(true)}
             className={`mx-auto block cursor-crosshair select-none touch-none ${
               fit ? 'w-full max-w-[1280px]' : 'w-[1920px] max-w-none'}`}
             draggable={false}
           />
+          {imgError && (
+            <div className="absolute inset-0 flex items-center justify-center bg-[#0d1117]/92 p-4">
+              <div className="space-y-2 text-center text-[11px] font-mono text-cyber-text-secondary">
+                <p className="text-cyber-neon-orange">验证页截图加载失败（接口没返回图片）</p>
+                <p>可能原因：crawler 服务不可达 / 会话已结束 / 截图尚未生成。</p>
+                <p className="text-cyber-text-muted">
+                  status={status?.reason || '未知'} ·
+                  active={String(status?.debug?.active_exists ?? '?')} ·
+                  frame={String(status?.debug?.frame_exists ?? '?')}
+                </p>
+                <Button size="sm" variant="outline" className="h-7 font-mono text-xs"
+                  onClick={() => { setImgError(false); setTick((v) => v + 1) }}>
+                  重试加载截图
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* 工具条 */}
@@ -164,6 +261,12 @@ export function CaptchaDialog() {
           <p className="text-[11px] font-mono text-cyber-text-muted">
             轻点=点击，按住拖动=滑块验证；先点页面里的输入框再用下方打字。手机上可左右拖动查看完整页面。
           </p>
+          {status?.debug?.session_dir && (
+            <p className="text-[10px] font-mono text-cyber-text-muted/70">
+              文件桥：{status.debug.session_dir} · active={String(status.debug.active_exists)} ·
+              done={String(status.debug.done_exists)} · frame={status.debug.frame_bytes}B
+            </p>
+          )}
           <div className="flex flex-wrap items-center gap-2">
             <Input
               value={text}
