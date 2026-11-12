@@ -20,6 +20,7 @@ from media_platform.xhs.client import XiaoHongShuClient
 from media_platform.xhs.exception import CaptchaError, DataFetchError
 from tools.v2_sync import (
     save_comment_resume, get_comment_resume, clear_comment_resume,
+    mark_comment_fully_fetched, COMMENT_FULLY_FETCHED_KEY,
 )
 
 
@@ -310,3 +311,55 @@ def test_save_get_clear_comment_resume(monkeypatch):
     # clear
     asyncio.run(clear_comment_resume("xhs", "n1"))
     assert "comment_resume" not in chapter.ext
+
+
+def test_mark_fully_fetched_corrects_inflated_declared(monkeypatch):
+    """has_more=False 时立刻把虚高分母改成真实已抓数，不等本轮 refresh。
+
+    线上元凶帖：declared=2166 / fetched=1424 / 65.7%，风控熔断让 refresh
+    来不及跑，于是下轮又被当成未达标重抓。
+    """
+    chapter = type("C", (), {
+        "ext": {}, "story_id": 99,
+        "declared_comment_count": 2166,
+        "fetched_comment_count": 1424,
+        "completeness": 0.6574,
+    })()
+    committed = {"n": 0}
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, *a, **k):
+            class Res:
+                def scalar_one_or_none(self):
+                    return chapter
+
+                def scalar(self):
+                    return 1424
+            return Res()
+
+        async def commit(self):
+            committed["n"] += 1
+
+    async def fake_session():
+        yield FakeSession()
+
+    monkeypatch.setattr("tools.v2_sync._v2_session",
+                        asynccontextmanager(fake_session))
+
+    async def _fake_site_id(s, p):
+        return 1
+
+    monkeypatch.setattr("tools.v2_sync._get_site_id", _fake_site_id)
+
+    asyncio.run(mark_comment_fully_fetched("xhs", "n1"))
+    assert chapter.ext.get(COMMENT_FULLY_FETCHED_KEY) is True
+    assert chapter.declared_comment_count == 1424
+    assert chapter.fetched_comment_count == 1424
+    assert chapter.completeness == 1.0
+    assert committed["n"] == 1

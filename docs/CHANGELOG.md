@@ -5,6 +5,51 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-12] 修「翻到底却没打抓全标记」→ 每轮重抓同一帖（仅建议 2 / 5）
+
+线上反爬分析发现的结构性死循环：`media_platform/xhs/core.py::_on_progress`
+只在 `finished and reached_end` 时写 `comment_fully_fetched`。page 级回调先把
+`reached_end=true` 存进 `comment_resume`，随后一旦被 461 / 超时 / 手动停止打断，
+`finished=True` 回调根本走不到，标记就永远丢了。于是「声明 2166 / 已抓 1424
+（65.7%），但主评论其实已翻到底」的帖子每轮都判定未达 90%、每轮排第一重抓、
+每轮在同一处撞 461，剩下 73 篇待补帖一轮都没推进过。
+
+### 建议 2：中断路径也落「抓全」标记
+- 新增 `core.py::_should_mark_fully_fetched(reached_end, sub_cursors, finished)`：
+  - 正常结束且翻到底 → 标记（原行为不变）；
+  - **page 级就翻到底、且没有待展开楼中楼** → 立刻 `clear_comment_resume` +
+    `mark_comment_fully_fetched`，不等 finished 回调；
+  - 还有楼中楼要翻（`sub_cursors` 非空）→ 不标，避免漏抓回复。
+- `_on_progress` 改用它，正常结束路径行为不变。
+
+### 建议 5：抓到 has_more=False 时立刻纠正虚高分母
+- `mark_comment_fully_fetched()` 打标记的同时，按 `count(Comment)` 把
+  `declared_comment_count` / `fetched_comment_count` 改成真实已抓数、
+  `completeness=1.0`。以前只打标记，分母要等每轮结束的 `refresh_comment_completeness`
+  才改；那轮被风控熔断时 refresh 可能来不及跑，前端仍显示 65% 且分母虚高。
+  口径与 refresh 的 fully 分支一致；章节孤立（`story_id` 为空）时只写标记不编分母。
+- `refresh_comment_completeness()` 的 `fully` 改用统一判据 `has_fully_fetched_marker()`，
+  存量 resume 自愈帖也会在这里把分母纠正过来。
+
+### 存量数据只读自愈（不需要改库）
+新增 `has_fully_fetched_marker(ext)`：除了显式标记，也认
+`ext.comment_resume.reached_end=true && sub_cursors 为空`。
+`is_comment_complete_full()` 调用它，而 `get_archived_content_ids` 与
+`get_backfill_candidates` 都走这个统一判据 —— 所以**线上那 2 篇存量死循环帖
+无需任何 UPDATE**，下一次任务直接从待补池移除，分母在 refresh 时自动纠正。
+否则它们下轮仍排在第一个、一发评论请求就撞 461，永远等不到「下一次成功抓取」
+来补写标记。
+
+### 本次**没有**改动
+任务额度 / 重试间隔 / 调度周期 / 请求预算 / 风控冷却 / 弹窗 / 群晖 compose /
+镜像构建，一律未动（建议 1、3、4 保持原样）。
+
+### 验证
+- `py_compile` 通过；受影响的 4 个测试文件 **50 passed**（含新增 7 个用例：
+  正常结束 / 未翻到底 / page 级翻到底 / 楼中楼待续 / resume 自愈 / 分母纠正）。
+- 内存 SQLite 端到端验证 `refresh_comment_completeness`：存量 reached_end 帖的
+  declared 由 2166 纠正为真实 3 条、completeness=1.0；普通未翻到底帖分母保持 100。
+
 ## [2026-11-12] 安全验证「日志说已推送、WebUI 却没弹窗」不再静默失败
 
 现象：定时任务 #27 在 11:37:32 命中小红书安全验证，日志明确打出

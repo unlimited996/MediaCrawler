@@ -145,6 +145,24 @@ def _comment_max_count(declared: int) -> int:
     return limit
 
 
+def _should_mark_fully_fetched(reached_end: bool, sub_cursors: Dict[str, str],
+                               finished: bool) -> bool:
+    """进度回调要不要立刻把这帖打成「评论已抓全」。
+
+    正常结束且翻到 has_more=False：标记（原逻辑）。
+    **page 级就翻到底、且没有待展开楼中楼**时也必须立刻标记：阶段二已经没有
+    请求可发，但进程可能在 finished 回调之前被 461/超时/手动停止打断，标记就
+    永远丢了。平台声明数虚高的帖子于是每轮按「未达 90%」重抓，重抓又在同一处
+    撞 461（2026-11-12 线上实测：同一帖连续多轮熔断）。
+    还有楼中楼要翻（sub_cursors 非空）时不能标，否则会漏抓回复。
+    """
+    if not reached_end:
+        return False
+    if finished:
+        return True
+    return not bool(sub_cursors)
+
+
 class XiaoHongShuCrawler(AbstractCrawler):
     # 这些是运行期注入的句柄。类级默认 None + __init__/launch 赋值：
     # 单测常用 `XiaoHongShuCrawler.__new__()` 绕开 __init__ 造对象，
@@ -1533,10 +1551,15 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         await save_comment_skipped_sub(
                             "xhs", nid,
                             int(state.get("skipped_sub_count", 0) or 0))
-                    if finished and state.get("reached_end"):
+                    if _should_mark_fully_fetched(
+                        reached_end=bool(state.get("reached_end", False)),
+                        sub_cursors=state.get("sub_cursors") or {},
+                        finished=finished,
+                    ):
                         # 真翻到底：评论抓全，清掉进度，避免下轮误续或误判；
-                        # 同时打「已抓全」标记，增量跳过判定据此直接视为 100%
-                        # 完成（平台声明数常虚高，否则会每轮反复重抓这条）。
+                        # 同时打「已抓全」标记（并纠正虚高分母），增量跳过判定据此
+                        # 直接视为 100% 完成。page 级就落标记，后续即使被风控
+                        # 打断也不会退化成「每轮重抓同一帖」。
                         await clear_comment_resume("xhs", nid)
                         await mark_comment_fully_fetched("xhs", nid)
                     else:

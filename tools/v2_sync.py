@@ -526,13 +526,36 @@ def is_comment_complete(fetched: int, declared: int,
     return comment_completeness(fetched, declared) >= target_ratio
 
 
+def has_fully_fetched_marker(ext: Any) -> bool:
+    """是否已有「主评论翻到 has_more=False」的证据。
+
+    两种形式：
+      1) 新数据：显式标记 `ext[COMMENT_FULLY_FETCHED_KEY]`；
+      2) 存量数据：只有 page 级 `ext[COMMENT_RESUME_KEY]` 里
+         `reached_end=true` 且 `sub_cursors` 为空 —— 主评论已翻到底、且没有
+         楼中楼待续，只是后续被风控打断没来得及写显式标记。
+
+    第 2 条是**只读自愈**：存量那几篇不用改库就能立刻从待补池移除，否则它们
+    下轮仍排在第一个、一发评论请求就撞 461，永远等不到「下一次成功抓取」来
+    补写标记（2026-11-12 线上死循环）。
+    """
+    ext = ext or {}
+    if not isinstance(ext, dict):
+        return False
+    if ext.get(COMMENT_FULLY_FETCHED_KEY, False):
+        return True
+    resume = ext.get(COMMENT_RESUME_KEY) or {}
+    return bool(isinstance(resume, dict) and resume.get("reached_end")
+                and not (resume.get("sub_cursors") or {}))
+
+
 def is_comment_complete_full(fetched: int, declared: int, ext: Any = None,
                              target_ratio: float = 0.0) -> bool:
     """完整率判据（含 ext 里的策略性标记），增量跳过判定的统一入口。
 
     三条命中任一即算「完成、可跳过」：
       1) 已抓/声明 >= 目标比例（正常路径）；
-      2) ext[COMMENT_FULLY_FETCHED_KEY]：评论已翻到 has_more=False 抓全 ——
+      2) `has_fully_fetched_marker(ext)`：评论已翻到 has_more=False 抓全 ——
          平台声明数常虚高（含已删/折叠），可抓的都抓到了，直接视为 100%，
          否则这类帖会每轮反复重抓、白打请求且容易撞 461；
       3) 已抓 >= 分母：平台少报声明数时，抓到的比声明还多，同样算完成。
@@ -544,7 +567,7 @@ def is_comment_complete_full(fetched: int, declared: int, ext: Any = None,
     if is_comment_complete(fetched, declared, target_ratio):
         return True
     ext = ext or {}
-    if ext.get(COMMENT_FULLY_FETCHED_KEY, False):
+    if has_fully_fetched_marker(ext):
         return True
     if declared > 0 and fetched >= declared:
         return True
@@ -964,8 +987,13 @@ async def mark_comment_fully_fetched(platform_code: str, content_id: str) -> Non
     会被 clear_comment_resume 清掉，而这个标记恰恰要在「翻到底之后」继续给
     增量跳过判定读。
 
-    作用：平台声明评论数虚高（含已删/折叠）时，即使「已抓/声明」< 90%，只要
-    已翻到 has_more=False 就视为 100% 完成、下一轮跳过，避免反复重抓。
+    作用：平台声明评论数虚高（含已删/折叠/私密评论、或 "5万" 这类展示值被当成
+    精确数）时，即使「已抓/声明」< 90%，只要已翻到 has_more=False 就视为 100%
+    完成、下一轮跳过，避免反复重抓。
+
+    同时**立刻把分母纠正为真实已抓数**（口径与 refresh_comment_completeness 的
+    fully 分支一致）。以前只打标记，分母要等每轮结束的 refresh 才会改；一旦那轮
+    被风控熔断/进程被杀，refresh 可能来不及跑，前端仍显示 65% 且 declared 虚高。
     """
     if not content_id:
         return
@@ -986,6 +1014,17 @@ async def mark_comment_fully_fetched(platform_code: str, content_id: str) -> Non
             ext = dict(chapter.ext or {})
             ext[COMMENT_FULLY_FETCHED_KEY] = True
             chapter.ext = ext
+
+            # 分母纠正：count(Comment) 走 idx_cmt_story_like，按 story_id 精确查。
+            # 章节孤立（story_id 为空）时只保留标记，不编造分母。
+            if chapter.story_id is not None:
+                fetched = int((await session.execute(
+                    select(func.count(Comment.id)).where(
+                        Comment.story_id == chapter.story_id)
+                )).scalar() or 0)
+                chapter.fetched_comment_count = fetched
+                chapter.declared_comment_count = fetched
+                chapter.completeness = 1.0
             await session.commit()
     except Exception as e:
         utils.logger.warning(
@@ -1118,7 +1157,9 @@ async def refresh_comment_completeness(platform_code: str,
                     (chapter.ext or {}).get(COMMENT_SKIPPED_KEY, 0) or 0))
                 fetched = int(cmt_count or 0)
                 chapter.fetched_comment_count = fetched
-                fully = bool((chapter.ext or {}).get(COMMENT_FULLY_FETCHED_KEY, False))
+                # 显式标记 + 存量 resume 自愈（has_fully_fetched_marker）：
+                # 老数据只有 reached_end=true 没写标记时，分母也在这里被纠正
+                fully = has_fully_fetched_marker(chapter.ext)
                 if fully or (declared > 0 and fetched >= declared):
                     # 已翻到 has_more=False 抓全，或已抓数 >= 平台声明数：
                     # 这类帖平台声明数普遍虚高（含已删/折叠/私密评论），用声明数当

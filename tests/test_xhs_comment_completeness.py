@@ -20,10 +20,11 @@ import pytest
 
 import config
 from media_platform.xhs.client import XiaoHongShuClient
-from media_platform.xhs.core import _comment_max_count
+from media_platform.xhs.core import _comment_max_count, _should_mark_fully_fetched
 from tools.v2_sync import (
     comment_completeness, is_comment_complete, plan_backfill,
-    is_comment_complete_full, COMMENT_FULLY_FETCHED_KEY,
+    is_comment_complete_full, has_fully_fetched_marker,
+    COMMENT_FULLY_FETCHED_KEY, COMMENT_RESUME_KEY,
 )
 
 
@@ -93,6 +94,62 @@ def test_fully_fetched_false_does_not_short_circuit():
     ext = {COMMENT_FULLY_FETCHED_KEY: False}
     assert is_comment_complete_full(337, 400, ext) is False
     assert is_comment_complete_full(380, 400, ext) is True
+
+
+def test_stale_resume_reached_end_self_heals_without_db_write():
+    """存量死循环帖：只有 page 级 resume（已翻到底、无待续楼中楼），没写标记。
+
+    声明 2166 / 已抓 1424 = 65.7%，若没有只读自愈会每轮重抓同一帖并撞 461。
+    """
+    ext = {COMMENT_RESUME_KEY: {"reached_end": True, "sub_cursors": {}}}
+    assert has_fully_fetched_marker(ext) is True
+    assert is_comment_complete_full(1424, 2166, ext) is True
+
+
+def test_resume_with_open_subs_is_not_fully_fetched():
+    """还有楼中楼待续时不能按「抓全」跳过。"""
+    ext = {COMMENT_RESUME_KEY: {
+        "reached_end": True, "sub_cursors": {"root1": "cursor"}}}
+    assert has_fully_fetched_marker(ext) is False
+    assert is_comment_complete_full(1424, 2166, ext) is False
+
+
+def test_resume_not_reached_end_is_not_fully_fetched():
+    ext = {COMMENT_RESUME_KEY: {"reached_end": False, "sub_cursors": {}}}
+    assert has_fully_fetched_marker(ext) is False
+    assert has_fully_fetched_marker({}) is False
+    assert has_fully_fetched_marker(None) is False
+
+
+# ---------------------------------------------------------------------------
+# 2c. 进度回调：被风控打断也要落「抓全」标记（2026-11-12 线上死循环）
+# ---------------------------------------------------------------------------
+def test_mark_fully_on_normal_finish():
+    """正常结束且翻到 has_more=False：标记（原有行为不变）。"""
+    assert _should_mark_fully_fetched(True, {"r1": "cur"}, finished=True) is True
+    assert _should_mark_fully_fetched(True, {}, finished=True) is True
+
+
+def test_no_mark_when_not_reached_end():
+    """没翻到底（被上限截断 / 中途报错）：绝不标抓全。"""
+    assert _should_mark_fully_fetched(False, {}, finished=False) is False
+    assert _should_mark_fully_fetched(False, {}, finished=True) is False
+
+
+def test_mark_fully_on_page_end_without_open_subs():
+    """page 级已翻到底、无待续楼中楼：即便随后被 461 打断也要立刻标记。
+
+    线上元凶帖 declared=2166 / fetched=1424（65.7%）、reached_end=true、
+    sub_cursors={}，但 finished 回调因风控没走到，标记一直没落，于是每轮重抓。
+    """
+    assert _should_mark_fully_fetched(True, {}, finished=False) is True
+
+
+def test_no_mark_when_sub_comments_still_pending():
+    """还有楼中楼要翻时不能提前标抓全，否则会漏抓回复。"""
+    assert _should_mark_fully_fetched(True, {"root1": "cursor"}, finished=False) is False
+    # 待展开但游标为空（page 级登记）同样算「还没翻」
+    assert _should_mark_fully_fetched(True, {"root1": ""}, finished=False) is False
 
 
 # ---------------------------------------------------------------------------
