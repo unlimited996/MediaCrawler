@@ -38,6 +38,8 @@ class TaskOptions(BaseModel):
     enable_comments: bool = True
     enable_sub_comments: bool = False
     enable_media: bool = False
+    #: 视频贴转储到 S3 videos 桶（默认关闭：额外下载/转码会显著增加请求与 CPU）
+    enable_video: bool = False
     save_option: SaveDataOptionEnum = SaveDataOptionEnum.POSTGRES
     headless: bool = True
     cookies: str = ""

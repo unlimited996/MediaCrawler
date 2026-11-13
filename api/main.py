@@ -39,7 +39,7 @@ from .routers import (crawler_router, data_router, websocket_router, export_rout
                       config_router, story_router, discover_router, accounts_router,
                       scheduler_router, stance_tags_router, s3_backup_router,
                       recipe_router, media_router, app_config_router, life_router,
-                      emoji_assets_router)
+                      emoji_assets_router, videos_router)
 
 # Project root directory (used for running subprocesses like uv run main.py)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -290,6 +290,7 @@ app.include_router(accounts_router, prefix="/api")
 app.include_router(scheduler_router, prefix="/api")
 app.include_router(stance_tags_router, prefix="/api")
 app.include_router(s3_backup_router, prefix="/api")
+app.include_router(videos_router, prefix="/api")
 app.include_router(emoji_assets_router, prefix="/api")
 # 菜谱域（KitchenHelper）：/api/recipes、/api/media、/api/app-config
 app.include_router(recipe_router, prefix="/api")
@@ -307,7 +308,7 @@ for _prefix, _routers in (
                       config_router, websocket_router)),
     ("/library/api", (story_router, data_router, discover_router, export_router,
                    stance_tags_router, s3_backup_router, recipe_router,
-                   media_router, app_config_router)),
+                   media_router, app_config_router, videos_router)),
 ):
     for _r in _routers:
         app.include_router(_r, prefix=_prefix)

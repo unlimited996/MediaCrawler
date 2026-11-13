@@ -38,7 +38,18 @@ examples
 .env
 .env.*
 !.env.example
+**/.env
+deploy/.env
 
+# 宿主机前端产物不进镜像：最终镜像只取 Stage 1 的构建结果，
+# 且 crawler 根本不需要静态页（只有 library 复制这一份）。
+api/webui
+
+# 本机调试/临时产物
+_t_*.py
+_t_*.png
+_t_*.log
+_t_recovery/
 *.log
 logs
 tmp

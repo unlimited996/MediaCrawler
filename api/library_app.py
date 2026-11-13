@@ -28,7 +28,7 @@ from .routers import (accounts_router, app_config_router, config_router,
                       data_router, discover_router, env_router, export_router,
                       life_router, media_router, recipe_router, s3_backup_router,
                       scheduler_router, stance_tags_router, story_router,
-                      websocket_router)
+                      videos_router, websocket_router)
 from .routers.internal import router as internal_router
 from .services import boot_tasks, discovery
 from .static_mounts import mount_webui
@@ -63,6 +63,7 @@ app.include_router(discover_router, prefix=API_PREFIX)
 app.include_router(export_router, prefix=API_PREFIX)
 app.include_router(stance_tags_router, prefix=API_PREFIX)
 app.include_router(s3_backup_router, prefix=API_PREFIX)
+app.include_router(videos_router, prefix=API_PREFIX)
 app.include_router(emoji_assets_router, prefix=API_PREFIX)
 app.include_router(recipe_router, prefix=API_PREFIX)
 app.include_router(media_router, prefix=API_PREFIX)

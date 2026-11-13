@@ -1683,6 +1683,28 @@ async def sync_content_to_v2(platform_code: str, item: Dict[str, Any]) -> bool:
                          "comment_count": chapter.comment_count},
                         source=str(item.get("crawl_source") or "crawl"))
 
+            # 视频贴转储登记：开关打开时只写一行 pending，不在抓取进程里
+            # 下载/转码（不阻塞抓取、不给 crawler 容器增加 ffmpeg 依赖）。
+            # 旁路能力：登记失败只告警，绝不中断内容主写。
+            if (platform_code == "xhs"
+                    and getattr(config, "ENABLE_VIDEO_BACKUP", False)
+                    and str(item.get("type") or "") == "video"):
+                try:
+                    raw_video = str(_pick(item, ("video_url",)) or "")
+                    candidates = [u.strip() for u in raw_video.split(",") if u.strip()]
+                    if candidates:
+                        from tools.video_store import enqueue_video
+
+                        await enqueue_video(
+                            session, platform=platform_code,
+                            content_id=content_id,
+                            source_url=candidates[0],
+                            backup_urls=candidates[1:],
+                            story_id=story.id if story is not None else None)
+                except Exception as e:
+                    utils.logger.warning(
+                        f"[v2_sync] 视频登记失败 {platform_code}/{content_id}: {e}")
+
             await session.commit()
             return True
     except Exception as e:  # v2 是衍生数据，失败不影响 v1 主写

@@ -24,6 +24,7 @@ def _normalize_options(opts: Dict[str, Any]) -> Dict[str, Any]:
         "enable_comments": bool(opts.get("enable_comments", True)),
         "enable_sub_comments": bool(opts.get("enable_sub_comments", False)),
         "enable_media": bool(opts.get("enable_media", False)),
+        "enable_video": bool(opts.get("enable_video", False)),
         "save_option": getattr(opts.get("save_option"), "value", opts.get("save_option")),
         "headless": bool(opts.get("headless", True)),
         "cookies": opts.get("cookies") or "",

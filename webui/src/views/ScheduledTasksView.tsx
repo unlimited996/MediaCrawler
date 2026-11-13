@@ -84,6 +84,7 @@ const EMPTY_FORM: ScheduledTaskPayload = {
     enable_comments: true,
     enable_sub_comments: false,
     enable_media: false,
+    enable_video: false,
     save_option: 'postgres',
     headless: true,
     cookies: '',
@@ -577,6 +578,12 @@ export function ScheduledTasksView() {
                 <label className="flex items-center gap-1.5 text-[11px] font-mono text-cyber-text-secondary cursor-pointer">
                   <Checkbox checked={form.options.enable_media} onCheckedChange={(v) => setOpt('enable_media', !!v)} />
                   {t('field.enableMedia')}
+                </label>
+              </div>
+              <div className="flex items-end gap-3 pb-1">
+                <label className="flex items-center gap-1.5 text-[11px] font-mono text-cyber-text-secondary cursor-pointer">
+                  <Checkbox checked={form.options.enable_video ?? false} onCheckedChange={(v) => setOpt('enable_video', !!v)} />
+                  {t('field.enableVideo')}
                 </label>
               </div>
               <div className="flex items-end gap-3 pb-1">

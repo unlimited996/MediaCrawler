@@ -168,6 +168,9 @@ MAX_CONCURRENCY_NUM = _env_int("MAX_CONCURRENCY_NUM", 1)
 # 支持的平台：xhs / dy / ks / bili / wb（tieba、zhihu 的数据结构中没有媒体字段，不支持）。
 # 命令行开关：--get_media
 ENABLE_GET_MEDIA = False
+#: 定时任务专属：视频贴转储到 S3 videos 桶。默认关闭，仅由
+#: build_crawler_env 按任务选项 enable_video 注入环境变量开启。
+ENABLE_VIDEO_BACKUP = _env_bool("ENABLE_VIDEO_BACKUP", False)
 
 # Whether to enable comment crawling mode. Comment crawling is enabled by default.
 ENABLE_GET_COMMENTS = True

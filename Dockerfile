@@ -134,7 +134,7 @@ FROM base-runtime AS runtime
 # --retries/--timeout：弱网下大轮子会被掐断连接，默认重试 5 次不够，这里放宽。
 # 装完清掉运行时用不到的测试代码/类型存根/字节码（镜像 ENV 已设
 # PYTHONDONTWRITEBYTECODE=1，不会再生成 pyc），纯省体积、不影响功能。
-COPY requirements-core.txt requirements-crawler.txt ./
+COPY requirements-core.txt ./
 ARG PIP_INDEX_URL=
 RUN PIP_ARGS="--no-cache-dir --retries 10 --timeout 120"; \
     if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS -i $PIP_INDEX_URL"; fi; \
@@ -212,22 +212,68 @@ RUN if [ -n "$PLAYWRIGHT_DOWNLOAD_HOST" ]; then export PLAYWRIGHT_DOWNLOAD_HOST;
 
 
 # -----------------------------------------------------------------------------
-# Stage 6：两条「应用层」分支 —— 只放源码与运行目录，
-# 保证改代码时只重建这几层，apt/pip 缓存仍然命中。
+# Stage 6：共享源码层（scratch，不含任何依赖/构建产物）
+#
+# 以前两个 app stage 各自 `COPY . /app`：同一份源码被打进两张镜像，还顺带
+# 带上 webui/ 源码、宿主机 api/webui 产物、deploy/、临时脚本等运行用不到的东西。
+# 现在只 COPY 运行时真正需要的 Python 包与入口文件，两个 app stage 都从这一层
+# 取，源码在 registry 里只存一份；前端产物只给 library（crawler 不提供静态页）。
 # -----------------------------------------------------------------------------
+FROM scratch AS app-source
+
+# 注意：COPY 多源只会把各目录的**内容**平铺进目标，不会保留目录名，
+# 所以运行时包必须逐条 COPY（不能写成 `COPY a b c /app/`）。
+COPY account /app/account
+COPY api /app/api
+COPY base /app/base
+COPY cache /app/cache
+COPY cmd_arg /app/cmd_arg
+COPY config /app/config
+COPY constant /app/constant
+COPY database /app/database
+COPY discovery /app/discovery
+COPY exporters /app/exporters
+COPY libs /app/libs
+COPY media_downloader /app/media_downloader
+COPY media_platform /app/media_platform
+COPY model /app/model
+COPY proxy /app/proxy
+COPY signer /app/signer
+COPY skills /app/skills
+COPY store /app/store
+COPY tools /app/tools
+COPY main.py worker.py var.py docker-entrypoint.sh pyproject.toml \
+     requirements-core.txt requirements-crawler.txt /app/
+
+
 FROM runtime AS app-library
 
-# 运行目录
-#   /app/logs          -> 应用日志（worker.out.log / scheduler_live.jsonl）
-#   /app/data          -> 抓取产物
-#   /app/browser_data  -> 浏览器登录态（必须持久化，否则每起重扫码）
-#   /app/database      -> sqlite / 导出
-#   /app/deploy        -> 外部挂进来的环境变量文件目录
-COPY . /app
+# 视频转储要统一转 H.264/AAC MP4：ffmpeg/ffprobe 只装在 library 最终层。
+# 视频下载/转码/上传都由 library 的后台批处理完成，crawler 只登记 pending，
+# 所以 crawler 镜像不需要 ffmpeg —— 避免两份镜像各自背一套编解码依赖。
+ARG APT_MIRROR=deb.debian.org
+RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+        sed -i "s|http://deb.debian.org|http://${APT_MIRROR}|g" \
+            /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+        sed -i "s|http://deb.debian.org|http://${APT_MIRROR}|g" \
+            /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
+              /usr/share/doc/* /usr/share/man/* /usr/share/info/* \
+              /usr/share/locale/* /tmp/*
 
-# 前端产物：用 Stage 1 的产物覆盖，保证镜像自包含
-# （SKIP_WEBUI_BUILD=1 时 Stage 1 是空目录，COPY 合并而非清空，宿主机产物仍生效）
+COPY --from=app-source /app/ /app/
+# 前端产物：唯一需要静态页的镜像
 COPY --from=webui-builder /app/api/webui/ /app/api/webui/
+
+# recipe_router 的 UploadFile 路由需要 python-multipart。刻意放最终层安装：
+# 改 requirements-core.txt 会让 pip / Playwright 浏览器层全部缓存失效（浏览器
+# 125MB 要重下），而 library 是唯一 include recipe_router 的部署目标；crawler
+# 不需要这个依赖，也就不装。
+RUN pip install --no-cache-dir "python-multipart>=0.0.9" \
+    && rm -rf /root/.cache /tmp/*
 
 RUN mkdir -p /app/data /app/browser_data /app/database /app/logs /app/deploy \
     && chmod +x /app/docker-entrypoint.sh
@@ -237,8 +283,7 @@ ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
 FROM browser-runtime AS app-browser
 
-COPY . /app
-COPY --from=webui-builder /app/api/webui/ /app/api/webui/
+COPY --from=app-source /app/ /app/
 
 RUN mkdir -p /app/data /app/browser_data /app/database /app/logs /app/deploy \
     && chmod +x /app/docker-entrypoint.sh
@@ -298,6 +343,10 @@ CMD ["uvicorn", "api.library_app:app", "--host", "0.0.0.0", "--port", "8081", \
 # 目标 3：一体化（旧行为；放在最后 = `docker build .` 的默认目标）
 # -----------------------------------------------------------------------------
 FROM app-browser AS all
+
+# 单体入口同样 include recipe_router（含 UploadFile），补同一依赖
+RUN pip install --no-cache-dir "python-multipart>=0.0.9" \
+    && rm -rf /root/.cache /tmp/*
 
 ENV APP_ROLE=all \
     SERVICE_NAME=mediacrawler-all \

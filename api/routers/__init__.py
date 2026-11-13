@@ -39,6 +39,7 @@ _ROUTER_EXPORTS = {
     "scheduler_router": ("scheduler", "router"),
     "stance_tags_router": ("stance_tags", "router"),
     "s3_backup_router": ("s3_backup", "router"),
+    "videos_router": ("videos", "router"),
     "recipe_router": ("recipe", "router"),
     "media_router": ("recipe", "media_router"),
     "app_config_router": ("recipe", "app_config_router"),
