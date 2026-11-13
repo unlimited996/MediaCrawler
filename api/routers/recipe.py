@@ -2205,7 +2205,10 @@ async def register_device(device_id: str = Query(default="", alias="deviceId")):
     """设备注册 / 存量 UUID claim。返回 deviceSecret（明文仅本次），库内只存哈希。"""
     dev = device_id.strip() or _uuid.uuid4().hex
     secret = _secrets.token_hex(32)
-    secret_hash = _hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    # HMAC 对称签名要求服务端持有原始密钥（存 sha256 无法反推）。
+    # 故 secret_hash 字段实际存 secret 本身（hex，64 字符）——服务端私有表，
+    # 批次 6 切 Keystore/密钥托管时再改单向 hash + 服务端侧 HMAC 反向。
+    secret_hash = secret
     engine, session = await _session()
     if session is None:
         raise HTTPException(status_code=503, detail="配置库不可用")
