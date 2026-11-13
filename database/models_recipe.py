@@ -649,6 +649,36 @@ class UserIngredient(BaseRecipe, TimestampMixin):
     )
 
 
+# ---------------------------------------------------------------------------
+# 23. 会员兑换台账（ENTITLEMENT 批次 6：柴豆兑换临时会员）
+# ---------------------------------------------------------------------------
+class MembershipGrant(BaseRecipe, TimestampMixin):
+    """一次柴豆兑换的会员权益记录。
+
+    权益语义：兑换后该设备在 start_at..expire_at 期间权益按满级（Lv5）计算，
+    成长值/柴豆照常积累；过期自动回落到 points 对应的等级权益。
+    叠加兑换 = 现行 grant 的 expire_at 顺延。以最新一条 active 记录为准。
+    """
+
+    __tablename__ = "membership_grant"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False)
+    sku = Column(String(16), nullable=False)
+    days = Column(SmallInteger, nullable=False)
+    cost_coins = Column(SmallInteger, nullable=False)
+    order_id = Column(String(64), nullable=False)
+    start_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expire_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("days > 0 AND cost_coins > 0", name="ck_grant_positive"),
+        UniqueConstraint("device_id", "order_id", name="uq_grant_order"),
+        Index("idx_grant_device", "device_id", "expire_at"),
+        {"schema": SCHEMA},
+    )
+
+
 #: 建表/校验时按依赖顺序使用
 ALL_TABLES = (
     RecipeCategory, RecipeTag, Recipe, RecipeIngredient, RecipeStep,
@@ -667,4 +697,6 @@ ALL_TABLES = (
     DeviceCredential, GrowthEvent, MembershipState,
     # v4.4：自定义食材台账（ENTITLEMENT 批次 5）
     UserIngredient,
+    # v4.5：会员兑换台账（ENTITLEMENT 批次 6）
+    MembershipGrant,
 )

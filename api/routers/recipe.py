@@ -38,6 +38,7 @@ import json
 import re
 import secrets
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from zoneinfo import ZoneInfo
@@ -55,7 +56,7 @@ from database.models_recipe import (
     RecipeCategory, RecipeFeedback, RecipeIngredient, RecipeNote, RecipeStep,
     RecipeTag, RecipeTagLink, ShoppingCheck, TablePlanRecord, TakeoutSpot,
     CollabMember, CollabRoom, CollabVote, FeedbackEntry, OcrUsage, UserProfile,
-    DeviceCredential, GrowthEvent, MembershipState,
+    DeviceCredential, GrowthEvent, MembershipState, MembershipGrant,
 )
 from .story import _session
 
@@ -2041,7 +2042,7 @@ async def ocr_receipt(
         raise HTTPException(status_code=413, detail={"code": "FILE_TOO_LARGE",
                                                      "message": "图片需 ≤8MB"})
 
-    # ---- 配额检查（批次 1：Lv1=3/日） ----
+    # ---- 配额检查（ENTITLEMENT 批次 6：按有效等级；会员期=满级 10 次/日） ----
     engine, session = await _session()
     if session is None:
         raise HTTPException(status_code=503, detail="配置库不可用")
@@ -2051,10 +2052,13 @@ async def ocr_receipt(
             select(OcrUsage).where(OcrUsage.device_id == device_id,
                                    OcrUsage.used_on == today))).scalar_one_or_none()
         used = row.used_count if row else 0
-        if used >= OCR_DAILY_LIMIT:
+        effective_level, _, _ = await _effective_level(session, device_id)
+        limit = MEMBER_OCR_DAILY_LIMIT if effective_level >= MEMBERSHIP_FULL_LEVEL \
+            else membership_entitlements(effective_level, used)["ocrDailyLimit"]
+        if used >= limit:
             raise HTTPException(status_code=429, detail={
                 "code": "OCR_QUOTA_EXCEEDED",
-                "usedToday": used, "limit": OCR_DAILY_LIMIT,
+                "usedToday": used, "limit": limit,
                 "message": "今日识别次数已用完，升级会员解锁更多次数"})
 
         # ---- 转发供应商（失败不扣次数） ----
@@ -2073,7 +2077,7 @@ async def ocr_receipt(
         await session.commit()
 
         lines = [parsed for line in raw_lines if (parsed := _parse_receipt_line(line))]
-        return {"lines": lines, "usedToday": used_today, "limit": OCR_DAILY_LIMIT}
+        return {"lines": lines, "usedToday": used_today, "limit": limit}
     finally:
         await session.close()
         await engine.dispose()
@@ -2271,6 +2275,25 @@ def membership_entitlements(level: int, ocr_used_today: int) -> Dict[str, Any]:
 async def _growth_award(session: AsyncSession, device_id: str, event_type: str,
                         ref_id: str, points: int, coins: int) -> bool:
     """写流水并累计到汇总。UNIQUE 幂等：同键已存在则不加分，返回 False。"""
+    if not await _growth_log_only(session, device_id, event_type, ref_id, points, coins):
+        return False
+    state = (await session.execute(
+        select(MembershipState).where(MembershipState.device_id == device_id))).scalar_one_or_none()
+    if state is None:
+        session.add(MembershipState(device_id=device_id, points=points, coins=coins))
+    else:
+        state.points = state.points + points
+        state.coins = state.coins + coins
+    return True
+
+
+async def _growth_log_only(session: AsyncSession, device_id: str, event_type: str,
+                           ref_id: str, points: int, coins: int) -> bool:
+    """只写 growth_event 流水，不动 membership_state 汇总。
+
+    用于汇总已通过其他途径修改的场景（如柴豆兑换的条件更新扣减）。
+    UNIQUE 幂等：同键已存在则不写，返回 False。
+    """
     exists = (await session.execute(
         select(GrowthEvent.id).where(
             GrowthEvent.device_id == device_id,
@@ -2280,13 +2303,6 @@ async def _growth_award(session: AsyncSession, device_id: str, event_type: str,
         return False
     session.add(GrowthEvent(device_id=device_id, event_type=event_type,
                             ref_id=ref_id, points=points, coins=coins))
-    state = (await session.execute(
-        select(MembershipState).where(MembershipState.device_id == device_id))).scalar_one_or_none()
-    if state is None:
-        session.add(MembershipState(device_id=device_id, points=points, coins=coins))
-    else:
-        state.points = state.points + points
-        state.coins = state.coins + coins
     return True
 
 
@@ -2307,7 +2323,13 @@ async def get_membership(device_id: str = Query(..., alias="deviceId")):
                 OcrUsage.device_id == device_id,
                 OcrUsage.used_on == _ocr_today()))).scalar_one_or_none()
         used = usage or 0
+        # ENTITLEMENT 批次 6：会员期权益按满级算（原等级不影响成长积累）
+        effective_level, base_level, grant = await _effective_level(session, device_id)
         gaps = [p for p in MEMBERSHIP_LEVEL_POINTS if p > points]
+        member = {
+            "active": grant is not None,
+            "until": grant.expire_at.isoformat() if grant else None,
+        }
         return {
             "deviceId": device_id,
             "points": points,
@@ -2315,7 +2337,8 @@ async def get_membership(device_id: str = Query(..., alias="deviceId")):
             "level": level,
             "title": MEMBERSHIP_TITLES[level - 1],
             "nextLevelGap": (gaps[0] - points) if gaps else None,
-            "entitlements": membership_entitlements(level, used),
+            "member": member,
+            "entitlements": membership_entitlements(effective_level, used),
         }
     finally:
         await session.close()
@@ -2381,15 +2404,13 @@ async def create_fridge_ingredient(payload: Dict[str, Any] = Body(default={})):
             raise HTTPException(status_code=409, detail={
                 "code": "INGREDIENT_DUPLICATE", "message": "这个食材已经有了"})
 
-        # 配额：服务端 COUNT vs entitlements（等级×10）
+        # 配额：服务端 COUNT vs 有效等级（ENTITLEMENT 批次 6：会员期按满级 50）
         used = (await session.execute(
             select(func.count()).select_from(UserIngredient).where(
                 UserIngredient.device_id == device_id))).scalar() or 0
-        state = (await session.execute(
-            select(MembershipState).where(
-                MembershipState.device_id == device_id))).scalar_one_or_none()
-        points = state.points if state else 0
-        limit = membership_level_of(points) * 10
+        effective_level, _, _ = await _effective_level(session, device_id)
+        limit = MEMBER_INGREDIENT_LIMIT if effective_level >= MEMBERSHIP_FULL_LEVEL \
+            else effective_level * 10
         if used >= limit:
             raise HTTPException(status_code=402, detail={
                 "code": "INGREDIENT_QUOTA_EXCEEDED",
@@ -2422,6 +2443,137 @@ async def delete_fridge_ingredient(ing_id: int,
         if not res.rowcount:
             raise HTTPException(status_code=404, detail="食材不存在")
         return {"success": True, "deleted": ing_id}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+# ===========================================================================
+# 柴豆兑换临时会员（ENTITLEMENT 批次 6）
+#
+# 权益语义（用户确认）：兑换后权益临时按满级（Lv5）计算——食材上限 50、
+# OCR 每日 10 次；成长值/柴豆照常积累（流水不受影响）；expire_at 过期后
+# 自动回落到 points 对应的等级权益。叠加兑换 = 现行有效期顺延。
+# 扣减用条件更新（coins >= cost）防并发透支；余额与流水全部服务端。
+# ===========================================================================
+
+from datetime import timedelta as _td
+
+#: 会员兑换档位（1日~1年）；价格与天数后续可迁 app_config 下发
+MEMBERSHIP_SKUS = [
+    {"sku": "vip_1d",   "days": 1,   "cost": 10,   "label": "1日会员"},
+    {"sku": "vip_3d",   "days": 3,   "cost": 25,   "label": "3日会员"},
+    {"sku": "vip_7d",   "days": 7,   "cost": 50,   "label": "7日会员"},
+    {"sku": "vip_30d",  "days": 30,  "cost": 150,  "label": "30日会员"},
+    {"sku": "vip_90d",  "days": 90,  "cost": 380,  "label": "90日会员"},
+    {"sku": "vip_180d", "days": 180, "cost": 660,  "label": "180日会员"},
+    {"sku": "vip_365d", "days": 365, "cost": 1200, "label": "365日会员"},
+]
+MEMBERSHIP_FULL_LEVEL = 5
+#: 会员期权益（满级口径；与 membership_entitlements(5) 的档位保持一致）
+MEMBER_OCR_DAILY_LIMIT = 10
+MEMBER_INGREDIENT_LIMIT = 50
+
+
+def _sku_by_id(sku: str):
+    return next((s for s in MEMBERSHIP_SKUS if s["sku"] == sku), None)
+
+
+async def _active_grant(session: AsyncSession, device_id: str) -> Optional[MembershipGrant]:
+    """现行会员记录（expire_at > now()，取最新一条）。"""
+    now_utc = datetime.now(tz=timezone.utc)
+    row = (await session.execute(
+        select(MembershipGrant)
+        .where(MembershipGrant.device_id == device_id,
+               MembershipGrant.expire_at > now_utc)
+        .order_by(MembershipGrant.expire_at.desc())
+        .limit(1))).scalar_one_or_none()
+    return row
+
+
+async def _effective_level(session: AsyncSession, device_id: str) -> tuple:
+    """返回（有效等级, 基础等级, grant）。会员期有效等级=5（满级）。"""
+    state = (await session.execute(
+        select(MembershipState).where(
+            MembershipState.device_id == device_id))).scalar_one_or_none()
+    points = state.points if state else 0
+    base = membership_level_of(points)
+    grant = await _active_grant(session, device_id)
+    effective = MEMBERSHIP_FULL_LEVEL if grant else base
+    return effective, base, grant
+
+
+@life_router.get("/membership/skus")
+async def list_membership_skus():
+    return {"items": [
+        {"sku": s["sku"], "days": s["days"], "costCoins": s["cost"],
+         "label": s["label"]} for s in MEMBERSHIP_SKUS]}
+
+
+@life_router.post("/membership/coins/spend")
+async def spend_coins_for_membership(payload: Dict[str, Any] = Body(default={})):
+    """柴豆兑换会员。条件更新防透支；流水记账；叠加兑换顺延 expire_at。"""
+    device_id = (payload.get("deviceId") or "").strip()
+    sku = (payload.get("sku") or "").strip()
+    if not device_id or not sku:
+        raise HTTPException(status_code=400, detail="deviceId / sku 必填")
+    item = _sku_by_id(sku)
+    if item is None:
+        raise HTTPException(status_code=400, detail=f"未知档位：{sku}")
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        order_id = uuid.uuid4().hex
+        now_utc = datetime.now(tz=timezone.utc)
+
+        # 1) 余额检查（给可读错误；真正扣减靠条件更新）
+        state = (await session.execute(
+            select(MembershipState).where(
+                MembershipState.device_id == device_id))).scalar_one_or_none()
+        coins = state.coins if state else 0
+        if coins < item["cost"]:
+            raise HTTPException(status_code=402, detail={
+                "code": "COINS_INSUFFICIENT",
+                "coins": coins, "cost": item["cost"],
+                "message": f"柴豆不够：当前 {coins}，需 {item['cost']}（记食、做熟新菜可攒柴豆）"})
+
+        # 2) 条件更新扣减（防并发透支）：失败 = 余额被并发花掉
+        res = await session.execute(
+            text(f'UPDATE "{SCHEMA}".membership_state SET coins = coins - :c, '
+                 f'updated_at = now() '
+                 f'WHERE device_id = :d AND coins >= :c'),
+            {"c": item["cost"], "d": device_id})
+        if not res.rowcount:
+            raise HTTPException(status_code=409, detail={
+                "code": "COINS_RACE", "message": "余额变化了，刷新后再试"})
+
+        # 3) 流水（growth_event 幂等：同 order 只记一次；汇总已由步骤 2 的
+        #    条件更新扣减，此处只记账，避免双重扣减）
+        if await _growth_log_only(session, device_id, "coins_spend",
+                                  order_id, 0, -item["cost"]):
+            # 4) 兑换台账：有现行会员则顺延，否则从现在起算
+            grant = await _active_grant(session, device_id)
+            if grant is not None:
+                grant.expire_at = grant.expire_at + _td(days=item["days"])
+                new_grant = grant
+            else:
+                new_grant = MembershipGrant(
+                    device_id=device_id, sku=item["sku"], days=item["days"],
+                    cost_coins=item["cost"], order_id=order_id,
+                    start_at=now_utc,
+                    expire_at=now_utc + _td(days=item["days"]))
+                session.add(new_grant)
+            await session.commit()
+            return {
+                "ok": True, "sku": item["sku"], "label": item["label"],
+                "days": item["days"], "cost": item["cost"],
+                "coinsLeft": max(0, coins - item["cost"]),
+                "memberUntil": new_grant.expire_at.isoformat(),
+            }
+        raise HTTPException(status_code=409, detail={
+            "code": "IDEMPOTENT_CONFLICT", "message": "重复提交"})
     finally:
         await session.close()
         await engine.dispose()
