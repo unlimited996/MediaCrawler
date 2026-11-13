@@ -552,6 +552,81 @@ class FeedbackEntry(BaseRecipe, TimestampMixin):
     )
 
 
+# ---------------------------------------------------------------------------
+# 18. OCR 每日用量（服务端配额，自然日=Asia/Shanghai）
+# ---------------------------------------------------------------------------
+class OcrUsage(BaseRecipe):
+    """小票 OCR 的按日用量（服务端配额记账）。
+
+    used_on 是东八区自然日；同一设备同一天一行，UPSERT 计数。
+    客户端清 App 数据不再能重置次数（ENTITLEMENT R6）。
+    """
+
+    __tablename__ = "ocr_usage"
+
+    device_id = Column(String(64), primary_key=True)
+    used_on = Column(Date, primary_key=True)
+    used_count = Column(SmallInteger, nullable=False, server_default="0")
+
+
+# ---------------------------------------------------------------------------
+# 19. 设备凭证（ENTITLEMENT 批次 2：HMAC 签名鉴权）
+# ---------------------------------------------------------------------------
+class DeviceCredential(BaseRecipe, TimestampMixin):
+    """deviceId → secret 哈希。secret 明文只在注册响应里出现一次，库内只存 SHA-256。
+
+    支持存量 UUID claim：老 App 的 deviceId 不变，只补绑 secret（零破坏迁移）。
+    """
+
+    __tablename__ = "device_credential"
+
+    device_id = Column(String(64), primary_key=True)
+    secret_hash = Column(String(64), nullable=False)
+    revoked = Column(Boolean, nullable=False, server_default="false")
+
+
+# ---------------------------------------------------------------------------
+# 20. 成长值/柴豆流水（ENTITLEMENT 批次 3：所有权益变动的唯一事实来源）
+# ---------------------------------------------------------------------------
+class GrowthEvent(BaseRecipe):
+    """一条发分流水。UNIQUE(device_id, event_type, ref_id) 幂等：
+    meal_logged 按 clientLogId 去重（防重放刷分）；
+    recipe_cooked 按 recipeId 去重（同菜二次记食不再 +5）。
+    """
+
+    __tablename__ = "growth_event"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False)
+    event_type = Column(String(16), nullable=False)
+    ref_id = Column(String(120), nullable=False)
+    points = Column(SmallInteger, nullable=False, server_default="0")
+    coins = Column(SmallInteger, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('meal_logged','recipe_cooked','coins_spend','admin_adjust')",
+            name="ck_growth_event_type"),
+        UniqueConstraint("device_id", "event_type", "ref_id", name="uq_growth_event_ref"),
+        Index("idx_growth_event_device", "device_id", "created_at"),
+        {"schema": SCHEMA},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 21. 会员汇总快照（ENTITLEMENT 批次 3：读放大优化，可由流水重建）
+# ---------------------------------------------------------------------------
+class MembershipState(BaseRecipe, TimestampMixin):
+    """成长值/柴豆汇总。以流水为唯一事实来源，此处只是缓存的汇总。"""
+
+    __tablename__ = "membership_state"
+
+    device_id = Column(String(64), primary_key=True)
+    points = Column(Integer, nullable=False, server_default="0")
+    coins = Column(Integer, nullable=False, server_default="0")
+
+
 #: 建表/校验时按依赖顺序使用
 ALL_TABLES = (
     RecipeCategory, RecipeTag, Recipe, RecipeIngredient, RecipeStep,
@@ -564,4 +639,8 @@ ALL_TABLES = (
     UserProfile, CollabRoom, CollabMember, CollabVote,
     # v4.1：反馈（提交 / 我的反馈）
     FeedbackEntry,
+    # v4.2：服务端配额记账（OCR 每日次数）
+    OcrUsage,
+    # v4.3：设备凭证 + 成长值流水/汇总（ENTITLEMENT 批次 2/3）
+    DeviceCredential, GrowthEvent, MembershipState,
 )

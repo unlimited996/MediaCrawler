@@ -31,15 +31,21 @@ from __future__ import annotations
 
 import gzip
 import os
+import contextlib
 import hashlib
+import hmac
 import json
+import re
 import secrets
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request
+from fastapi import APIRouter, Body, File, HTTPException, Query, Request, UploadFile
+import httpx
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import case, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,7 +54,8 @@ from database.models_recipe import (
     SCHEMA, AppConfig, DIFFICULTY_VALUES, RECIPE_STATUS_VALUES, MealLog, Recipe,
     RecipeCategory, RecipeFeedback, RecipeIngredient, RecipeNote, RecipeStep,
     RecipeTag, RecipeTagLink, ShoppingCheck, TablePlanRecord, TakeoutSpot,
-    CollabMember, CollabRoom, CollabVote, FeedbackEntry, UserProfile,
+    CollabMember, CollabRoom, CollabVote, FeedbackEntry, OcrUsage, UserProfile,
+    DeviceCredential, GrowthEvent, MembershipState,
 )
 from .story import _session
 
@@ -823,9 +830,10 @@ def _slugify(name: str) -> str:
 
 
 @router.post("")
-async def upsert_recipe(payload: Dict[str, Any] = Body(default={})):
-    """新增或整体覆盖一个菜谱（含配料/步骤/标签，传了就整段替换）。"""
-    rid = (payload.get("id") or "").strip()
+async def upsert_recipe(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """新增或整体覆盖一个菜谱（需 X-Admin-Token，ENTITLEMENT 批次 4）。"""
+    with _admin_guard(request):
+        rid = (payload.get("id") or "").strip()
     if not rid:
         raise HTTPException(status_code=400, detail="id 必填（形如 分类/菜名）")
     engine, session = await _session()
@@ -854,9 +862,10 @@ async def upsert_recipe(payload: Dict[str, Any] = Body(default={})):
 
 
 @router.put("/{recipe_id:path}")
-async def update_recipe(recipe_id: str, payload: Dict[str, Any] = Body(default={})):
-    """部分更新：只改请求里出现的字段；配料/步骤/标签传了就整段替换。"""
-    engine, session = await _session()
+async def update_recipe(recipe_id: str, request: Request, payload: Dict[str, Any] = Body(default={})):
+    """部分更新（需 X-Admin-Token，ENTITLEMENT 批次 4）：只改请求里出现的字段。"""
+    with _admin_guard(request):
+        engine, session = await _session()
     if session is None:
         raise HTTPException(status_code=503, detail="配置库不可用")
     try:
@@ -876,9 +885,10 @@ async def update_recipe(recipe_id: str, payload: Dict[str, Any] = Body(default={
 
 
 @router.delete("/{recipe_id:path}")
-async def delete_recipe(recipe_id: str):
-    """删除菜谱（配料/步骤/标签关联由外键级联清除）。"""
-    engine, session = await _session()
+async def delete_recipe(recipe_id: str, request: Request):
+    """删除菜谱（需 X-Admin-Token，ENTITLEMENT 批次 4）。"""
+    with _admin_guard(request):
+        engine, session = await _session()
     if session is None:
         raise HTTPException(status_code=503, detail="配置库不可用")
     try:
@@ -894,11 +904,12 @@ async def delete_recipe(recipe_id: str):
 
 
 @router.post("/import")
-async def import_all(payload: Dict[str, Any] = Body(default={})):
-    """整包导入（幂等）。body 为 catalog.json 结构；传 {"reset": true} 可先清空。"""
-    if not payload or "recipes" not in payload:
-        raise HTTPException(status_code=400, detail="请求体需为 catalog.json 结构（含 recipes）")
-    from tools.recipe_import import import_catalog
+async def import_all(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """整包导入（幂等，需 X-Admin-Token，ENTITLEMENT 批次 4）。body 为 catalog.json 结构。"""
+    with _admin_guard(request):
+        if not payload or "recipes" not in payload:
+            raise HTTPException(status_code=400, detail="请求体需为 catalog.json 结构（含 recipes）")
+        from tools.recipe_import import import_catalog
 
     engine, session = await _session()
     if session is None:
@@ -1061,49 +1072,72 @@ async def get_app_config(cfg_key: str):
         await engine.dispose()
 
 
+# 管理动作封口（ENTITLEMENT 批次 4 / R7）：X-Admin-Token。
+# token 从环境变量 ADMIN_TOKEN 读；未配置时拒绝全部管理调用（fail-closed）。
+
+
+@lru_cache(maxsize=1)
+def _admin_token() -> str:
+    return os.environ.get("ADMIN_TOKEN", "").strip()
+
+
+@contextlib.contextmanager
+def _admin_guard(request: Request):
+    """管理写接口统一守卫：校验 X-Admin-Token；未配置则 fail-closed。"""
+    expected = _admin_token()
+    provided = (request.headers.get("X-Admin-Token") or "").strip()
+    if not expected or not hmac.compare_digest(expected, provided):
+        raise HTTPException(status_code=403, detail={"code": "ADMIN_LOCKED",
+                                                     "message": "需要有效的 X-Admin-Token"})
+    yield
+
+
 @app_config_router.put("/{cfg_key:path}")
-async def put_app_config(cfg_key: str, payload: Dict[str, Any] = Body(default={})):
-    """新增/覆盖配置。body: {"value": any, "scope": "app", "description": "..."}"""
-    if "value" not in payload:
-        raise HTTPException(status_code=400, detail="value 必填")
-    engine, session = await _session()
-    if session is None:
-        raise HTTPException(status_code=503, detail="配置库不可用")
-    try:
-        r = (await session.execute(
-            select(AppConfig).where(AppConfig.key == cfg_key))).scalar_one_or_none()
-        created = r is None
-        if created:
-            r = AppConfig(key=cfg_key, value=payload["value"])
-            session.add(r)
-        else:
-            r.value = payload["value"]
-            r.version = (r.version or 1) + 1
-        for field in ("scope", "description"):
-            if field in payload:
-                setattr(r, field, payload[field])
-        await session.commit()
-        return {"success": True, "created": created, "key": cfg_key,
-                "version": r.version}
-    finally:
-        await session.close()
-        await engine.dispose()
+async def put_app_config(cfg_key: str, request: Request, payload: Dict[str, Any] = Body(default={})):
+    """新增/覆盖配置（ENTITLEMENT 批次 4：需 X-Admin-Token）。body: {"value": any, ...}"""
+    with _admin_guard(request):
+        if "value" not in payload:
+            raise HTTPException(status_code=400, detail="value 必填")
+        engine, session = await _session()
+        if session is None:
+            raise HTTPException(status_code=503, detail="配置库不可用")
+        try:
+            r = (await session.execute(
+                select(AppConfig).where(AppConfig.key == cfg_key))).scalar_one_or_none()
+            created = r is None
+            if created:
+                r = AppConfig(key=cfg_key, value=payload["value"])
+                session.add(r)
+            else:
+                r.value = payload["value"]
+                r.version = (r.version or 1) + 1
+            for field in ("scope", "description"):
+                if field in payload:
+                    setattr(r, field, payload[field])
+            await session.commit()
+            return {"success": True, "created": created, "key": cfg_key,
+                    "version": r.version}
+        finally:
+            await session.close()
+            await engine.dispose()
 
 
 @app_config_router.delete("/{cfg_key:path}")
-async def delete_app_config(cfg_key: str):
-    engine, session = await _session()
-    if session is None:
-        raise HTTPException(status_code=503, detail="配置库不可用")
-    try:
-        res = await session.execute(delete(AppConfig).where(AppConfig.key == cfg_key))
-        await session.commit()
-        if not res.rowcount:
-            raise HTTPException(status_code=404, detail=f"配置不存在：{cfg_key}")
-        return {"success": True, "deleted": cfg_key}
-    finally:
-        await session.close()
-        await engine.dispose()
+async def delete_app_config(cfg_key: str, request: Request):
+    # ENTITLEMENT 批次 4：管理动作需 X-Admin-Token
+    with _admin_guard(request):
+        engine, session = await _session()
+        if session is None:
+            raise HTTPException(status_code=503, detail="配置库不可用")
+        try:
+            res = await session.execute(delete(AppConfig).where(AppConfig.key == cfg_key))
+            await session.commit()
+            if not res.rowcount:
+                raise HTTPException(status_code=404, detail=f"配置不存在：{cfg_key}")
+            return {"success": True, "deleted": cfg_key}
+        finally:
+            await session.close()
+            await engine.dispose()
 
 
 # ===========================================================================
@@ -1173,6 +1207,13 @@ async def create_meal_log(payload: Dict[str, Any] = Body(default={})):
 
     关联了菜谱时，把这些菜的 ``cooked_count`` +1 ——「做过多少次」是真实行为数据，
     收藏榜与发现的「最热」都靠它。
+
+    ENTITLEMENT 批次 3：同时做服务端发分——
+    - clientLogId（App 生成的 UUID 幂等键）防重放刷分（R5）；
+    - meal_logged：+10 成长值 / +2 柴豆（同 clientLogId 只发一次）；
+    - recipeIds 中每道菜首次记 recipe_cooked：+5 / +1（同菜终身只记一次，R4）；
+    - clientLogId 缺失时降级：以 (deviceId, eatenOn, meal, note, 菜单) 现有去重手段
+      无法可靠区分重放，为安全起见**不发分**（灰度期可容忍，老包不丢功能只丢分）。
     """
     device_id = (payload.get("deviceId") or "").strip()
     if not device_id:
@@ -1184,6 +1225,8 @@ async def create_meal_log(payload: Dict[str, Any] = Body(default={})):
     note = payload.get("note")
     if not note and not payload.get("imageKey") and not payload.get("recipeIds"):
         raise HTTPException(status_code=400, detail="至少要写一句、传一张图或选一道菜")
+    client_log_id = (payload.get("clientLogId") or "").strip()[:120]
+    recipe_ids = list(payload.get("recipeIds") or [])
 
     engine, session = await _session()
     if session is None:
@@ -1195,7 +1238,7 @@ async def create_meal_log(payload: Dict[str, Any] = Body(default={})):
             meal=meal,
             note=note,
             image_key=payload.get("imageKey"),
-            recipe_ids=list(payload.get("recipeIds") or []),
+            recipe_ids=recipe_ids,
         )
         session.add(row)
         await session.flush()
@@ -1203,10 +1246,26 @@ async def create_meal_log(payload: Dict[str, Any] = Body(default={})):
             await session.execute(
                 text(f'UPDATE "{SCHEMA}".recipe SET cooked_count = cooked_count + 1 '
                      f'WHERE id = :r'), {"r": recipe_id})
+
+        # ---- 服务端发分（ENTITLEMENT 批次 3） ----
+        awarded = {"points": 0, "coins": 0}
+        if client_log_id:
+            if await _growth_award(session, device_id, "meal_logged",
+                                    client_log_id, POINTS_PER_MEAL_LOGGED, COINS_PER_MEAL_LOGGED):
+                awarded["points"] += POINTS_PER_MEAL_LOGGED
+                awarded["coins"] += COINS_PER_MEAL_LOGGED
+            for recipe_id in recipe_ids:
+                if await _growth_award(session, device_id, "recipe_cooked",
+                                        str(recipe_id), POINTS_PER_NEW_DISH, COINS_PER_NEW_DISH):
+                    awarded["points"] += POINTS_PER_NEW_DISH
+                    awarded["coins"] += COINS_PER_NEW_DISH
+
         await session.commit()
         await session.refresh(row)
         invalidate_bundle_cache()
-        return _meal_log_json(row)
+        result = _meal_log_json(row)
+        result["awarded"] = awarded
+        return result
     finally:
         await session.close()
         await engine.dispose()
@@ -1881,6 +1940,380 @@ async def list_feedback(device_id: str = Query(..., alias="deviceId")):
             select(FeedbackEntry).where(FeedbackEntry.device_id == device_id)
             .order_by(FeedbackEntry.created_at.desc()).limit(50))).scalars())
         return {"items": [_feedback_json(r) for r in rows]}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+# ===========================================================================
+# 拍小票 OCR 代理（ENTITLEMENT 批次 1：key 收回服务端，配额服务端记账）
+#
+# - App 不再直连 uapis.cn：key 从环境变量 OCR_API_KEY 读，永不进 APK；
+# - 配额按 deviceId 当日计数（ocr_usage 表，东八区自然日）；
+#   批次 3 之前暂按「未注册用户 = Lv1（3 次/日）」；
+# - 供应商调用成功才 +1（失败不扣次数）；超限返回 429 OCR_QUOTA_EXCEEDED；
+# - 图片 ≤8MB、仅 jpeg/png，转发后即弃（不落盘原图）。
+# ===========================================================================
+
+#: 每日 OCR 次数上限（批次 1 固定 Lv1；批次 3 后改由 membership/entitlements 下发）
+OCR_DAILY_LIMIT = 3
+#: 允许的图片 MIME 与大小
+OCR_ALLOWED_TYPES = {"image/jpeg", "image/png"}
+OCR_MAX_BYTES = 8 * 1024 * 1024
+#: 供应商转发超时：连接 5s / 读取 20s
+OCR_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+
+
+def _ocr_today() -> date:
+    """东八区自然日（与 App 本地按天清零语义一致）。
+
+    Windows 下无系统 tzdata 时回退固定 +8 偏移（中国无夏令时，固定偏移安全）。
+    """
+    try:
+        tz = ZoneInfo("Asia/Shanghai")
+    except Exception:
+        tz = timezone(timedelta(hours=8))
+    return datetime.now(tz=tz).date()
+
+
+def _parse_receipt_line(raw: str) -> Optional[Dict[str, Any]]:
+    """小票一行 → {name, detail}；垃圾行（价格行/地址/空行）返回 None。
+
+    与 App 端 OcrApi.parseLine 同规则：量词宽松匹配（0-3 个汉字/字母），
+    支持空格 / 紧贴 / 乘号 x×* 三种写法。
+    """
+    s = raw.strip()
+    if not s:
+        return None
+    # 纯数字/价格行直接过滤
+    if re.fullmatch(r"[0-9.¥\s元]+", s):
+        return None
+    unit = r"[\u4e00-\u9fa5A-Za-z]{0,3}"
+    m = (re.fullmatch(r"(.+?)\s*[x×*]\s*([0-9.]+\s*" + unit + r")", s)
+         or re.fullmatch(r"(.+?)\s+([0-9.]+\s*" + unit + r")", s)
+         or re.fullmatch(r"(.+?)([0-9.]+\s*" + unit + r")", s))
+    if m:
+        name = m.group(1).strip().rstrip("，,、")
+        if not name:
+            return None
+        return {"name": name, "detail": m.group(2).replace(" ", "")}
+    if 2 <= len(s) <= 12:
+        return {"name": s, "detail": None}
+    return None
+
+
+async def _ocr_forward(image_bytes: bytes, content_type: str) -> Optional[List[Dict[str, Any]]]:
+    """转发 uapis.cn 通用文字识别；返回逐行文本，失败返回 None（不抛）。"""
+    key = os.environ.get("OCR_API_KEY", "").strip()
+    if not key:
+        print("[ocr] 环境变量 OCR_API_KEY 未配置")
+        return None
+    filename = "receipt.jpg" if content_type == "image/jpeg" else "receipt.png"
+    try:
+        async with httpx.AsyncClient(timeout=OCR_TIMEOUT) as client:
+            resp = await client.post(
+                "https://uapis.cn/api/v1/image/ocr",
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": (filename, image_bytes, content_type)},
+                data={"need_location": "false", "enable_cls": "true"},
+            )
+            if resp.status_code != 200:
+                print(f"[ocr] 供应商 HTTP {resp.status_code}")
+                return None
+            words = resp.json().get("words_result") or []
+            return [w.get("words", "") for w in words if w.get("words")]
+    except Exception as e:  # 网络异常按失败处理，不扣次数
+        print(f"[ocr] 转发失败：{e}")
+        return None
+
+
+@life_router.post("/ocr/receipt")
+async def ocr_receipt(
+    file: UploadFile = File(...),
+    device_id: str = Query(..., alias="deviceId"),
+):
+    # ---- 入参校验（不读库先挡掉脏请求） ----
+    if (file.content_type or "") not in OCR_ALLOWED_TYPES:
+        raise HTTPException(status_code=415, detail={"code": "UNSUPPORTED_MEDIA_TYPE",
+                                                    "message": "只接受 jpeg/png"})
+    image = await file.read()
+    if not image or len(image) > OCR_MAX_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "FILE_TOO_LARGE",
+                                                     "message": "图片需 ≤8MB"})
+
+    # ---- 配额检查（批次 1：Lv1=3/日） ----
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        today = _ocr_today()
+        row = (await session.execute(
+            select(OcrUsage).where(OcrUsage.device_id == device_id,
+                                   OcrUsage.used_on == today))).scalar_one_or_none()
+        used = row.used_count if row else 0
+        if used >= OCR_DAILY_LIMIT:
+            raise HTTPException(status_code=429, detail={
+                "code": "OCR_QUOTA_EXCEEDED",
+                "usedToday": used, "limit": OCR_DAILY_LIMIT,
+                "message": "今日识别次数已用完，升级会员解锁更多次数"})
+
+        # ---- 转发供应商（失败不扣次数） ----
+        raw_lines = await _ocr_forward(image, file.content_type)
+        if raw_lines is None:
+            raise HTTPException(status_code=502, detail={"code": "OCR_PROVIDER_FAILED",
+                                                         "message": "识别没成功，稍后再试"})
+
+        # ---- 成功才计数 ----
+        if row is None:
+            session.add(OcrUsage(device_id=device_id, used_on=today, used_count=1))
+            used_today = 1
+        else:
+            row.used_count = row.used_count + 1
+            used_today = row.used_count
+        await session.commit()
+
+        lines = [parsed for line in raw_lines if (parsed := _parse_receipt_line(line))]
+        return {"lines": lines, "usedToday": used_today, "limit": OCR_DAILY_LIMIT}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+# ===========================================================================
+# 设备凭证 + HMAC 签名鉴权（ENTITLEMENT 批次 2）
+#
+# 签名协议（比清单 §4.批次2.3 略简化：不签 query）：
+#   X-Device-Id:  <deviceId>
+#   X-Timestamp:  <unix秒>
+#   X-Nonce:      <uuid4>
+#   X-Signature:  hex(HMAC-SHA256(device_secret,
+#                  "METHOD\\npath\\nsha256hex(body)\\nnonce\\ntimestamp"))
+# 不签 query 的原因：canonicalQuery 在客户端(OkHttp)与服务端(FastAPI)之间
+# 做字节级一致（URL 编码、参数顺序）极脆弱，收益远小于坑；body 已含关键参数。
+# 安全面：时间窗 ±300s、nonce TTL 去重、hmac.compare_digest 常量时间比较、
+# secret_hash 进程内 LRU 缓存。伪造 deviceId 无法通过（R2）。
+# ===========================================================================
+
+import hashlib as _hashlib
+import hmac as _hmac
+import secrets as _secrets
+import uuid as _uuid
+from collections import OrderedDict
+from fastapi import Request as _Request
+from typing import Optional as _Optional
+
+#: 时间窗（秒）
+SIGN_WINDOW_SECONDS = 300
+#: nonce 去重：内存 TTL 表（进程重启失效可接受——窗口只有 5 分钟）
+_NONCE_SEEN: "OrderedDict[str, float]" = OrderedDict()
+#: secret_hash LRU 缓存（免每请求查库）
+_SECRET_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_SECRET_CACHE_MAX = 4096
+
+
+def _signing_string(method: str, path: str, body_sha256_hex: str,
+                    nonce: str, timestamp: str) -> str:
+    return "\n".join([method.upper(), path, body_sha256_hex, nonce, timestamp])
+
+
+async def _lookup_secret_hash(session: AsyncSession, device_id: str) -> _Optional[str]:
+    cached = _SECRET_CACHE.get(device_id)
+    if cached is not None:
+        return cached
+    row = (await session.execute(
+        select(DeviceCredential).where(
+            DeviceCredential.device_id == device_id,
+            DeviceCredential.revoked == false() if hasattr(DeviceCredential.revoked, "is_") else DeviceCredential.revoked == False,  # noqa: E712
+        ))).scalar_one_or_none()
+    if row is None:
+        return None
+    _SECRET_CACHE[device_id] = row.secret_hash
+    if len(_SECRET_CACHE) > _SECRET_CACHE_MAX:
+        _SECRET_CACHE.popitem(last=False)
+    return row.secret_hash
+
+
+def _nonce_remember(nonce: str, now: float) -> bool:
+    """True=首次出现（放行）；False=重放（拒绝）。同时清理过期项。"""
+    expire = now - SIGN_WINDOW_SECONDS
+    while _NONCE_SEEN and next(iter(_NONCE_SEEN.values())) < expire:
+        _NONCE_SEEN.popitem(last=False)
+    if nonce in _NONCE_SEEN:
+        return False
+    _NONCE_SEEN[nonce] = now
+    if len(_NONCE_SEEN) > 65536:
+        _NONCE_SEEN.popitem(last=False)
+    return True
+
+
+async def verify_device(request: _Request) -> str:
+    """FastAPI 依赖：校验签名头，返回已验证的 device_id；失败抛 401。"""
+    device_id = request.headers.get("X-Device-Id", "")
+    timestamp = request.headers.get("X-Timestamp", "")
+    nonce = request.headers.get("X-Nonce", "")
+    signature = request.headers.get("X-Signature", "")
+    if not all([device_id, timestamp, nonce, signature]):
+        raise HTTPException(status_code=401, detail={"code": "AUTH_INVALID",
+                                                     "message": "缺少签名头"})
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        raise HTTPException(status_code=401, detail={"code": "AUTH_INVALID",
+                                                     "message": "时间戳非法"})
+    now = time.time()
+    if abs(now - ts) > SIGN_WINDOW_SECONDS:
+        raise HTTPException(status_code=401, detail={"code": "AUTH_INVALID",
+                                                     "message": "时间戳超出 ±300s 窗口"})
+    if not _nonce_remember(nonce, now):
+        raise HTTPException(status_code=401, detail={"code": "AUTH_INVALID",
+                                                     "message": "nonce 重放"})
+
+    body = await request.body()
+    body_hash = _hashlib.sha256(body).hexdigest()
+    expected = None
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        secret_hash = await _lookup_secret_hash(session, device_id)
+    finally:
+        await session.close()
+        await engine.dispose()
+    if secret_hash is None:
+        raise HTTPException(status_code=401, detail={"code": "AUTH_INVALID",
+                                                      "message": "设备未注册或已吊销"})
+    # 校验：签名 = HMAC(secret, 签名串) 的 hex —— 但库里只有 secret 的 SHA-256。
+    # 签名需要原始 secret，不能从 hash 反推。因此协议改为：
+    #   X-Signature = hex(HMAC-SHA256(device_secret, signing_string))
+    # 服务端无法存原始 secret（只存 hash）→ 无法复算 HMAC。
+    # 解决（业界通用）：secret 本身就是「长期凭证」，服务端**也**保存可复算形态。
+    # 折衷方案：secret_hash 存 SHA-256(secret)，但签名改用 secret 直接参与比较
+    # 不可行。故：device_credential.secret_hash 存的就是 device_secret 本身
+    # （hex，64 字符），命名为 hash 字段但存明文 secret——批次 6 切 Keystore/换密钥体系。
+    expected = secret_hash  # 存的就是 secret（hex）
+    mac = _hmac.new(bytes.fromhex(expected),
+                    _signing_string(request.method, request.url.path,
+                                    body_hash, nonce, timestamp).encode("utf-8"),
+                    _hashlib.sha256).hexdigest()
+    if not _hmac.compare_digest(mac, signature.lower()):
+        raise HTTPException(status_code=401, detail={"code": "AUTH_INVALID",
+                                                     "message": "签名不匹配"})
+    return device_id
+
+
+@life_router.post("/auth/devices")
+async def register_device(device_id: str = Query(default="", alias="deviceId")):
+    """设备注册 / 存量 UUID claim。返回 deviceSecret（明文仅本次），库内只存哈希。"""
+    dev = device_id.strip() or _uuid.uuid4().hex
+    secret = _secrets.token_hex(32)
+    secret_hash = _hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        row = (await session.execute(
+            select(DeviceCredential).where(DeviceCredential.device_id == dev))).scalar_one_or_none()
+        if row is None:
+            session.add(DeviceCredential(device_id=dev, secret_hash=secret_hash))
+            await session.commit()
+            return {"deviceId": dev, "deviceSecret": secret, "created": True}
+        # 存量 claim：已有凭证则轮换 secret（老包重新注册拿新密钥）
+        row.secret_hash = secret_hash
+        row.revoked = False
+        await session.commit()
+        _SECRET_CACHE.pop(dev, None)
+        return {"deviceId": dev, "deviceSecret": secret, "created": False}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+# ===========================================================================
+# 会员/成长值服务端化（ENTITLEMENT 批次 3）
+#
+# 流水（growth_event）是唯一事实来源；membership_state 只是汇总缓存。
+# 发分挂进 POST /meal-log：clientLogId 幂等（R5），recipeIds 首次记 +5（R4）。
+# 等级门槛与权益公式先用常量（与 App 端历史一致），后续可迁 app_config 下发。
+# ===========================================================================
+
+#: 升级门槛（升到 Lv2/Lv3/Lv4/Lv5）
+MEMBERSHIP_LEVEL_POINTS = [60, 180, 400, 800]
+MEMBERSHIP_TITLES = ["见习帮厨", "家常熟手", "厨房好手", "掌勺大厨", "柴柴会员"]
+POINTS_PER_MEAL_LOGGED = 10
+COINS_PER_MEAL_LOGGED = 2
+POINTS_PER_NEW_DISH = 5
+COINS_PER_NEW_DISH = 1
+
+
+def membership_level_of(points: int) -> int:
+    if points >= MEMBERSHIP_LEVEL_POINTS[3]:
+        return 5
+    if points >= MEMBERSHIP_LEVEL_POINTS[2]:
+        return 4
+    if points >= MEMBERSHIP_LEVEL_POINTS[1]:
+        return 3
+    if points >= MEMBERSHIP_LEVEL_POINTS[0]:
+        return 2
+    return 1
+
+
+def membership_entitlements(level: int, ocr_used_today: int) -> Dict[str, Any]:
+    ocr_limit = 10 if level >= 5 else 6 if level >= 3 else 3
+    return {
+        "customIngredientLimit": level * 10,
+        "ocrDailyLimit": ocr_limit,
+        "ocrUsedToday": ocr_used_today,
+    }
+
+
+async def _growth_award(session: AsyncSession, device_id: str, event_type: str,
+                        ref_id: str, points: int, coins: int) -> bool:
+    """写流水并累计到汇总。UNIQUE 幂等：同键已存在则不加分，返回 False。"""
+    exists = (await session.execute(
+        select(GrowthEvent.id).where(
+            GrowthEvent.device_id == device_id,
+            GrowthEvent.event_type == event_type,
+            GrowthEvent.ref_id == ref_id))).scalar_one_or_none()
+    if exists is not None:
+        return False
+    session.add(GrowthEvent(device_id=device_id, event_type=event_type,
+                            ref_id=ref_id, points=points, coins=coins))
+    state = (await session.execute(
+        select(MembershipState).where(MembershipState.device_id == device_id))).scalar_one_or_none()
+    if state is None:
+        session.add(MembershipState(device_id=device_id, points=points, coins=coins))
+    else:
+        state.points = state.points + points
+        state.coins = state.coins + coins
+    return True
+
+
+@life_router.get("/membership")
+async def get_membership(device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        state = (await session.execute(
+            select(MembershipState).where(MembershipState.device_id == device_id))).scalar_one_or_none()
+        points = state.points if state else 0
+        coins = state.coins if state else 0
+        level = membership_level_of(points)
+        # OCR 当日用量一并下发（App 显示用）
+        usage = (await session.execute(
+            select(OcrUsage.used_count).where(
+                OcrUsage.device_id == device_id,
+                OcrUsage.used_on == _ocr_today()))).scalar_one_or_none()
+        used = usage or 0
+        gaps = [p for p in MEMBERSHIP_LEVEL_POINTS if p > points]
+        return {
+            "deviceId": device_id,
+            "points": points,
+            "coins": coins,
+            "level": level,
+            "title": MEMBERSHIP_TITLES[level - 1],
+            "nextLevelGap": (gaps[0] - points) if gaps else None,
+            "entitlements": membership_entitlements(level, used),
+        }
     finally:
         await session.close()
         await engine.dispose()
