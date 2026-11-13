@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import gzip
+import logging
 import os
 import contextlib
 import hashlib
@@ -40,12 +41,14 @@ import secrets
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from collections import OrderedDict, deque
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Body, File, HTTPException, Query, Request, UploadFile
+from fastapi import (APIRouter, Body, Depends, File, HTTPException, Query,
+                     Request, UploadFile)
 import httpx
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import case, delete, func, select, text
@@ -1032,9 +1035,17 @@ async def _serve_media(key: str, request: Request):
 # ---------------------------------------------------------------------------
 # 配置中心（KV）
 # ---------------------------------------------------------------------------
+#: App 可读 scope 白名单（ENTITLEMENT 批次 4 / R7）：
+#: 敏感 scope（未来 auth/admin/internal 等）永不下发；管理动作走 X-Admin-Token。
+PUBLIC_CONFIG_SCOPES = ("app", "membership", "public")
+
+
 @app_config_router.get("")
 async def list_app_config(scope: Optional[str] = None):
-    """全量配置：{"items": {key: value}, "meta": {...}}。"""
+    """App 配置列表。只下发白名单 scope；指定敏感 scope 直接 403。"""
+    if scope is not None and scope not in PUBLIC_CONFIG_SCOPES:
+        raise HTTPException(status_code=403, detail={
+            "code": "CONFIG_SCOPE_LOCKED", "message": f"scope 不可读：{scope}"})
     engine, session = await _session()
     if session is None:
         raise HTTPException(status_code=503, detail="配置库不可用")
@@ -1042,6 +1053,9 @@ async def list_app_config(scope: Optional[str] = None):
         stmt = select(AppConfig)
         if scope:
             stmt = stmt.where(AppConfig.scope == scope)
+        else:
+            # 无 scope 参数 → 只下发白名单（catalog.meta 等存量配置 scope='app' 不受影响）
+            stmt = stmt.where(AppConfig.scope.in_(PUBLIC_CONFIG_SCOPES))
         rows = (await session.execute(stmt.order_by(AppConfig.key))).scalars().all()
         return {
             "items": {r.key: r.value for r in rows},
@@ -1063,7 +1077,8 @@ async def get_app_config(cfg_key: str):
     try:
         r = (await session.execute(
             select(AppConfig).where(AppConfig.key == cfg_key))).scalar_one_or_none()
-        if r is None:
+        if r is None or r.scope not in PUBLIC_CONFIG_SCOPES:
+            # 敏感 scope 单 key 也读不到（404，不泄露存在性）
             raise HTTPException(status_code=404, detail=f"配置不存在：{cfg_key}")
         return {"key": r.key, "value": r.value, "scope": r.scope,
                 "version": r.version, "description": r.description,
@@ -1144,7 +1159,52 @@ async def delete_app_config(cfg_key: str, request: Request):
 # ===========================================================================
 # v2：生活流（记食 / 我的餐桌）
 # ===========================================================================
-life_router = APIRouter(prefix="", tags=["life"])
+
+# ---------------------------------------------------------------------------
+# 存量端点灰度鉴权（ENTITLEMENT 批次 4 剩余 / R2：伪造 deviceId 冒名读写）
+#
+# 灰度语义（§7 兼容与灰度）：
+# - 无签名头（老包）→ 放行并打日志（灰度观察老包占比）；
+# - 带签名头 → 验签（复用批次 2 verify_device：时间窗/nonce/HMAC），
+#   失败 401；验签通过后做**身份绑定**——签名身份必须与请求声称的
+#   deviceId（query 或 JSON body）一致，不一致 401 FORGED_IDENTITY，
+#   拿自己凭证冒名他人数据的通道就此关闭；
+# - multipart（OCR 上传）暂跳过验签：依赖层读 body 后 multipart 解析的
+#   二次消费兼容性需真机实测再开，OCR 次数由批次 1 的服务端配额兜底。
+# - 强制开关（app_config: auth.enforce）留待灰度观察 1~2 个版本后启用。
+# ---------------------------------------------------------------------------
+_auth_log = logging.getLogger("recipe.gray")
+
+
+async def gradual_auth(request: Request) -> None:
+    """Router 级灰度鉴权依赖：带签名则验+绑定身份，不带放行（老包兼容）。"""
+    if "x-signature" not in request.headers:
+        _auth_log.info("gray-auth pass-through %s %s", request.method, request.url.path)
+        return
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in ctype:
+        _auth_log.info("gray-auth skip-multipart %s %s", request.method, request.url.path)
+        return
+    verified = await verify_device(request)  # 验签失败/重放/超窗在此抛 401
+    # 身份绑定：比对签名身份与请求声称的 deviceId
+    claimed = request.query_params.get("deviceId")
+    if not claimed:
+        body_bytes = await request.body()  # verify_device 已缓存 body，此处命中缓存
+        if "application/json" in ctype and body_bytes:
+            try:
+                claimed = (json.loads(body_bytes) or {}).get("deviceId")
+            except Exception:
+                claimed = None
+    if claimed and claimed != verified:
+        _auth_log.warning("gray-auth FORGED_IDENTITY sig=%s claimed=%s %s",
+                          verified, claimed, request.url.path)
+        raise HTTPException(status_code=401, detail={
+            "code": "FORGED_IDENTITY",
+            "message": "签名身份与 deviceId 不一致"})
+
+
+life_router = APIRouter(prefix="", tags=["life"],
+                        dependencies=[Depends(gradual_auth)])
 
 
 def _meal_log_json(row: MealLog) -> Dict[str, Any]:
@@ -1482,12 +1542,28 @@ async def put_recipe_note(recipe_id: str, payload: Dict[str, Any] = Body(default
         await engine.dispose()
 
 
+# ---------------------------------------------------------------------------
+# plan_key 服务端校验（ENTITLEMENT 批次 4 / R8 尾巴）：客户端自算的
+# planKey 形如 "2026-11-14-1a2b3c4d"（日期-菜集hash），无法绑设备签名前
+# 先挡脏数据：长度与字符集校验，防 storage 膨胀/注入式垃圾。
+# ---------------------------------------------------------------------------
+_PLAN_KEY_RE = re.compile(r"^[A-Za-z0-9_.:\-]{1,64}$")
+
+
+def _validate_plan_key(plan_key: str) -> None:
+    if not plan_key or not _PLAN_KEY_RE.match(plan_key):
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_PLAN_KEY",
+            "message": "planKey 格式非法（1~64 位字母数字与 . : _ -）"})
+
+
 @life_router.get("/shopping-checks")
 async def list_shopping_checks(
     device_id: str = Query(..., alias="deviceId"),
     plan_key: str = Query(..., alias="planKey"),
 ):
     """这一桌已经买齐的食材名。客户端拿它把勾选状态恢复出来。"""
+    _validate_plan_key(plan_key)
     engine, session = await _session()
     if session is None:
         raise HTTPException(status_code=503, detail="配置库不可用")
@@ -1511,6 +1587,7 @@ async def put_shopping_check(payload: Dict[str, Any] = Body(default={})):
     item = (payload.get("itemName") or "").strip()
     if not device_id or not plan_key or not item:
         raise HTTPException(status_code=400, detail="deviceId / planKey / itemName 必填")
+    _validate_plan_key(plan_key)
     checked = bool(payload.get("checked", True))
 
     engine, session = await _session()
@@ -1614,6 +1691,70 @@ def _gen_room_code() -> str:
     return "".join(secrets.choice(_ROOM_CODE_CHARS) for _ in range(6))
 
 
+# ---------------------------------------------------------------------------
+# collab 防爆破（ENTITLEMENT 批次 4 / R8）：邀请码空间 32^6≈10.7 亿靠频控兜底。
+# 内存实现（单实例服务，进程重启失效可接受）：
+# - join 失败（房间不存在）按 device|IP 滑动窗计数，10 次/分钟 → 封 10 分钟；
+# - 建房每设备每日 ≤20。
+# ---------------------------------------------------------------------------
+JOIN_FAIL_LIMIT = 10
+JOIN_WINDOW_SECONDS = 60.0
+JOIN_BAN_SECONDS = 600.0
+ROOM_DAILY_CREATE_LIMIT = 20
+
+_JOIN_FAILS: "OrderedDict[str, Deque[float]]" = OrderedDict()
+_JOIN_BANNED: Dict[str, float] = {}
+_ROOM_CREATES: Dict[str, Tuple[str, int]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for") or ""
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+
+
+def _join_gate(key: str, now: float) -> float:
+    """封禁中返回剩余秒数，否则 0。顺手清理过期封禁。"""
+    for k in [k for k, until in _JOIN_BANNED.items() if until <= now]:
+        _JOIN_BANNED.pop(k, None)
+    until = _JOIN_BANNED.get(key, 0.0)
+    return (until - now) if until > now else 0.0
+
+
+def _join_fail_note(key: str, now: float) -> None:
+    """记录一次 join 失败；窗口内超限 → 封禁。"""
+    wins = _JOIN_FAILS.setdefault(key, deque())
+    wins.append(now)
+    while wins and wins[0] <= now - JOIN_WINDOW_SECONDS:
+        wins.popleft()
+    if len(wins) >= JOIN_FAIL_LIMIT:
+        _JOIN_BANNED[key] = now + JOIN_BAN_SECONDS
+        _JOIN_FAILS.pop(key, None)
+
+
+def _join_fail_clear(key: str) -> None:
+    """成功加入：清失败窗并解封（成功即证明非爆破）。"""
+    _JOIN_FAILS.pop(key, None)
+    _JOIN_BANNED.pop(key, None)
+
+
+def _room_create_allow(device_id: str, today: str) -> bool:
+    prev = _ROOM_CREATES.get(device_id)
+    return not (prev and prev[0] == today and prev[1] >= ROOM_DAILY_CREATE_LIMIT)
+
+
+def _room_create_note(device_id: str, today: str) -> None:
+    prev = _ROOM_CREATES.get(device_id)
+    if prev and prev[0] == today:
+        _ROOM_CREATES[device_id] = (today, prev[1] + 1)
+    else:
+        # 顺手清理跨日旧项（防 dict 无界膨胀）
+        for k in [k for k, v in _ROOM_CREATES.items() if v[0] != today]:
+            _ROOM_CREATES.pop(k, None)
+        _ROOM_CREATES[device_id] = (today, 1)
+
+
 def _profile_json(row: UserProfile) -> Dict[str, Any]:
     return {"deviceId": row.device_id, "nickname": row.nickname, "avatar": row.avatar}
 
@@ -1711,7 +1852,8 @@ async def _room_detail(session: AsyncSession, room: CollabRoom, my_device_id: st
 
 
 @life_router.post("/collab/rooms")
-async def create_collab_room(payload: Dict[str, Any] = Body(default={})):
+async def create_collab_room(payload: Dict[str, Any] = Body(default={}),
+                            request: Request = None):
     device_id = (payload.get("deviceId") or "").strip()
     dish_ids = payload.get("dishIds") or []
     title = (payload.get("title") or "这一桌").strip()[:48]
@@ -1720,6 +1862,13 @@ async def create_collab_room(payload: Dict[str, Any] = Body(default={})):
         raise HTTPException(status_code=400, detail="deviceId 必填")
     if not dish_ids:
         raise HTTPException(status_code=400, detail="先配好一桌菜再邀请")
+
+    # 防爆破（批次 4 / R8）：每设备每日建房上限
+    today = datetime.now(tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    if not _room_create_allow(device_id, today):
+        raise HTTPException(status_code=429, detail={
+            "code": "ROOM_CREATE_LIMIT",
+            "message": f"今天建得够多了（上限 {ROOM_DAILY_CREATE_LIMIT} 个），明天再开桌"})
 
     engine, session = await _session()
     if session is None:
@@ -1744,6 +1893,7 @@ async def create_collab_room(payload: Dict[str, Any] = Body(default={})):
         session.add(CollabMember(room_id=room.id, device_id=device_id,
                                  nickname=nickname, avatar=avatar))
         await session.commit()
+        _room_create_note(device_id, today)  # 建房成功计数（批次 4 / R8）
         await session.refresh(room)
         return await _room_detail(session, room, device_id)
     finally:
@@ -1765,16 +1915,31 @@ async def get_collab_room(code: str, device_id: str = Query(..., alias="deviceId
 
 
 @life_router.post("/collab/rooms/{code}/join")
-async def join_collab_room(code: str, payload: Dict[str, Any] = Body(default={})):
+async def join_collab_room(code: str, payload: Dict[str, Any] = Body(default={}),
+                           request: Request = None):
     device_id = (payload.get("deviceId") or "").strip()
     if not device_id:
         raise HTTPException(status_code=400, detail="deviceId 必填")
+
+    # 防爆破（批次 4 / R8）：失败滑动窗 + 临时封禁，key = device|IP
+    gate_key = f"{device_id}|{_client_ip(request)}"
+    now = time.time()
+    left = _join_gate(gate_key, now)
+    if left:
+        raise HTTPException(status_code=429, detail={
+            "code": "RATE_LIMITED",
+            "message": f"尝试太频繁，{int(left) + 1} 秒后再试"})
 
     engine, session = await _session()
     if session is None:
         raise HTTPException(status_code=503, detail="配置库不可用")
     try:
-        room = await _load_room(session, code)
+        try:
+            room = await _load_room(session, code)
+        except HTTPException as e:
+            if e.status_code == 404:
+                _join_fail_note(gate_key, time.time())  # 房间不存在 = 一次爆破尝试
+            raise
         if room.status != "open":
             raise HTTPException(status_code=409, detail="这一桌已经定稿了")
         exists = (await session.execute(
@@ -1791,6 +1956,7 @@ async def join_collab_room(code: str, payload: Dict[str, Any] = Body(default={})
             session.add(CollabMember(room_id=room.id, device_id=device_id,
                                      nickname=nickname, avatar=avatar))
             await session.commit()
+        _join_fail_clear(gate_key)  # 加入成功清失败窗（批次 4 / R8）
         return await _room_detail(session, room, device_id)
     finally:
         await session.close()
@@ -2101,12 +2267,6 @@ import hashlib as _hashlib
 import hmac as _hmac
 import secrets as _secrets
 import uuid as _uuid
-from collections import OrderedDict
-from fastapi import Request as _Request
-from typing import Optional as _Optional
-
-#: 时间窗（秒）
-SIGN_WINDOW_SECONDS = 300
 #: nonce 去重：内存 TTL 表（进程重启失效可接受——窗口只有 5 分钟）
 _NONCE_SEEN: "OrderedDict[str, float]" = OrderedDict()
 #: secret_hash LRU 缓存（免每请求查库）
@@ -2117,6 +2277,10 @@ _SECRET_CACHE_MAX = 4096
 def _signing_string(method: str, path: str, body_sha256_hex: str,
                     nonce: str, timestamp: str) -> str:
     return "\n".join([method.upper(), path, body_sha256_hex, nonce, timestamp])
+
+
+#: 签名时间窗（秒）：协议约定 ±300s
+SIGN_WINDOW_SECONDS = 300.0
 
 
 async def _lookup_secret_hash(session: AsyncSession, device_id: str) -> _Optional[str]:
