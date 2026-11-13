@@ -136,8 +136,7 @@ FROM base-runtime AS runtime
 # PYTHONDONTWRITEBYTECODE=1，不会再生成 pyc），纯省体积、不影响功能。
 COPY requirements-core.txt ./
 ARG PIP_INDEX_URL=
-RUN --mount=type=cache,target=/root/.cache/pip \
-    PIP_ARGS="--no-cache-dir --retries 10 --timeout 120"; \
+RUN PIP_ARGS="--no-cache-dir --retries 10 --timeout 120"; \
     if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="$PIP_ARGS -i $PIP_INDEX_URL"; fi; \
     pip install $PIP_ARGS -r requirements-core.txt \
     && (find /usr/local/lib/python3.11/site-packages -type d \

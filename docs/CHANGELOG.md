@@ -64,7 +64,9 @@
   `.dockerignore` 排除 `api/webui` 宿主机产物。
 - **ffmpeg 只装 library 最终层**（视频转码在 library 批处理，crawler 只登记），
   `--no-install-recommends` + 清理 apt 缓存；crawler 镜像不含编解码依赖。
-- `runtime` 层不再重复 COPY crawler 依赖；pip 加 BuildKit cache mount。
+- `runtime` 层不再重复 COPY crawler 依赖；pip 仍用 `--no-cache-dir`（构建
+  缓存不进镜像层，故不引入 BuildKit cache mount，避免与清理 `/root/.cache`
+  冲突导致 `Device or resource busy`）。
 - `deploy/cleanup-images.sh`（新）：构建前只删本项目仓库下 **非 latest、
   非容器在用** 的旧 tag，再清 dangling 构建残留；打印清理前后磁盘余量。
   `server-update.sh` 与 `build-push.sh` 都在 `docker compose build` 前调用，
