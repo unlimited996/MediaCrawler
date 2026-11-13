@@ -60,6 +60,7 @@ from database.models_recipe import (
     RecipeTag, RecipeTagLink, ShoppingCheck, TablePlanRecord, TakeoutSpot,
     CollabMember, CollabRoom, CollabVote, FeedbackEntry, OcrUsage, UserProfile,
     DeviceCredential, GrowthEvent, MembershipState, MembershipGrant,
+    UserIngredient,
 )
 from .story import _session
 
