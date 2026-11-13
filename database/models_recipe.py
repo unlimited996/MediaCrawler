@@ -627,6 +627,28 @@ class MembershipState(BaseRecipe, TimestampMixin):
     coins = Column(Integer, nullable=False, server_default="0")
 
 
+# ---------------------------------------------------------------------------
+# 22. 自定义食材台账（ENTITLEMENT 批次 5：配额在服务端"数得出来"的数据前提）
+# ---------------------------------------------------------------------------
+class UserIngredient(BaseRecipe, TimestampMixin):
+    """用户自定义食材。云端是唯一事实来源，客户端 FridgeStore 降级为缓存。"""
+
+    __tablename__ = "user_ingredient"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    device_id = Column(String(64), nullable=False)
+    name = Column(String(64), nullable=False)
+    category = Column(String(16), nullable=False, server_default="其他")
+    plan = Column(String(16), nullable=False, server_default="不设提醒")
+    note = Column(String(120))
+
+    __table_args__ = (
+        UniqueConstraint("device_id", "name", name="uq_user_ingredient_name"),
+        Index("idx_user_ingredient_device", "device_id", "created_at"),
+        {"schema": SCHEMA},
+    )
+
+
 #: 建表/校验时按依赖顺序使用
 ALL_TABLES = (
     RecipeCategory, RecipeTag, Recipe, RecipeIngredient, RecipeStep,
@@ -643,4 +665,6 @@ ALL_TABLES = (
     OcrUsage,
     # v4.3：设备凭证 + 成长值流水/汇总（ENTITLEMENT 批次 2/3）
     DeviceCredential, GrowthEvent, MembershipState,
+    # v4.4：自定义食材台账（ENTITLEMENT 批次 5）
+    UserIngredient,
 )

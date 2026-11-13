@@ -2320,3 +2320,108 @@ async def get_membership(device_id: str = Query(..., alias="deviceId")):
     finally:
         await session.close()
         await engine.dispose()
+
+
+# ===========================================================================
+# 自定义食材上云（ENTITLEMENT 批次 5）：云端台账 + 配额服务端判定
+#
+# - 云端是唯一事实来源；客户端 FridgeStore 降级为缓存 + 离线兜底
+# - POST 前服务端 COUNT 与 entitlements.customIngredientLimit 比较，
+#   超限返回 402 INGREDIENT_QUOTA_EXCEEDED（清 App 数据不再能绕过配额）
+# - 同名重复返回 409（幂等迁移时客户端忽略）
+# ===========================================================================
+
+def _ingredient_json(row: UserIngredient) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "category": row.category,
+        "plan": row.plan,
+        "note": row.note,
+    }
+
+
+@life_router.get("/fridge/ingredients")
+async def list_fridge_ingredients(device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        rows = list((await session.execute(
+            select(UserIngredient).where(UserIngredient.device_id == device_id)
+            .order_by(UserIngredient.id))).scalars())
+        return {"items": [_ingredient_json(r) for r in rows]}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.post("/fridge/ingredients")
+async def create_fridge_ingredient(payload: Dict[str, Any] = Body(default={})):
+    device_id = (payload.get("deviceId") or "").strip()
+    name = (payload.get("name") or "").strip()[:64]
+    if not device_id or not name:
+        raise HTTPException(status_code=400, detail="deviceId / name 必填")
+    category = (payload.get("category") or "其他").strip()[:16]
+    plan = (payload.get("plan") or "不设提醒").strip()[:16]
+    note = (payload.get("note") or None)
+    if note:
+        note = note.strip()[:120]
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        # 幂等：同名已存在返回 409（迁移/重试场景客户端可忽略）
+        dup = (await session.execute(
+            select(UserIngredient.id).where(
+                UserIngredient.device_id == device_id,
+                UserIngredient.name == name))).scalar_one_or_none()
+        if dup is not None:
+            raise HTTPException(status_code=409, detail={
+                "code": "INGREDIENT_DUPLICATE", "message": "这个食材已经有了"})
+
+        # 配额：服务端 COUNT vs entitlements（等级×10）
+        used = (await session.execute(
+            select(func.count()).select_from(UserIngredient).where(
+                UserIngredient.device_id == device_id))).scalar() or 0
+        state = (await session.execute(
+            select(MembershipState).where(
+                MembershipState.device_id == device_id))).scalar_one_or_none()
+        points = state.points if state else 0
+        limit = membership_level_of(points) * 10
+        if used >= limit:
+            raise HTTPException(status_code=402, detail={
+                "code": "INGREDIENT_QUOTA_EXCEEDED",
+                "used": used, "limit": limit,
+                "message": "当前等级可保存 {0} 条自定义食材".format(limit)})
+
+        row = UserIngredient(device_id=device_id, name=name,
+                             category=category, plan=plan, note=note)
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return _ingredient_json(row)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@life_router.delete("/fridge/ingredients/{ing_id}")
+async def delete_fridge_ingredient(ing_id: int,
+                                   device_id: str = Query(..., alias="deviceId")):
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        res = await session.execute(
+            delete(UserIngredient).where(
+                UserIngredient.id == ing_id,
+                UserIngredient.device_id == device_id))
+        await session.commit()
+        if not res.rowcount:
+            raise HTTPException(status_code=404, detail="食材不存在")
+        return {"success": True, "deleted": ing_id}
+    finally:
+        await session.close()
+        await engine.dispose()
