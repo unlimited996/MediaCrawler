@@ -2290,7 +2290,7 @@ async def _lookup_secret_hash(session: AsyncSession, device_id: str) -> _Optiona
     row = (await session.execute(
         select(DeviceCredential).where(
             DeviceCredential.device_id == device_id,
-            DeviceCredential.revoked == false() if hasattr(DeviceCredential.revoked, "is_") else DeviceCredential.revoked == False,  # noqa: E712
+            DeviceCredential.revoked.is_(False),
         ))).scalar_one_or_none()
     if row is None:
         return None
