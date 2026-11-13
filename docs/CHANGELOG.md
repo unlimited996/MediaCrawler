@@ -71,6 +71,10 @@
   非容器在用** 的旧 tag，再清 dangling 构建残留；打印清理前后磁盘余量。
   `server-update.sh` 与 `build-push.sh` 都在 `docker compose build` 前调用，
   失败不阻断构建。
+- 合并其它会话的 `recipe.py`（`UploadFile = File(...)`）后，library 启动会因缺
+  `python-multipart` 直接 RuntimeError。把该依赖装在 `app-library` / `all` 最终层，
+  crawler 不含也不需要；刻意不写进 `requirements-core.txt`，否则 pip 与
+  Playwright 浏览器层全部缓存失效（125MB 浏览器要重下），而这两个薄层重跑几秒。
 
 ### 验证
 - `py_compile` / `bash -n` / `tsc -b` / `npm run build` 全过。

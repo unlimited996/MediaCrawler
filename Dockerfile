@@ -268,6 +268,13 @@ COPY --from=app-source /app/ /app/
 # 前端产物：唯一需要静态页的镜像
 COPY --from=webui-builder /app/api/webui/ /app/api/webui/
 
+# recipe_router 的 UploadFile 路由需要 python-multipart。刻意放最终层安装：
+# 改 requirements-core.txt 会让 pip / Playwright 浏览器层全部缓存失效（浏览器
+# 125MB 要重下），而 library 是唯一 include recipe_router 的部署目标；crawler
+# 不需要这个依赖，也就不装。
+RUN pip install --no-cache-dir "python-multipart>=0.0.9" \
+    && rm -rf /root/.cache /tmp/*
+
 RUN mkdir -p /app/data /app/browser_data /app/database /app/logs /app/deploy \
     && chmod +x /app/docker-entrypoint.sh
 
@@ -336,6 +343,10 @@ CMD ["uvicorn", "api.library_app:app", "--host", "0.0.0.0", "--port", "8081", \
 # 目标 3：一体化（旧行为；放在最后 = `docker build .` 的默认目标）
 # -----------------------------------------------------------------------------
 FROM app-browser AS all
+
+# 单体入口同样 include recipe_router（含 UploadFile），补同一依赖
+RUN pip install --no-cache-dir "python-multipart>=0.0.9" \
+    && rm -rf /root/.cache /tmp/*
 
 ENV APP_ROLE=all \
     SERVICE_NAME=mediacrawler-all \
