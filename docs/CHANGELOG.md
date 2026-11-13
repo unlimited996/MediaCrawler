@@ -5,6 +5,78 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-13] 小红书视频贴转储 S3 videos 桶 + 镜像构建精简
+
+需求：视频贴转储到 `videos` 桶；定时任务默认不勾选；统一 H.264/AAC MP4
+方便播放；镜像只含运行所需、避免重复依赖打包；构建前清理旧版项目镜像；
+后端补齐新增/删除/查询接口并返回准确原始大小；页面同步展示。
+
+### 1. 数据层（与图片备份链路完全隔离）
+- 新增 `video_asset` 表 / `VideoAsset` 模型，字段含 `bucket`、
+  `original_size_bytes`（**源片真实字节数，转码前**）、`stored_size_bytes`
+  （S3 对象大小）、`codec_v/codec_a/duration_sec/status/object_key`。
+  图片那套内容寻址去重 / 表情包收敛逻辑一行未改，现有备份功能零影响。
+- `deploy/sql/video_asset.sql`：幂等建表 + 索引（`IF NOT EXISTS`），线上直接执行。
+
+### 2. 转储核心 `tools/video_store.py` + `media_downloader/ffmpeg.py`
+- 抓取侧开关打开时只写一行 `pending`（不发视频请求、不阻塞抓取）；
+  library 侧后台批处理 `run_video_batch()` 消费队列。
+- 流式下载到临时文件（不整包进内存）→ `ffprobe` 探测 → `normalize_video()`
+  统一成 H.264/AAC progressive MP4：已是 H.264/AAC 只 `-c copy` 重封装，
+  其它编码重编码，一律 `-movflags +faststart`（moov 前置，边下边播）；
+  HLS 由 ffmpeg 直接读播放列表转 MP4。ffmpeg 缺失时显式降级并打日志。
+- 上传前校验 `ftyp` box，上传显式 `ContentType=video/mp4`，
+  `head_object` 回读校验对象大小；`videos` 桶不存在时自动创建。
+- 复用当前启用的 S3Config，**只换 Bucket**（`dataclasses.replace`），
+  endpoint / 密钥 / region 不变。
+
+### 3. 后端接口 `api/routers/videos.py`（风格对齐 s3_backup.py）
+- `POST /videos` 新增（幂等；`run=true` 立即转储）、`GET /videos` 查询列表、
+  `GET /videos/{id}` 详情、`DELETE /videos/{id}` 删除（连 S3 对象）、
+  `POST /videos/run` 批处理、`GET /videos/{id}/stream` 播放代理。
+- 全部返回 `original_size_bytes` / `stored_size_bytes`；错误处理沿用
+  `_session()` + `HTTPException`（422 参数 / 404 不存在 / 503 库或 S3 不可用 /
+  502 转储失败），列表统一 `{items,total,page,page_size}`。
+- `stream` 透传 `Range` → 返回 `206` + `Content-Range` / `Accept-Ranges`，
+  `<video>` 进度条可拖动。
+- 详情页查询会懒触发一次批处理，不需要额外常驻 worker。
+
+### 4. 定时任务开关（默认关闭）
+- `enable_video: bool = False` 过 `TaskOptions` / `_normalize_options` /
+  `update_task` 三关；前端默认值 + Checkbox + 中英文案。
+- `build_crawler_env` 注入 `ENABLE_VIDEO_BACKUP`（存量任务无该键 → `0`），
+  不走 CLI 参数，手动抓取行为完全不变。
+- `sync_content_to_v2` 在开关打开且 `type=video` 时用
+  `chapter.ext.video_url` 的候选直链登记；旁路 try/except，失败只告警。
+
+### 5. 前端
+- `videoApi` / `VideoAssetRow` / `formatBytes`（B/KB/MB/GB，1024 进制）。
+- `VideoAttachment` 挂在详情页：`<video controls preload=metadata>` +
+  「原始大小 xx MB / 转储 xx MB / H.264·AAC·MP4」，hover 显示精确字节数；
+  取值直接来自后端 `original_size_bytes`，与接口记录一致；转储中自动轮询。
+
+### 6. 镜像构建（本次重点）
+- **共享源码层**：`FROM scratch AS app-source` 精确 COPY 运行时 Python 包与
+  入口文件，两个 app target 都 `COPY --from=app-source`，源码在 registry 里
+  只存一份；不再 `COPY . /app`（此前会带 webui 源码、宿主机前端产物、
+  临时脚本、docs 等）。
+- **前端产物只进 library**：crawler 不提供静态页，删掉它那份 COPY；
+  `.dockerignore` 排除 `api/webui` 宿主机产物。
+- **ffmpeg 只装 library 最终层**（视频转码在 library 批处理，crawler 只登记），
+  `--no-install-recommends` + 清理 apt 缓存；crawler 镜像不含编解码依赖。
+- `runtime` 层不再重复 COPY crawler 依赖；pip 加 BuildKit cache mount。
+- `deploy/cleanup-images.sh`（新）：构建前只删本项目仓库下 **非 latest、
+  非容器在用** 的旧 tag，再清 dangling 构建残留；打印清理前后磁盘余量。
+  `server-update.sh` 与 `build-push.sh` 都在 `docker compose build` 前调用，
+  失败不阻断构建。
+
+### 验证
+- `py_compile` / `bash -n` / `tsc -b` / `npm run build` 全过。
+- 新增 `tests/test_videos_api.py` 6 例：新增返回原始大小、列表/详情一致、
+  422/404/502/503 错误处理、删除、Range 206、登记幂等与自愈。
+- 受影响模块回归 **74 passed**；`api.library_app` 冒烟确认
+  `/library/api/videos*` 四条路由已注册。
+
 ## [2026-11-12] 修「翻到底却没打抓全标记」→ 每轮重抓同一帖（仅建议 2 / 5）
 
 线上反爬分析发现的结构性死循环：`media_platform/xhs/core.py::_on_progress`

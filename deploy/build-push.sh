@@ -25,6 +25,9 @@ COMPOSE_FILE="docker-compose.split.yml"
 CRAWLER="${REGISTRY}/${NAMESPACE}/mediacrawler-crawler"
 LIBRARY="${REGISTRY}/${NAMESPACE}/mediacrawler-library"
 
+echo "==> 构建前清理旧版项目镜像"
+bash deploy/cleanup-images.sh "$REGISTRY" "$NAMESPACE" || echo "==> 清理未成功，继续构建"
+
 echo "==> 构建（crawler + library，含前端 npm build）"
 docker compose -f "${COMPOSE_FILE}" build
 

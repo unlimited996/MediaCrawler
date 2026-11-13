@@ -572,6 +572,51 @@ export interface S3BackupStats {
   last_error_at: string | null
 }
 
+export interface VideoAssetRow {
+  id: number
+  story_id: number | null
+  content_id: string
+  platform: string
+  source_url: string
+  object_key: string | null
+  bucket: string
+  status: 'pending' | 'uploading' | 'uploaded' | 'failed'
+  mime_type: string
+  /** 源片真实大小（转码前），页面展示用这个 */
+  original_size_bytes: number | null
+  /** S3 对象大小（转码后） */
+  stored_size_bytes: number | null
+  codec_v: string | null
+  codec_a: string | null
+  duration_sec: number | null
+  object_url: string | null
+  last_error: string | null
+  uploaded_at: string | null
+}
+
+export interface VideoCreatePayload {
+  content_id: string
+  source_url: string
+  platform?: string
+  story_id?: number | null
+  backup_urls?: string[]
+  run?: boolean
+}
+
+/** 视频转储（S3 videos 桶）：路径首段 videos → 自动加 /library/api */
+export const videoApi = {
+  list: (params: { status?: string; platform?: string; content_id?: string;
+                    story_id?: number; page?: number; page_size?: number } = {}) =>
+    api.get<{ items: VideoAssetRow[]; total: number; page: number; page_size: number }>(
+      '/videos', { params }),
+  get: (id: number) => api.get<VideoAssetRow>(`/videos/${id}`),
+  create: (p: VideoCreatePayload) => api.post<VideoAssetRow>('/videos', p),
+  remove: (id: number) =>
+    api.delete<{ success: boolean; object_deleted: boolean | null }>(`/videos/${id}`),
+  run: (limit = 5) =>
+    api.post<{ started: boolean }>('/videos/run', {}, { params: { limit } }),
+}
+
 export const s3BackupApi = {
   // 配置
   listConfigs: () =>

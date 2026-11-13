@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { StoryEditLogDialog } from '@/components/data/StoryEditLogDialog'
+import { VideoAttachment } from '@/components/data/VideoAttachment'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import {
@@ -582,6 +583,7 @@ export function PlatformStoryDetail({
         ) : readonly ? (
           // 只读模式（访客）：不提供改判入口，立场徽标自动变为不可点
           <RepliesContext.Provider value={{ showReplies, storyId }}>
+            <VideoAttachment storyId={storyId} />
             {renderLayout()}
 
             {/* 滚动到底自动加载下一页评论；没有更多时给出总数提示 */}
@@ -616,6 +618,7 @@ export function PlatformStoryDetail({
         ) : (
           <RepliesContext.Provider value={{ showReplies, storyId }}>
             <StanceEditContext.Provider value={{ open: setStanceEditTarget }}>
+            <VideoAttachment storyId={storyId} />
             {renderLayout()}
 
             {/* 滚动到底自动加载下一页评论；没有更多时给出总数提示 */}

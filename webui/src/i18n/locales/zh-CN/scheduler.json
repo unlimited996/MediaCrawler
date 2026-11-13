@@ -58,6 +58,7 @@
     "enableComments": "抓取评论",
     "enableSubComments": "抓取子评论",
     "enableMedia": "下载媒体",
+    "enableVideo": "抓取视频并转储 S3",
     "headless": "无头模式",
     "ignoreRiskCooldown": "忽略风控冷却",
     "cookies": "Cookie（留空则用账号池）",

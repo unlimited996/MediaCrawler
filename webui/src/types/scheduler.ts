@@ -16,6 +16,8 @@ export interface TaskOptions {
   enable_comments: boolean
   enable_sub_comments: boolean
   enable_media: boolean
+  /** 视频贴转储到 S3 videos 桶（默认关闭；存量任务无此键视为 false） */
+  enable_video?: boolean
   save_option: string
   headless: boolean
   cookies: string

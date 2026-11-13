@@ -794,6 +794,53 @@ class MediaBackup(BaseV2, TimestampMixin):
     )
 
 
+class VideoAsset(BaseV2, TimestampMixin):
+    """小红书视频贴转储到 S3 `videos` 桶的记录（独立于图片备份链路）。
+
+    与 media_backup 分开：图片的「内容寻址去重 / 表情包收敛」逻辑很复杂，
+    视频不需要也不该去动它；独立表保证现有图片备份功能零影响。
+
+    original_size_bytes 是**下载完成时源片的真实字节数**（转码前），
+    stored_size_bytes 是最终 S3 对象大小（转码后）。用户/页面看到的
+    「原始文件大小」以前者为准，不能用转码后的大小冒充。
+    """
+
+    __tablename__ = "video_asset"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    story_id = Column(BigInteger)
+    content_id = Column(String(255), nullable=False)
+    platform = Column(String(16), nullable=False, server_default="xhs")
+    source_url = Column(Text, nullable=False)
+    backup_urls = Column(JsonType, nullable=False, default=list)
+
+    object_key = Column(Text)
+    bucket = Column(String(128), nullable=False, server_default="videos")
+    status = Column(String(16), nullable=False, server_default="pending")  # pending/uploading/uploaded/failed
+    mime_type = Column(String(64), nullable=False, server_default="video/mp4")
+
+    original_size_bytes = Column(BigInteger)      # 源片原始大小
+    stored_size_bytes = Column(BigInteger)        # 转储对象大小
+    codec_v = Column(String(32))
+    codec_a = Column(String(32))
+    duration_sec = Column(Numeric(10, 2))
+    checksum = Column(String(64))
+
+    retry_count = Column(Integer, nullable=False, server_default="0")
+    max_retries = Column(Integer, nullable=False, server_default="3")
+    last_error = Column(Text)
+    uploaded_at = Column(DateTime(timezone=True))
+
+    ext = Column(JsonType, nullable=False, default=dict)
+    schema_ver = Column(Integer, nullable=False, server_default="1")
+
+    __table_args__ = (
+        Index("uq_video_asset_content", "platform", "content_id", unique=True),
+        Index("idx_video_asset_story", "story_id"),
+        Index("idx_video_asset_status", "status"),
+    )
+
+
 class EmojiAsset(BaseV2, TimestampMixin, SoftDeleteMixin):
     """表情包库：把重复出现、疑似表情包的图片单独归档管理。
 

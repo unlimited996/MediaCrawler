@@ -283,6 +283,10 @@ async def build_crawler_env(task: Dict[str, Any]) -> Dict[str, str]:
     env["PYTHONUNBUFFERED"] = "1"
     env["MAX_CONCURRENCY_NUM"] = str(int(task.get("max_concurrency") or 1))
     env["CRAWLER_MAX_SLEEP_SEC"] = str(float(task.get("rate_interval_sec") or 3))
+    # 视频转储默认关闭：存量任务 options_json 没有这个键，一律不注入开启值。
+    # 不走 CLI 参数，避免改动 cmd_arg 影响手动抓取的既有行为。
+    env["ENABLE_VIDEO_BACKUP"] = (
+        "1" if (task.get("options") or {}).get("enable_video", False) else "0")
     # 与平台无关的两个参数：子进程是独立 Python 进程，读不到本进程
     # runtime_config 的内存缓存，必须显式注入环境变量（config 用 _env_* 覆盖）
     try:

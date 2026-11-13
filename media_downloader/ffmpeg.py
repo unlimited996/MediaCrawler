@@ -45,6 +45,111 @@ def ffmpeg_path() -> str | None:
     return shutil.which("ffmpeg")
 
 
+@functools.lru_cache(maxsize=1)
+def ffprobe_path() -> str | None:
+    """ffprobe 可执行文件；与 ffmpeg 一起安装，缺失时探测能力降级。"""
+    return shutil.which("ffprobe")
+
+
+async def _run(args: list[str], timeout: float) -> tuple[int, str]:
+    """跑一次 ffmpeg/ffprobe 并保证子进程被回收（事件循环不能被同步调用阻塞）。"""
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise MediaDownloadError(f"ffmpeg 执行超时（{timeout}s）") from exc
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+            with contextlib.suppress(BaseException):
+                await process.wait()
+        raise
+    return process.returncode, (stdout or stderr or b"").decode("utf-8", "replace")
+
+
+async def probe_video(path: Path) -> dict:
+    """读取视频编码信息：{codec_v, codec_a, duration_sec}。
+
+    ffprobe 不存在或解析失败时返回空字典，由调用方决定降级——不做隐式安装。
+    """
+    executable = ffprobe_path()
+    if not executable:
+        return {}
+    code, out = await _run([
+        executable, "-v", "error", "-show_entries",
+        "format=duration:stream=codec_type,codec_name",
+        "-of", "json", str(path),
+    ], timeout=60)
+    if code != 0:
+        return {}
+    try:
+        import json
+
+        data = json.loads(out or "{}")
+    except Exception:
+        return {}
+    codec_v, codec_a = "", ""
+    for stream in data.get("streams") or []:
+        if stream.get("codec_type") == "video" and not codec_v:
+            codec_v = str(stream.get("codec_name") or "")
+        elif stream.get("codec_type") == "audio" and not codec_a:
+            codec_a = str(stream.get("codec_name") or "")
+    try:
+        duration = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    return {"codec_v": codec_v, "codec_a": codec_a, "duration_sec": duration}
+
+
+def is_browser_friendly(probe: dict) -> bool:
+    """浏览器原生可播：H.264 视频 + AAC（或无音轨）音频。"""
+    return (probe.get("codec_v") == "h264"
+            and probe.get("codec_a") in ("aac", "", None))
+
+
+async def normalize_video(
+    src: Path, dst: Path, probe: dict | None = None,
+    timeout: float = DEFAULT_MERGE_TIMEOUT,
+) -> dict:
+    """统一成 H.264/AAC 的 progressive MP4，并把 moov 前置（边下边播）。
+
+    - 已是 H.264/AAC：只做 `-c copy -movflags +faststart` 重封装，不重编码；
+    - 其它编码 / HLS 合并后的流：重编码成 libx264 + aac；
+    - ffmpeg 缺失：原样返回 src，并在结果里标 `available=False`，调用方需显式
+      降级并打日志，绝不静默当作已转码。
+
+    返回 {path, transcoded, remuxed, available, reason?}
+    """
+    executable = ffmpeg_path()
+    if not executable:
+        return {"path": src, "transcoded": False, "remuxed": False,
+                "available": False, "reason": "ffmpeg 不可用"}
+    probe = probe or await probe_video(src)
+    friendly = is_browser_friendly(probe)
+    args = [executable, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    if friendly:
+        args += ["-c", "copy"]
+    else:
+        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"]
+    args += ["-movflags", "+faststart", "-f", "mp4", str(dst)]
+
+    code, detail = await _run(args, timeout=timeout)
+    if code != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise MediaDownloadError(
+            f"ffmpeg 归一化失败（退出码 {code}）: {detail[-500:]}")
+    logger.info("[normalize_video] %s -> %s (%d bytes, transcoded=%s)",
+                src.name, dst.name, dst.stat().st_size, not friendly)
+    return {"path": dst, "transcoded": not friendly, "remuxed": friendly,
+            "available": True}
+
+
 def is_available() -> bool:
     """本机是否具备 ffmpeg"""
     return ffmpeg_path() is not None
