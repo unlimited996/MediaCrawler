@@ -563,6 +563,7 @@ class OcrUsage(BaseRecipe):
     """
 
     __tablename__ = "ocr_usage"
+    __table_args__ = {"schema": SCHEMA}
 
     device_id = Column(String(64), primary_key=True)
     used_on = Column(Date, primary_key=True)
@@ -579,6 +580,7 @@ class DeviceCredential(BaseRecipe, TimestampMixin):
     """
 
     __tablename__ = "device_credential"
+    __table_args__ = {"schema": SCHEMA}
 
     device_id = Column(String(64), primary_key=True)
     secret_hash = Column(String(64), nullable=False)
@@ -621,6 +623,7 @@ class MembershipState(BaseRecipe, TimestampMixin):
     """成长值/柴豆汇总。以流水为唯一事实来源，此处只是缓存的汇总。"""
 
     __tablename__ = "membership_state"
+    __table_args__ = {"schema": SCHEMA}
 
     device_id = Column(String(64), primary_key=True)
     points = Column(Integer, nullable=False, server_default="0")
