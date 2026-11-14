@@ -16,6 +16,7 @@ Chromium 关闭时自己把 Cookie 写进去。之后定时任务再用 persiste
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -74,6 +75,8 @@ class _LoginSession:
         self._last_qr: Optional[str] = None
         self.lock = asyncio.Lock()
         self.started_at: Optional[str] = None
+        # 登录成功 / 关闭会话时只发一次「二维码已清除」哨兵，避免 FAB 一直显示过期二维码
+        self._clear_emitted = False
 
     @property
     def active(self) -> bool:
@@ -105,6 +108,10 @@ class _LoginSession:
             if self.active:
                 self.touch()
                 return
+            # 新会话开始：重置清除标记，并先发一次清除哨兵，
+            # 避免上一次异常退出残留的二维码还挂在 FAB 上
+            self._clear_emitted = False
+            self._emit_qrcode_clear()
             # 已有抓取在跑时不能抢同一个 profile
             running = await _running_task_count()
             if running:
@@ -162,6 +169,8 @@ class _LoginSession:
             self.started_at = None
             self._last_qr = None
             LOCK_FILE.unlink(missing_ok=True)
+            # 关闭会话：清除二维码（登录页关闭后不应再弹）
+            self._emit_qrcode_clear()
             if ctx:
                 try:
                     await ctx.close()   # Chromium 在此把 Cookie 刷进 user_data_dir
@@ -219,7 +228,30 @@ class _LoginSession:
             raise RuntimeError("会话未启动")
         self.touch()
         await self._publish_qrcode()
+        # 已登录：页面不再有二维码，发一次清除哨兵让 FAB 收起
+        if await self.logged_in() and not self._clear_emitted:
+            self._emit_qrcode_clear()
+            self._clear_emitted = True
         return await self.page.screenshot(type="jpeg", quality=60)
+
+    def _emit_qrcode_clear(self) -> None:
+        """写一条 [QRCODE_CLEAR] 哨兵到共享实时日志。
+
+        crawler_manager.get_qrcode() 看到比二维码更新的清除哨兵就返回 None，
+        让右下角扫码浮窗收起，避免「明明已登录、刷新后二维码还一直弹」。
+        """
+        try:
+            line = json.dumps({
+                "ts": time.strftime("%H:%M:%S"),
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "level": "info",
+                "msg": "[QRCODE_CLEAR]",
+            }, ensure_ascii=False)
+            LIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(LIVE_LOG, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception:
+            pass
 
     async def input(self, action: str, x: float = 0, y: float = 0,
                     text: str = "", key: str = "", dy: float = 0) -> None:

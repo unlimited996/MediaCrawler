@@ -295,6 +295,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
             if not await self.xhs_client.pong():
+                # pong 失败：先确认浏览器上下文是否已经是登录态。
+                # 复用「原版登录页」写入 browser_data 卷的会话时，浏览器打开就是已登录，
+                # 但 pong 可能因网络冷启动偶发失败；此时不应进扫码流程——页面没有二维码，
+                # login_by_qrcode 会直接 sys.exit() 把任务干掉。已登录就跳过校验直接抓。
+                skip_login = bool(self.browser_context) and await self._browser_logged_in()
                 login_obj = XiaoHongShuLogin(
                     login_type=config.LOGIN_TYPE,
                     login_phone="",  # input your phone number
@@ -302,7 +307,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     context_page=self.context_page,
                     cookie_str=config.COOKIES,
                 )
-                await login_obj.begin()
+                if skip_login:
+                    utils.logger.info(
+                        "[XiaoHongShuCrawler] 浏览器上下文已是登录态，跳过登录校验直接抓取")
+                else:
+                    await login_obj.begin()
                 await self.xhs_client.update_cookies(
                     browser_context=self.browser_context,
                     urls=self.cookie_urls,
@@ -349,6 +358,11 @@ class XiaoHongShuCrawler(AbstractCrawler):
             # web_session 这个键，过期 Cookie 也能通过，会拿死 Cookie 污染账号池，
             # 下次启动又被取出来注入，表现为"每次都登录失败还查不出原因"。
             if await self.xhs_client.pong():
+                # 已登录：清掉可能残留的扫码弹窗（避免右下角 FAB 一直显示过期二维码）
+                try:
+                    utils.logger.info("[QRCODE_CLEAR]")
+                except Exception:
+                    pass
                 try:
                     from tools.cookie_sync import sync_login_to_pool
 
@@ -448,6 +462,33 @@ class XiaoHongShuCrawler(AbstractCrawler):
             f"当前系统代理 = {proxy_env}；"
             f"请确认代理软件已启动且能访问小红书，不需要代理时清空 "
             f"http_proxy/https_proxy 环境变量后重试（或调大 config.PAGE_GOTO_TIMEOUT_SEC）")
+
+    async def _browser_logged_in(self) -> bool:
+        """浏览器上下文是否已经是登录态（用于「原版登录页」已写入会话时跳过登录校验）。
+
+        优先看页面 UI（侧边栏「我」节点），其次看 web_session Cookie 是否存在。
+        任何异常都保守返回 False，交给常规登录流程处理，避免把失效会话误判为已登录
+        导致静默抓不到数据。
+        """
+        try:
+            if self.context_page is None or self.browser_context is None:
+                return False
+            # 1) UI 判定：侧边栏出现「我」说明已登录
+            try:
+                is_visible = await self.context_page.is_visible(
+                    "xpath=//a[contains(@href, '/user/profile/')]//span[text()='我']",
+                    timeout=800,
+                )
+                if is_visible:
+                    return True
+            except Exception:
+                pass
+            # 2) Cookie 判定：上下文里存在 web_session 即认为已登录
+            cookies = await self.browser_context.cookies()
+            _, cookie_dict = utils.convert_cookies(cookies)
+            return bool(cookie_dict.get("web_session"))
+        except Exception:
+            return False
 
     async def _browser_required(self) -> bool:
         """是否需要启动浏览器。

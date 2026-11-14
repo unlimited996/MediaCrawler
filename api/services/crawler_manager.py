@@ -33,6 +33,18 @@ from tools.cst import cst_now
 LIVE_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "scheduler_live.jsonl"
 
 
+def _log_at(raw: str) -> Optional[str]:
+    """从 [QRCODE_*] 日志行里取 at 时间戳（形如 "2026-11-07 09:46:18"）。"""
+    import json
+
+    try:
+        obj = json.loads(raw)
+        at = str(obj.get("at") or "")
+        return at or None
+    except Exception:
+        return None
+
+
 class CrawlerManager:
     """Crawler process manager
 
@@ -542,7 +554,11 @@ class CrawlerManager:
         return live if self._qr_fresh(live) else None
 
     def _qrcode_from_live_log(self) -> Optional[Dict[str, Any]]:
-        """从 worker 实时日志（JSONL，每行含 at/msg）里取最近一条 [QRCODE]。"""
+        """从 worker 实时日志（JSONL，每行含 at/msg）里取最近一条二维码。
+
+        若比二维码更新的 [QRCODE_CLEAR] 哨兵存在（登录页关闭 / 登录成功 / 抓取已登录），
+        则返回 None，让右下角扫码浮窗收起，避免过期二维码一直弹。
+        """
         import json
 
         if not LIVE_LOG_PATH.exists():
@@ -553,30 +569,45 @@ class CrawlerManager:
         except Exception:
             return None
 
+        last_qr: Optional[Dict[str, Any]] = None
+        last_clear_at: Optional[str] = None
         for raw in reversed(lines):
-            if "[QRCODE]" not in raw:
+            # 清除哨兵：记录其时间戳（日志里 at 形如 "2026-11-07 09:46:18"）
+            if last_clear_at is None and "[QRCODE_CLEAR]" in raw:
+                last_clear_at = _log_at(raw)
+                if last_qr is not None:
+                    break
                 continue
-            msg, at = raw, ""
-            try:
-                obj = json.loads(raw)
-                msg, at = str(obj.get("msg") or ""), str(obj.get("at") or "")
-            except Exception:
-                pass
-            idx = msg.find("[QRCODE]")
-            if idx < 0:
-                continue
-            image = msg[idx + len("[QRCODE]"):].strip()
-            if not image.startswith("data:image"):
-                continue
-            # 日志里的 at 形如 "2026-11-07 09:46:18"（无时区），补上 CST
-            try:
-                from tools.cst import CST
-                dt = datetime.strptime(at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST)
-                at_iso = dt.isoformat()
-            except Exception:
-                at_iso = cst_now().isoformat()
-            return {"image": image, "at": at_iso}
-        return None
+            # 二维码行：兼容 [QRCODE]（抓取扫码 / 原版登录页）与 [QRCODE_LOGIN]
+            if last_qr is None and "[QRCODE]" in raw and "[QRCODE_CLEAR]" not in raw:
+                marker = "[QRCODE_LOGIN]" if "[QRCODE_LOGIN]" in raw else "[QRCODE]"
+                msg, at = raw, ""
+                try:
+                    obj = json.loads(raw)
+                    msg, at = str(obj.get("msg") or ""), str(obj.get("at") or "")
+                except Exception:
+                    pass
+                idx = msg.find(marker)
+                if idx < 0:
+                    continue
+                image = msg[idx + len(marker):].strip()
+                if not image.startswith("data:image"):
+                    continue
+                try:
+                    from tools.cst import CST
+                    dt = datetime.strptime(at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST)
+                    at_iso = dt.isoformat()
+                except Exception:
+                    at_iso = cst_now().isoformat()
+                last_qr = {"image": image, "at": at_iso}
+                if last_clear_at is not None:
+                    break
+        if not last_qr:
+            return None
+        # 有比二维码更新的清除哨兵 → 视为已清除
+        if last_clear_at and last_qr["at"] <= last_clear_at:
+            return None
+        return last_qr
 
     async def _get_pool_cookie(self, platform: str) -> Optional[str]:
         """从账号池取该平台的活跃登录态（解密后的 cookie 串）。
@@ -699,6 +730,9 @@ class CrawlerManager:
                     if line:
                         # 二维码行：logging 会给每行加时间戳前缀，所以用包含匹配；
                         # base64 很长，不进日志列表，单独存
+                        if "[QRCODE_CLEAR]" in line:
+                            self.qr_code = None
+                            continue
                         qr_idx = line.find("[QRCODE]")
                         if qr_idx >= 0:
                             self.qr_code = {
@@ -719,6 +753,9 @@ class CrawlerManager:
                     for line in remaining.strip().split('\n'):
                         line = line.strip()
                         if not line:
+                            continue
+                        if "[QRCODE_CLEAR]" in line:
+                            self.qr_code = None
                             continue
                         qr_idx = line.find("[QRCODE]")
                         if qr_idx >= 0:

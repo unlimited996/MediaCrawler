@@ -162,6 +162,11 @@ class XiaoHongShuLogin(AbstractLogin):
 
         wait_redirect_seconds = 5
         utils.logger.info(f"[XiaoHongShuLogin.login_by_mobile] Login successful then wait for {wait_redirect_seconds} seconds redirect ...")
+        # 手机验证码登录成功：清掉扫码弹窗（避免 FAB 残留二维码）
+        try:
+            utils.logger.info("[QRCODE_CLEAR]")
+        except Exception:
+            pass
         await asyncio.sleep(wait_redirect_seconds)
 
     async def login_by_qrcode(self):
@@ -178,13 +183,36 @@ class XiaoHongShuLogin(AbstractLogin):
             utils.logger.info("[XiaoHongShuLogin.login_by_qrcode] login failed , have not found qrcode please check ....")
             # if this website does not automatically popup login dialog box, we will manual click login button
             await asyncio.sleep(0.5)
-            login_button_ele = self.context_page.locator("xpath=//*[@id='app']/div[1]/div[2]/div[1]/ul/div[1]/button")
-            await login_button_ele.click()
-            base64_qrcode_img = await utils.find_login_qrcode(
-                self.context_page,
-                selector=qrcode_img_selector
-            )
+            try:
+                login_button_ele = self.context_page.locator("xpath=//*[@id='app']/div[1]/div[2]/div[1]/ul/div[1]/button")
+                await login_button_ele.click()
+                base64_qrcode_img = await utils.find_login_qrcode(
+                    self.context_page,
+                    selector=qrcode_img_selector
+                )
+            except Exception:
+                # 已经是登录态时登录按钮可能不存在，忽略，交给下面的已登录判定
+                base64_qrcode_img = None
             if not base64_qrcode_img:
+                # 没找到二维码：页面可能已经是登录态（例如复用「原版登录页」写入的会话）。
+                # 这时直接视为已登录返回，而不是 sys.exit() 把整个抓取任务干掉。
+                try:
+                    if await self.check_login_state(""):
+                        utils.logger.info(
+                            "[XiaoHongShuLogin.login_by_qrcode] 页面已是登录态，无需扫码，直接返回")
+                        return
+                except Exception:
+                    pass
+                # 同时再确认一次浏览器上下文确实带 web_session，避免误杀
+                try:
+                    cookies = await self.browser_context.cookies()
+                    _, cookie_dict = utils.convert_cookies(cookies)
+                    if cookie_dict.get("web_session"):
+                        utils.logger.info(
+                            "[XiaoHongShuLogin.login_by_qrcode] 上下文已带 web_session，视为已登录返回")
+                        return
+                except Exception:
+                    pass
                 sys.exit()
 
         # get not logged session
@@ -210,6 +238,11 @@ class XiaoHongShuLogin(AbstractLogin):
         except RetryError:
             utils.logger.info("[XiaoHongShuLogin.login_by_qrcode] Login xiaohongshu failed by qrcode login method ...")
             sys.exit()
+        # 扫码成功：清掉扫码弹窗（避免 FAB 一直显示已扫过的过期二维码）
+        try:
+            utils.logger.info("[QRCODE_CLEAR]")
+        except Exception:
+            pass
 
         wait_redirect_seconds = 5
         utils.logger.info(f"[XiaoHongShuLogin.login_by_qrcode] Login successful then wait for {wait_redirect_seconds} seconds redirect ...")
