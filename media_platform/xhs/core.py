@@ -294,70 +294,77 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
+            # 浏览器上下文是否已经是登录态（「原版登录页」已写入会话时复用，无需再校验）。
+            # 提前算一次，后面账号池同步也用得到。
+            browser_already_logged_in = (
+                bool(self.browser_context) and await self._browser_logged_in())
+
             if not await self.xhs_client.pong():
-                # pong 失败：先确认浏览器上下文是否已经是登录态。
-                # 复用「原版登录页」写入 browser_data 卷的会话时，浏览器打开就是已登录，
-                # 但 pong 可能因网络冷启动偶发失败；此时不应进扫码流程——页面没有二维码，
-                # login_by_qrcode 会直接 sys.exit() 把任务干掉。已登录就跳过校验直接抓。
-                skip_login = bool(self.browser_context) and await self._browser_logged_in()
-                login_obj = XiaoHongShuLogin(
-                    login_type=config.LOGIN_TYPE,
-                    login_phone="",  # input your phone number
-                    browser_context=self.browser_context,
-                    context_page=self.context_page,
-                    cookie_str=config.COOKIES,
-                )
-                if skip_login:
+                # pong 失败：浏览器已登录则跳过整个登录校验直接抓——
+                # pong 可能因网络冷启动偶发失败，但页面/会话确实有效，
+                # 此时万不能进扫码流程（否则会 clear_cookies + 弹码等扫码，任务卡死还不抓数据）。
+                if browser_already_logged_in:
                     utils.logger.info(
                         "[XiaoHongShuCrawler] 浏览器上下文已是登录态，跳过登录校验直接抓取")
+                    await self.xhs_client.update_cookies(
+                        browser_context=self.browser_context,
+                        urls=self.cookie_urls,
+                    )
                 else:
+                    login_obj = XiaoHongShuLogin(
+                        login_type=config.LOGIN_TYPE,
+                        login_phone="",  # input your phone number
+                        browser_context=self.browser_context,
+                        context_page=self.context_page,
+                        cookie_str=config.COOKIES,
+                    )
                     await login_obj.begin()
-                await self.xhs_client.update_cookies(
-                    browser_context=self.browser_context,
-                    urls=self.cookie_urls,
-                )
+                    await self.xhs_client.update_cookies(
+                        browser_context=self.browser_context,
+                        urls=self.cookie_urls,
+                    )
 
-                # Cookie 模式只是把 web_session 塞进浏览器上下文，既不校验也不弹二维码。
-                # Cookie 过期时表现为"没让扫码就直接抓 → 全部跳过 → 显示成功"，
-                # 用户根本不知道是登录态挂了。这里二次校验，仍无效就回退扫码。
-                if not await self.xhs_client.pong():
-                    use_cdp_now = bool(getattr(config, "XHS_ENABLE_CDP_MODE",
-                                               config.ENABLE_CDP_MODE))
-                    headless_now = (bool(getattr(config, "XHS_CDP_HEADLESS",
-                                                 config.CDP_HEADLESS))
-                                    if use_cdp_now else config.HEADLESS)
-                    if headless_now:
-                        utils.logger.warning(
-                            "[XiaoHongShuCrawler] 登录态无效（Cookie 已过期），当前为无头模式无法扫码。"
-                            "请更新 Cookie，或关闭无头模式后重试（届时会弹出扫码）")
-                    else:
-                        utils.logger.warning(
-                            "[XiaoHongShuCrawler] 登录态无效（Cookie 已过期），回退到扫码登录："
-                            "请在弹出的浏览器窗口中扫描二维码 ...")
-                        # 先清掉失效 Cookie 再刷新，否则页面停在"有 session 但服务端不认"的
-                        # 假登录态，登录弹窗不出来，login_by_qrcode 会直接 sys.exit()
-                        try:
-                            await self.browser_context.clear_cookies()
-                            await self.context_page.reload()
-                            await asyncio.sleep(2)
-                        except Exception as e:
+                    # Cookie 模式只是把 web_session 塞进浏览器上下文，既不校验也不弹二维码。
+                    # Cookie 过期时表现为"没让扫码就直接抓 → 全部跳过 → 显示成功"，
+                    # 用户根本不知道是登录态挂了。这里二次校验，仍无效就回退扫码。
+                    if not await self.xhs_client.pong():
+                        use_cdp_now = bool(getattr(config, "XHS_ENABLE_CDP_MODE",
+                                                   config.ENABLE_CDP_MODE))
+                        headless_now = (bool(getattr(config, "XHS_CDP_HEADLESS",
+                                                     config.CDP_HEADLESS))
+                                        if use_cdp_now else config.HEADLESS)
+                        if headless_now:
                             utils.logger.warning(
-                                f"[XiaoHongShuCrawler] 清理失效 Cookie 失败（继续尝试扫码）：{e}")
-                        await login_obj.login_by_qrcode()
-                        await self.xhs_client.update_cookies(
-                            browser_context=self.browser_context,
-                            urls=self.cookie_urls,
-                        )
-                        if not await self.xhs_client.pong():
+                                "[XiaoHongShuCrawler] 登录态无效（Cookie 已过期），当前为无头模式无法扫码。"
+                                "请更新 Cookie，或关闭无头模式后重试（届时会弹出扫码）")
+                        else:
                             utils.logger.warning(
-                                "[XiaoHongShuCrawler] 扫码后登录态仍无效，本次抓取可能拿不到数据")
+                                "[XiaoHongShuCrawler] 登录态无效（Cookie 已过期），回退到扫码登录："
+                                "请在弹出的浏览器窗口中扫描二维码 ...")
+                            # 先清掉失效 Cookie 再刷新，否则页面停在"有 session 但服务端不认"的
+                            # 假登录态，登录弹窗不出来，login_by_qrcode 会直接 sys.exit()
+                            try:
+                                await self.browser_context.clear_cookies()
+                                await self.context_page.reload()
+                                await asyncio.sleep(2)
+                            except Exception as e:
+                                utils.logger.warning(
+                                    f"[XiaoHongShuCrawler] 清理失效 Cookie 失败（继续尝试扫码）：{e}")
+                            await login_obj.login_by_qrcode()
+                            await self.xhs_client.update_cookies(
+                                browser_context=self.browser_context,
+                                urls=self.cookie_urls,
+                            )
+                            if not await self.xhs_client.pong():
+                                utils.logger.warning(
+                                    "[XiaoHongShuCrawler] 扫码后登录态仍无效，本次抓取可能拿不到数据")
 
             # 登录态同步到账号池（无论本次是否触发登录流程）：
             # 热榜抓取/无浏览器模式走 httpx，需要这里的 Cookie。
             # 只在服务端确认有效时才写回——looks_logged_in 只看 Cookie 里有没有
             # web_session 这个键，过期 Cookie 也能通过，会拿死 Cookie 污染账号池，
             # 下次启动又被取出来注入，表现为"每次都登录失败还查不出原因"。
-            if await self.xhs_client.pong():
+            if await self.xhs_client.pong() or browser_already_logged_in:
                 # 已登录：清掉可能残留的扫码弹窗（避免右下角 FAB 一直显示过期二维码）
                 try:
                     utils.logger.info("[QRCODE_CLEAR]")
