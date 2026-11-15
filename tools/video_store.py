@@ -22,12 +22,12 @@ import os
 import shutil
 import tempfile
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from database.models_v2 import VideoAsset
 from tools import utils
@@ -386,6 +386,28 @@ async def backfill_story(session, story_id: int) -> Dict[str, Any]:
             "content_id": info["content_id"]}
 
 
+_STALE_UPLOAD_MIN = int(os.getenv("VIDEO_STALE_UPLOAD_MIN", "15"))
+
+
+async def reap_stale_uploading(session) -> int:
+    """回收僵尸 uploading 记录。
+
+    进程崩溃 / 容器重启会把记录永久留在 uploading（批量只捡 pending/failed），
+    表现为「一直转码中」且永不重试。超过阈值就重新排队。
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=_STALE_UPLOAD_MIN)
+    res = await session.execute(
+        update(VideoAsset)
+        .where(VideoAsset.status == "uploading", VideoAsset.created_at < cutoff)
+        .values(status="pending", last_error="上传中断，已重新排队")
+    )
+    await session.commit()
+    reaped = res.rowcount or 0
+    if reaped:
+        utils.logger.warning("[video_store] 回收 %d 条僵尸 uploading 记录", reaped)
+    return reaped
+
+
 async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
     """处理 pending / 失败待重试的记录；同一时刻只允许一批（进程内锁）。"""
     global _BATCH_LOCK
@@ -395,6 +417,7 @@ async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
         async with _v2_session() as session:
             if session is None:
                 return {"processed": 0, "error": "配置库不可用"}
+            await reap_stale_uploading(session)
             rows = (await session.execute(
                 select(VideoAsset).where(
                     VideoAsset.status.in_(("pending", "failed")),

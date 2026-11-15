@@ -29,7 +29,9 @@ import asyncio
 import contextlib
 import functools
 import logging
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 from .types import MediaDownloadError
@@ -37,6 +39,13 @@ from .types import MediaDownloadError
 logger = logging.getLogger("MediaCrawler.media_downloader.ffmpeg")
 
 DEFAULT_MERGE_TIMEOUT = 300.0
+
+# 重编码线程上限：留出 CPU 给 API / 抓取，避免一条视频把整机压满。
+# 0 表示交给 ffmpeg 自己按核数决定。
+_SOFT_THREADS = int(os.getenv("VIDEO_FFMPEG_THREADS", "4") or 4)
+_SOFT_PRESET = os.getenv("VIDEO_FFMPEG_PRESET", "superfast")
+_SOFT_CRF = os.getenv("VIDEO_FFMPEG_CRF", "24")
+_ENCODER_CACHE: dict[str, bool] = {}
 
 
 @functools.lru_cache(maxsize=1)
@@ -113,6 +122,58 @@ def is_browser_friendly(probe: dict) -> bool:
             and probe.get("codec_a") in ("aac", "", None))
 
 
+def _ffmpeg_has_encoder(name: str) -> bool:
+    """ffmpeg 是否编进了某个编码器（缓存，避免每条视频都跑一次 -encoders）。"""
+    cached = _ENCODER_CACHE.get(name)
+    if cached is not None:
+        return cached
+    exe = ffmpeg_path()
+    ok = False
+    if exe:
+        try:
+            out = subprocess.run([exe, "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True, timeout=15).stdout
+            ok = name in (out or "")
+        except Exception:
+            ok = False
+    _ENCODER_CACHE[name] = ok
+    return ok
+
+
+def _hw_encode_spec() -> tuple[list[str], list[str]]:
+    """硬件编码参数 ``(全局参数, 输出参数)``；不可用返回 ``([], [])``。
+
+    只做 VAAPI（Intel / AMD 核显通用）。真正生效还需要：
+      * 容器挂载 ``/dev/dri``（compose: ``devices: ["/dev/dri:/dev/dri"]``）
+      * 镜像内装 Intel/AMD 的 VAAPI 驱动（见 docs/DEPLOY_SPLIT.md）
+    探测不到就静默回退 libx264，不影响任何现有部署。
+    用 ``VIDEO_HWACCEL=none`` 可强制关闭，``VIDEO_VAAPI_DEVICE`` 可改设备路径。
+    """
+    mode = os.getenv("VIDEO_HWACCEL", "auto").strip().lower()
+    if mode in ("none", "off", "0", "false"):
+        return [], []
+    device = os.getenv("VIDEO_VAAPI_DEVICE", "/dev/dri/renderD128")
+    if (mode in ("auto", "vaapi") and Path(device).exists()
+            and _ffmpeg_has_encoder("h264_vaapi")):
+        return (["-vaapi_device", device],
+                ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "24"])
+    return [], []
+
+
+def _soft_encode_args() -> list[str]:
+    """软件编码参数：画质可接受的前提下尽量少占 CPU / 内存。
+
+    实测 1440x2560 的 HEVC 源：默认 veryfast 吃 8.5 核 / 1.68GB；
+    限 4 线程 + 关 lookahead 后降到 2.7 核 / 0.9GB。
+    可用环境变量覆盖：VIDEO_FFMPEG_PRESET / VIDEO_FFMPEG_CRF / VIDEO_FFMPEG_THREADS。
+    """
+    args = ["-c:v", "libx264", "-preset", _SOFT_PRESET, "-crf", _SOFT_CRF,
+            "-pix_fmt", "yuv420p", "-rc-lookahead", "0", "-refs", "1", "-bf", "2"]
+    if _SOFT_THREADS > 0:
+        args += ["-threads", str(_SOFT_THREADS)]
+    return args + ["-c:a", "aac", "-b:a", "128k"]
+
+
 async def normalize_video(
     src: Path, dst: Path, probe: dict | None = None,
     timeout: float = DEFAULT_MERGE_TIMEOUT,
@@ -132,16 +193,29 @@ async def normalize_video(
                 "available": False, "reason": "ffmpeg 不可用"}
     probe = probe or await probe_video(src)
     friendly = is_browser_friendly(probe)
-    args = [executable, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    tail = ["-movflags", "+faststart", "-f", "mp4", str(dst)]
+    head = [executable, "-hide_banner", "-loglevel", "error", "-y"]
+
+    hw_global: list[str] = []
     if friendly:
-        args += ["-c", "copy"]
+        args = head + ["-i", str(src), "-c", "copy"] + tail
     else:
-        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"]
-    args += ["-movflags", "+faststart", "-f", "mp4", str(dst)]
+        hw_global, hw_out = _hw_encode_spec()
+        encode = hw_out or _soft_encode_args()
+        args = head + hw_global + ["-i", str(src)] + encode + tail
 
     code, detail = await _run(args, timeout=timeout)
-    if code != 0 or not dst.exists() or dst.stat().st_size == 0:
+    ok = code == 0 and dst.exists() and dst.stat().st_size > 0
+    if not ok and hw_global:
+        # 硬件编码失败（驱动/设备不支持）时自动回退软件编码，不让整条任务失败
+        logger.warning("[normalize_video] 硬件编码失败，回退 libx264：%s",
+                       detail[-200:])
+        if dst.exists():
+            dst.unlink(missing_ok=True)
+        args = head + ["-i", str(src)] + _soft_encode_args() + tail
+        code, detail = await _run(args, timeout=timeout)
+        ok = code == 0 and dst.exists() and dst.stat().st_size > 0
+    if not ok:
         raise MediaDownloadError(
             f"ffmpeg 归一化失败（退出码 {code}）: {detail[-500:]}")
     logger.info("[normalize_video] %s -> %s (%d bytes, transcoded=%s)",

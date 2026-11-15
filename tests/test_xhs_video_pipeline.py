@@ -255,3 +255,101 @@ def test_ssr_importable_without_crawler_deps():
     proc = subprocess.run([sys.executable, "-c", code], cwd=str(root),
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr[-1000:]
+
+
+def _stream_item(url: str, w: int, h: int, codec: str) -> dict:
+    return {"masterUrl": url, "width": w, "height": h,
+            "videoCodec": codec, "avg_bitrate": w * h}
+
+
+def test_extract_prefers_h264_stream(monkeypatch):
+    """免转码优先：h264 分档排最前，origin/其它编码兜底在后面。"""
+    import config as cfg
+    from media_platform.xhs.media import extract_video_urls
+
+    monkeypatch.setattr(cfg, "XHS_VIDEO_PREFER_H264", True, raising=False)
+    item = {"type": "video", "video": {
+        "consumer": {"originVideoKey": "orig/608.mp4"},
+        "media": {"stream": {
+            "h265": [_stream_item("http://x/608.mp4", 1440, 2560, "hevc")],
+            "h264": [_stream_item("http://x/258.mp4", 720, 1280, "h264")],
+        }},
+    }}
+    urls = extract_video_urls(item)
+    assert urls[0].endswith("/258.mp4"), urls
+    assert urls[-1].endswith("/orig/608.mp4"), urls
+
+
+def test_extract_falls_back_when_no_h264(monkeypatch):
+    """没有 h264 档时，仍按清晰度给出其它编码（调用方会重编码）。"""
+    import config as cfg
+    from media_platform.xhs.media import extract_video_urls
+
+    monkeypatch.setattr(cfg, "XHS_VIDEO_PREFER_H264", True, raising=False)
+    item = {"type": "video", "video": {"media": {"stream": {
+        "h265": [_stream_item("http://x/608.mp4", 1440, 2560, "hevc")],
+    }}}}
+    assert extract_video_urls(item) == ["http://x/608.mp4"]
+
+
+def test_extract_can_opt_out_of_h264_preference(monkeypatch):
+    """XHS_VIDEO_PREFER_H264=False 时回到清晰度优先（画质最高但要转码）。"""
+    import config as cfg
+    from media_platform.xhs.media import extract_video_urls
+
+    monkeypatch.setattr(cfg, "XHS_VIDEO_PREFER_H264", False, raising=False)
+    item = {"type": "video", "video": {"media": {"stream": {
+        "h265": [_stream_item("http://x/608.mp4", 1440, 2560, "hevc")],
+        "h264": [_stream_item("http://x/258.mp4", 720, 1280, "h264")],
+    }}}}
+    urls = extract_video_urls(item)
+    assert urls[0].endswith("/608.mp4"), urls
+
+
+def _stream_item(url: str, w: int, h: int, codec: str) -> dict:
+    return {"masterUrl": url, "width": w, "height": h,
+            "videoCodec": codec, "avg_bitrate": w * h}
+
+
+def test_extract_prefers_h264_stream(monkeypatch):
+    """免转码优先：h264 分档排最前，origin/其它编码兜底在后面。"""
+    import config as cfg
+    from media_platform.xhs.media import extract_video_urls
+
+    monkeypatch.setattr(cfg, "XHS_VIDEO_PREFER_H264", True, raising=False)
+    item = {"type": "video", "video": {
+        "consumer": {"originVideoKey": "orig/608.mp4"},
+        "media": {"stream": {
+            "h265": [_stream_item("http://x/608.mp4", 1440, 2560, "hevc")],
+            "h264": [_stream_item("http://x/258.mp4", 720, 1280, "h264")],
+        }},
+    }}
+    urls = extract_video_urls(item)
+    assert urls[0].endswith("/258.mp4"), urls
+    assert urls[-1].endswith("/orig/608.mp4"), urls
+
+
+def test_extract_falls_back_when_no_h264(monkeypatch):
+    """没有 h264 档时，仍按清晰度给出其它编码（调用方会重编码）。"""
+    import config as cfg
+    from media_platform.xhs.media import extract_video_urls
+
+    monkeypatch.setattr(cfg, "XHS_VIDEO_PREFER_H264", True, raising=False)
+    item = {"type": "video", "video": {"media": {"stream": {
+        "h265": [_stream_item("http://x/608.mp4", 1440, 2560, "hevc")],
+    }}}}
+    assert extract_video_urls(item) == ["http://x/608.mp4"]
+
+
+def test_extract_can_opt_out_of_h264_preference(monkeypatch):
+    """XHS_VIDEO_PREFER_H264=False 时回到清晰度优先（画质最高但要转码）。"""
+    import config as cfg
+    from media_platform.xhs.media import extract_video_urls
+
+    monkeypatch.setattr(cfg, "XHS_VIDEO_PREFER_H264", False, raising=False)
+    item = {"type": "video", "video": {"media": {"stream": {
+        "h265": [_stream_item("http://x/608.mp4", 1440, 2560, "hevc")],
+        "h264": [_stream_item("http://x/258.mp4", 720, 1280, "h264")],
+    }}}}
+    urls = extract_video_urls(item)
+    assert urls[0].endswith("/608.mp4"), urls

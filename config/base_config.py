@@ -71,6 +71,11 @@ PLATFORM = "xhs"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
 # 开启后 API 走 webapi.rednote.com，cookie 域使用 .rednote.com
 XHS_INTERNATIONAL = False
 
+# 视频转储优先选 H.264 分档（浏览器原生可播 → 下载后 `-c copy` 零转码）。
+# 关掉则按清晰度优先取 originVideoKey 原片 / h265 档，画质更高，
+# 但每条都要重编码，NAS 上 CPU 会被打满（1440x2560 实测 8.5 核 / 1.7GB）。
+XHS_VIDEO_PREFER_H264 = True
+
 # 搜索关键词：**不设默认值**。搜索模式下为空会直接拒绝启动，
 # 避免出现"用户没填却默默用内置关键词抓取"的诡异行为。
 KEYWORDS = ""  # Keyword search configuration, separated by English commas

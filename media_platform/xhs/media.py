@@ -89,12 +89,38 @@ def _iter_stream_items(stream: Dict) -> List[Dict]:
     ]
 
 
-def extract_video_urls(note_item: Dict) -> List[str]:
-    """提取视频地址候选列表，按可用性排序。
+def _iter_stream_buckets(stream: Dict):
+    """按 (分档名, 条目) 遍历 stream。
 
-    优先无水印源片（origin_video_key），其余按清晰度从高到低排。
-    同一分档内含多个分辨率（720P→4K），取最高的作主地址，其余交给下载器回退。
-    国际版（rednote）的 CDN 域名与国内不同，不能拼接 xhscdn 域名。
+    分档名就是编码名：h264 / h265 / h266 / av1。上游换过命名方式，
+    所以编码另从条目字段取，取不到才用分档名兜底。
+    """
+    for name, bucket in (stream or {}).items():
+        if not isinstance(bucket, list):
+            continue
+        for item in bucket:
+            if not isinstance(item, dict):
+                continue
+            if _stream_master_url(item) or _stream_backup_urls(item):
+                yield str(name).lower(), item
+
+
+def _stream_codec(bucket_name: str, item: Dict) -> str:
+    codec = (item.get("videoCodec") or item.get("video_codec")
+             or item.get("codec") or bucket_name)
+    return str(codec or "").strip().lower()
+
+
+def extract_video_urls(note_item: Dict) -> List[str]:
+    """提取视频地址候选列表，按「免转码优先」排序。
+
+    小红书同一帖会同时给 h264 / h265 / h266 / av1 多个分档，但**只有 h264
+    是浏览器原生可播的**，其余下载后必须重编码 —— 1440x2560 的 HEVC 在 NAS 上
+    实测要 8.5 核 / 1.7GB 内存，一条就把机器压满。
+
+    所以默认把 h264 分档排最前（下载后 `-c copy` 重封装，零转码），
+    originVideoKey 原片与其它编码放到最后兜底。需要最高画质可设
+    `XHS_VIDEO_PREFER_H264 = False` 改回清晰度优先。
     """
     if note_item.get("type") != "video":
         return []
@@ -103,17 +129,32 @@ def extract_video_urls(note_item: Dict) -> List[str]:
     if not video_dict:
         return []
 
-    urls: List[str] = []
-    origin_video_key = _extract_origin_video_key(video_dict)
-    if origin_video_key and not getattr(config, "XHS_INTERNATIONAL", False):
-        urls.append(f"{XHS_VIDEO_CDN_HOST}/{origin_video_key}")
-
     stream = _as_dict(_as_dict(video_dict.get("media")).get("stream"))
-    ranked = sorted(_iter_stream_items(stream), key=_stream_quality_key, reverse=True)
-    for item in ranked:
+    compat: List[Dict] = []
+    other: List[Dict] = []
+    for name, item in _iter_stream_buckets(stream):
+        (compat if _stream_codec(name, item) == "h264" else other).append(item)
+    compat.sort(key=_stream_quality_key, reverse=True)
+    other.sort(key=_stream_quality_key, reverse=True)
+
+    urls: List[str] = []
+
+    def _add(item: Dict) -> None:
         for url in [_stream_master_url(item), *_stream_backup_urls(item)]:
             if url and url not in urls:
                 urls.append(url)
+
+    prefer_h264 = bool(getattr(config, "XHS_VIDEO_PREFER_H264", True))
+    ordered = (compat + other) if (prefer_h264 and compat) else (other + compat)
+    for item in ordered:
+        _add(item)
+
+    # 无水印原片放最后：分辨率最高，但几乎一定要重编码
+    origin_video_key = _extract_origin_video_key(video_dict)
+    if origin_video_key and not getattr(config, "XHS_INTERNATIONAL", False):
+        origin = f"{XHS_VIDEO_CDN_HOST}/{origin_video_key}"
+        if origin not in urls:
+            urls.append(origin)
 
     return urls
 

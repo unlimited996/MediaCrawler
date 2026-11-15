@@ -95,6 +95,13 @@ services:
       GATEWAY_ENABLED: "1"
       # 容器内直连 crawler 服务的兜底地址（Nacos 正常时优先用 Nacos 发现）
       CRAWLER_BASE_URL: http://crawler:8001
+      # 硬件转码开关：auto=探测到 /dev/dri 就用 VAAPI，none=强制软编码。
+      # 代码自动探测，主机没有核显/没挂设备时会静默回退 libx264。
+      VIDEO_HWACCEL: ${VIDEO_HWACCEL:-auto}
+    # 主机有核显（Intel/AMD）时取消下面两行注释，把 /dev/dri 透传给容器，
+    # ffmpeg 会自动改用 h264_vaapi 硬件编码（CPU 占用可从 4 核降到 1 核以内）。
+    # devices:
+    #   - /dev/dri:/dev/dri
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data

@@ -259,6 +259,8 @@ RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
             /etc/apt/sources.list 2>/dev/null || true; \
     fi \
     && apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && (apt-get install -y --no-install-recommends i965-va-driver mesa-va-drivers \
+        || echo "[library] VAAPI 驱动不可用，跳过（继续用软编码）") \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
               /usr/share/doc/* /usr/share/man/* /usr/share/info/* \

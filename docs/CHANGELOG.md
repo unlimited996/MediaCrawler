@@ -5,6 +5,38 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-16] 优化：视频优先免转码 + 大幅降低 ffmpeg CPU / 内存
+
+线上现象：转「万能浇头冰版梅花肉」时 ffmpeg 吃满 CPU、内存到 GB 级，一条要十几分钟。
+
+根因：`extract_video_urls` 把 `originVideoKey`（1440×2560 HEVC 原片）排在第一位，
+而小红书同帖其实同时给了 **h264 分档（720×1280，浏览器原生可播）**。
+选了 HEVC 就必须重编码，NAS 上一条就是 8.5 核 / 1.68GB。
+
+### 1. 首选 h264 分档，直接免转码
+- 选流顺序改为 **h264 分档优先**（`XHS_VIDEO_PREFER_H264`，默认开），
+  `originVideoKey` 与其它编码放到最后兜底。
+- 实测同一条视频：下载 h264 档后 `normalize_video` 走 `-c copy` 重封装，
+  **0.29 秒**完成（原 HEVC 重编码 31.7 秒 / 8.5 核 / 1.68GB），CPU 近乎为零。
+- 需要最高画质可设 `XHS_VIDEO_PREFER_H264 = False` 回到清晰度优先。
+
+### 2. 必须重编码时压到「慢一点也别把机器压死」
+- `veryfast / crf23` → **`superfast / crf24`**，并加 `-threads 4`
+  `-rc-lookahead 0` `-refs 1`（都可用环境变量覆盖）。
+- 实测 1440×2560 HEVC：峰值内存 **1678MB → 794MB（-53%）**，
+  平均核数 **8.5 → 4.6（-46%）**，耗时基本持平（31.7s → 33.2s），输出体积 +44%。
+
+### 3. 可选硬件转码（VAAPI）
+- `VIDEO_HWACCEL=auto` 时自动探测 `/dev/dri/renderD128` 与 `h264_vaapi`，
+  可用就硬编、不可用静默回退 libx264；显式 `none` 可关闭。
+- 镜像容错安装 `i965-va-driver` / `mesa-va-drivers`；compose 里给了
+  `devices: ["/dev/dri:/dev/dri"]` 的注释示例（没有核显的机器不要开）。
+
+### 4. 回收僵尸 uploading
+- 进程崩溃 / 容器重启会把记录永久留在 `uploading`，批量只捡 `pending/failed`，
+  表现为「一直转码中」且永不重试。现在超过 `VIDEO_STALE_UPLOAD_MIN`
+  （默认 15 分钟）自动重新排队。
+
 ## [2026-11-15] 修复：视频改为「封面点击播放」+ 播放 0kb/s
 
 ### 播放 0kb/s
