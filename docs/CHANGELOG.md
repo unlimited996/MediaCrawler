@@ -5,6 +5,53 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-15] 视频转储跑通：桶回退 + 登记开关 + 存量补建
+
+线上现象：抓过的视频帖详情页没有播放器，S3 里也查不到视频。逐层排查后
+定位到 **三个彼此独立的断点**，这一版全部修掉，并在本机对真实帖子跑通了
+「登记 → 下载 → 转码 → 上传 S3 → Range 播放」全链路。
+
+### 1. 修复：`videos` 桶不存在导致整条链路失败（直接原因）
+- 线上对象存储只有 `photos` 桶，`videos` 桶**从未创建**，且这把 key 无建桶
+  权限（`head_bucket` 403 / `create_bucket` 报 `BucketAlreadyExists`）。
+  原来的 `ensure_bucket()` 直接抛错，每条视频都在最后一步失败。
+- 新增 `video_target()`：独立 `videos` 桶可用就用它；不可用自动退回
+  **当前图片备份桶 + `videos/` 前缀**（`videos/xhs/<content_id>/<sha16>.mp4`），
+  并在日志里提示「如需独立桶请自行创建并授权」。
+- 读/删对象改为**按库表记录的 `bucket` 字段**取存储配置
+  （`stream`、`purge`、`video_settings(bucket=...)`），不再用默认桶去猜。
+
+### 2. 修复：抓取侧根本没登记（没人写 `video_asset`）
+- **手动「详情」抓取**原来不注入 `ENABLE_VIDEO_BACKUP`，视频帖只落文字+封面；
+  现在 `crawler_manager` 在 `crawler_type == detail` 时注入 `=1`
+  （列表/搜索/创作者模式仍按配置默认关闭，避免批量拉片）。
+- **账号行为抓取**（点赞/收藏）原来无条件跳过视频帖，开关形同虚设；
+  现在开关打开时视频帖照常抓详情（拿到直链登记 + 视频帖评论）。
+
+### 3. 修复：SSR 兜底抓到的视频解析成 0 条
+- `extract_video_urls()` 只认 snake_case `master_url`，而
+  `__INITIAL_STATE__`（免登录 SSR 兜底）给的是 camelCase `masterUrl`。
+  现在两种都认，并把 `backupUrls` 一并收进候选直链。
+
+### 4. 新增：存量视频帖「转储视频」（不必重抓）
+- `POST /videos/backfill`（body `{story_id}`）：优先用抓取时已落在
+  `story_chapter.ext.video_url` 的直链；缺失时免登录重拉详情页补解析。
+  幂等登记后交给后台批处理，详情页轮询自动出播放器。
+- `GET /stories/{id}` 的 chapters 增加 `note_type` / `has_video_source`；
+  详情页据此在**没有视频记录**时显示「转储视频」按钮。
+
+### 5. 回退：登录块恢复原始流程
+- 上一版「浏览器已登录就跳过登录校验」方向不对（判断的是另一套 profile），
+  已还原为原始逻辑（仅保留登录成功时发 `[QRCODE_CLEAR]`）。
+
+### 测试
+- `tests/test_xhs_video_pipeline.py`（8 例）：驼峰/蛇形直链解析、
+  按 story 补建、非视频帖拒绝、幂等、登记钩子开/关两态。
+- `tests/test_videos_api.py`（6 例）随新签名更新。
+- 本机实跑：真实帖子 96,669,824B 源片 → 转码 H.264/AAC 196.5s →
+  上传 `photos/videos/xhs/...`；`GET /videos/{id}/stream` 返回 206 +
+  `bytes 0-2047/96669823`，首字节含 `ftyp`。
+
 ## [2026-11-13] 小红书视频贴转储 S3 videos 桶 + 镜像构建精简
 
 需求：视频贴转储到 `videos` 桶；定时任务默认不勾选；统一 H.264/AAC MP4

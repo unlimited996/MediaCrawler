@@ -93,10 +93,10 @@ async def create_video(payload: VideoCreate):
         )).scalar_one_or_none()
         if payload.run and row.status != "uploaded":
             try:
-                settings, _ = await store.video_settings(session)
+                settings, prefix = await store.video_target(session)
             except Exception as e:
                 raise HTTPException(status_code=503, detail=f"S3 存储不可用：{e}") from e
-            result = await store.archive_video(session, row, settings)
+            result = await store.archive_video(session, row, settings, prefix)
             if not result.get("ok"):
                 raise HTTPException(
                     status_code=502, detail=result.get("error") or "视频转储失败")
@@ -158,6 +158,36 @@ async def run_batch(limit: int = Query(5, ge=1, le=50)):
             **({} if started else {"message": "批处理已在运行"})}
 
 
+class VideoBackfill(BaseModel):
+    story_id: int = Field(description="要补建视频转储的内容（story）ID")
+
+
+@router.post("/backfill")
+async def backfill_video(payload: VideoBackfill):
+    """按内容补建转储：用抓取时已存的直链（缺失时免登录重拉详情解析）。
+
+    存量视频帖抓取时没开转储开关，库里没有视频记录；这个入口让详情页
+    可以就地补齐，不必重新抓一遍帖子。
+    """
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        result = await store.backfill_story(session, payload.story_id)
+        if not result.get("ok"):
+            raise HTTPException(status_code=422, detail=result.get("error") or "登记失败")
+        row = (await session.execute(
+            select(VideoAsset).where(VideoAsset.id == result["id"])
+        )).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=500, detail="登记后读取记录失败")
+        _schedule_batch()
+        return _out(row)
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
 @router.get("/{video_id}")
 async def get_video(video_id: int):
     engine, session = await _session()
@@ -206,7 +236,7 @@ async def stream_video(video_id: int, request: Request):
         if row is None or not row.object_key:
             raise HTTPException(status_code=404, detail="视频尚未转储")
         try:
-            settings, _ = await store.video_settings(session)
+            settings, _ = await store.video_settings(session, bucket=row.bucket)
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"S3 存储不可用：{e}") from e
 

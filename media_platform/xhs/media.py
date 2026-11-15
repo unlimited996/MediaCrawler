@@ -58,6 +58,21 @@ def _stream_quality_key(item: Dict) -> tuple:
     return (_to_int(item.get("height")), _to_int(item.get("avg_bitrate")))
 
 
+def _stream_master_url(item: Dict) -> str:
+    """分档条目的主地址。接口是 snake_case（master_url），
+    SSR（__INITIAL_STATE__）里是 camelCase（masterUrl）——两种都要认，
+    否则免登录 SSR 兜底抓到的视频会静默提取成 0 条。"""
+    return item.get("master_url") or item.get("masterUrl") or ""
+
+
+def _stream_backup_urls(item: Dict) -> List[str]:
+    """分档条目的备用地址（同样兼容 snake_case / camelCase）。"""
+    raw = item.get("backup_urls") or item.get("backupUrls") or []
+    if not isinstance(raw, list):
+        return []
+    return [u for u in raw if isinstance(u, str) and u]
+
+
 def _iter_stream_items(stream: Dict) -> List[Dict]:
     """摊平 stream 下的全部分档条目。
 
@@ -70,7 +85,7 @@ def _iter_stream_items(stream: Dict) -> List[Dict]:
         for bucket in stream.values()
         if isinstance(bucket, list)
         for item in bucket
-        if isinstance(item, dict) and item.get("master_url")
+        if isinstance(item, dict) and _stream_master_url(item)
     ]
 
 
@@ -96,9 +111,9 @@ def extract_video_urls(note_item: Dict) -> List[str]:
     stream = _as_dict(_as_dict(video_dict.get("media")).get("stream"))
     ranked = sorted(_iter_stream_items(stream), key=_stream_quality_key, reverse=True)
     for item in ranked:
-        master_url = item["master_url"]
-        if master_url not in urls:
-            urls.append(master_url)
+        for url in [_stream_master_url(item), *_stream_backup_urls(item)]:
+            if url and url not in urls:
+                urls.append(url)
 
     return urls
 

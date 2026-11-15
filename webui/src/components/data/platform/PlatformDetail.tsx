@@ -311,6 +311,8 @@ export function PlatformStoryDetail({
   // 话题从标题/正文里摘出来：标题栏只留纯文本，话题走正文底部的彩色标签
   // topics 一并并进 d.tags，各布局现有的标签渲染块直接复用
   const { d } = useMemo(() => extractTopics(detailQ.data), [detailQ.data])
+  /** 视频帖：后端把平台原始类型放在 chapters[].note_type 上 */
+  const isVideoPost = ((d as any)?.chapters?.[0]?.note_type === 'video')
   const theme = getPlatformTheme(d.platform)
 
   const commentsToolbar = (
@@ -583,7 +585,7 @@ export function PlatformStoryDetail({
         ) : readonly ? (
           // 只读模式（访客）：不提供改判入口，立场徽标自动变为不可点
           <RepliesContext.Provider value={{ showReplies, storyId }}>
-            <VideoAttachment storyId={storyId} />
+            <VideoAttachment storyId={storyId} isVideo={isVideoPost} />
             {renderLayout()}
 
             {/* 滚动到底自动加载下一页评论；没有更多时给出总数提示 */}
@@ -618,7 +620,7 @@ export function PlatformStoryDetail({
         ) : (
           <RepliesContext.Provider value={{ showReplies, storyId }}>
             <StanceEditContext.Provider value={{ open: setStanceEditTarget }}>
-            <VideoAttachment storyId={storyId} />
+            <VideoAttachment storyId={storyId} isVideo={isVideoPost} />
             {renderLayout()}
 
             {/* 滚动到底自动加载下一页评论；没有更多时给出总数提示 */}

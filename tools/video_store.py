@@ -48,8 +48,12 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def video_settings(session):
-    """复用当前启用的 S3 配置，只把 Bucket 换成 videos（凭据/endpoint 不变）。"""
+async def video_settings(session, bucket: Optional[str] = None):
+    """复用当前启用的 S3 配置，只把 Bucket 换成视频桶（凭据/endpoint 不变）。
+
+    `bucket` 传入时以它为准——数据库里记录的是「实际写进哪个桶」，
+    读对象/删对象必须按记录走，不能再用默认视频桶去猜。
+    """
     from tools.media_backup import active_settings
     from tools.s3_client import S3Settings
 
@@ -57,7 +61,49 @@ async def video_settings(session):
     if cfg is None:
         raise RuntimeError("未配置可用的 S3 存储")
     base: S3Settings = cfg["settings"]
-    return replace(base, bucket=VIDEO_BUCKET), cfg.get("config_id")
+    return replace(base, bucket=bucket or VIDEO_BUCKET), cfg.get("config_id")
+
+
+async def _bucket_usable(settings) -> bool:
+    """探测某个桶当前能否读写（head → list → create 三级尝试）。"""
+    from tools.s3_client import call
+
+    for op, kwargs in (
+        ("head_bucket", {"Bucket": settings.bucket}),
+        ("list_objects_v2", {"Bucket": settings.bucket, "MaxKeys": 1}),
+        ("create_bucket", {"Bucket": settings.bucket}),
+    ):
+        try:
+            await call(settings, op, **kwargs)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def video_target(session):
+    """选定可写的视频落地目标，返回 `(settings, key_prefix)`。
+
+    优先用独立的 `videos` 桶；但对象存储常常不给我们建桶权限
+    （Garage 里这把 key 只被授权到某个已存在的桶，建桶会直接报错），
+    此时自动退回**当前图片备份所用的桶**，用 `videos/` 前缀隔离，
+    保证视频转储不会因为「没有独立桶」而整体不可用。
+    """
+    from tools.media_backup import active_settings
+    from tools.s3_client import S3Settings
+
+    cfg = await active_settings(session)
+    if cfg is None:
+        raise RuntimeError("未配置可用的 S3 存储")
+    base: S3Settings = cfg["settings"]
+    if VIDEO_BUCKET and VIDEO_BUCKET != base.bucket:
+        candidate = replace(base, bucket=VIDEO_BUCKET)
+        if await _bucket_usable(candidate):
+            return candidate, ""
+        utils.logger.warning(
+            f"[video_store] 桶 {VIDEO_BUCKET} 不存在且建桶失败，"
+            f"退回 {base.bucket}/videos/ 前缀（如需独立桶请在对象存储侧创建并授权）")
+    return base, "videos/"
 
 
 async def ensure_bucket(settings) -> None:
@@ -160,7 +206,8 @@ async def _transcode_hls_url(url: str, dst: Path) -> Dict[str, Any]:
             "source_kind": "hls"}
 
 
-async def archive_video(session, row: VideoAsset, settings) -> Dict[str, Any]:
+async def archive_video(session, row: VideoAsset, settings,
+                        key_prefix: str = "") -> Dict[str, Any]:
     """单条转储：下载 → 归一化 → 上传 → 校验。成功写回准确的原始大小。"""
     from media_downloader.ffmpeg import (
         probe_video, normalize_video,
@@ -210,7 +257,7 @@ async def archive_video(session, row: VideoAsset, settings) -> Dict[str, Any]:
                 original_size = int(info["size"])
                 stored_size = out.stat().st_size
                 checksum = await asyncio.to_thread(_sha256_file, out)
-                key = f"{row.platform}/videos/{row.content_id}/{checksum[:16]}.mp4"
+                key = f"{key_prefix}{row.platform}/{row.content_id}/{checksum[:16]}.mp4"
 
                 await ensure_bucket(settings)
                 await upload_file(settings, str(out), key, "video/mp4")
@@ -270,6 +317,75 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+async def _story_video_sources(session, story_id: int) -> Dict[str, Any]:
+    """解析某条 story 可用的视频源。
+
+    优先用抓取时已落在 `story_chapter.ext.video_url` 的直链（抓取当时最可信）；
+    存量帖没有该字段时（早期 SSR 驼峰字段解析为空）再免登录拉一次详情页补解析。
+    返回 `{"platform","content_id","source_url","backup_urls"}` 或 `{"error": ...}`。
+    """
+    from database.models_v2 import SourceSite, StoryChapter
+
+    row = (await session.execute(
+        select(StoryChapter, SourceSite.code)
+        .join(SourceSite, SourceSite.id == StoryChapter.source_site_id)
+        .where(StoryChapter.story_id == story_id,
+               StoryChapter.deleted_at.is_(None))
+        .order_by(StoryChapter.seq_no)
+        .limit(1)
+    )).first()
+    if row is None:
+        return {"error": "内容不存在或已删除"}
+    chapter, platform = row[0], row[1]
+    ext = chapter.ext if isinstance(chapter.ext, dict) else {}
+    note_type = str(ext.get("type") or "")
+    content_id = str(chapter.source_content_id or "")
+    urls = [u.strip() for u in
+            str(ext.get("video_url") or "").split(",") if u.strip()]
+
+    # 已知是图文帖就别白跑一次网络请求
+    if note_type and note_type != "video":
+        return {"error": "该内容不是视频帖"}
+
+    if not urls and chapter.source_url:
+        try:
+            from media_platform.xhs.media import extract_video_urls
+            from media_platform.xhs.ssr import fetch_note_by_url
+
+            data = await fetch_note_by_url(chapter.source_url)
+            item = data.get("note_item") or {}
+            note_type = str(item.get("type") or note_type)
+            urls = extract_video_urls(item)
+        except Exception as e:
+            return {"error": f"重新解析视频直链失败（xsec_token 可能已过期）：{e}"}
+
+    if note_type and note_type != "video":
+        return {"error": "该内容不是视频帖"}
+    if not urls:
+        return {"error": "没有解析到可用的视频直链"}
+    return {"platform": platform or "xhs", "content_id": content_id,
+            "source_url": urls[0], "backup_urls": urls[1:]}
+
+
+async def backfill_story(session, story_id: int) -> Dict[str, Any]:
+    """按 story 补建一条转储登记（幂等）。视频下载交给批处理，不阻塞请求。"""
+    info = await _story_video_sources(session, story_id)
+    if info.get("error"):
+        return {"ok": False, "error": info["error"]}
+    vid = await enqueue_video(
+        session, platform=info["platform"], content_id=info["content_id"],
+        source_url=info["source_url"], story_id=story_id,
+        backup_urls=info.get("backup_urls") or [])
+    await session.commit()
+    if vid is None:
+        return {"ok": False, "error": "视频登记失败"}
+    row = (await session.execute(
+        select(VideoAsset).where(VideoAsset.id == vid)
+    )).scalar_one()
+    return {"ok": True, "id": row.id, "status": row.status,
+            "content_id": info["content_id"]}
+
+
 async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
     """处理 pending / 失败待重试的记录；同一时刻只允许一批（进程内锁）。"""
     global _BATCH_LOCK
@@ -288,12 +404,12 @@ async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
             if not rows:
                 return {"processed": 0}
             try:
-                settings, _ = await video_settings(session)
+                settings, prefix = await video_target(session)
             except Exception as e:
                 return {"processed": 0, "error": str(e)}
             ok = 0
             for row in rows:
-                res = await archive_video(session, row, settings)
+                res = await archive_video(session, row, settings, prefix)
                 ok += 1 if res.get("ok") else 0
             return {"processed": len(rows), "succeeded": ok}
 
@@ -314,7 +430,7 @@ async def purge_video(session, video_id: int) -> Dict[str, Any]:
     error = ""
     if row.object_key:
         try:
-            settings, _ = await video_settings(session)
+            settings, _ = await video_settings(session, bucket=row.bucket)
             await delete_object(settings, row.object_key)
             deleted = True
         except Exception as e:

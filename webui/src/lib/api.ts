@@ -615,6 +615,9 @@ export const videoApi = {
     api.delete<{ success: boolean; object_deleted: boolean | null }>(`/videos/${id}`),
   run: (limit = 5) =>
     api.post<{ started: boolean }>('/videos/run', {}, { params: { limit } }),
+  /** 存量视频帖补建转储：用抓取时已存的直链登记，再后台下载转码上传 */
+  backfill: (storyId: number) =>
+    api.post<VideoAssetRow>('/videos/backfill', { story_id: storyId }),
 }
 
 export const s3BackupApi = {

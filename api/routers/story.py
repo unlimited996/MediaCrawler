@@ -574,6 +574,9 @@ async def get_story(story_id: int):
                 "like_count": c.like_count,
                 "comment_count": c.comment_count,
                 "completeness": float(c.completeness) if c.completeness else None,
+                # 视频帖标记：前端据此决定「没有视频记录时」是否给出补建入口
+                "note_type": (c.ext or {}).get("type") or "",
+                "has_video_source": bool((c.ext or {}).get("video_url")),
             } for c in chapters],
             "media": [{
                 "type": m.media_type,

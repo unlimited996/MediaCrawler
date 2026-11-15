@@ -69,10 +69,13 @@ def _request(rng: str | None = None) -> Request:
 async def test_create_returns_original_size(db, monkeypatch):
     engine, Session = db
 
-    async def fake_settings(session):
+    async def fake_settings(session, bucket=None):
         return SimpleNamespace(bucket="videos"), 1
 
-    async def fake_archive(session, row, settings):
+    async def fake_target(session):
+        return SimpleNamespace(bucket="videos"), ""
+
+    async def fake_archive(session, row, settings, key_prefix=""):
         row.status = "uploaded"
         row.object_key = "xhs/videos/abc/a.mp4"
         row.original_size_bytes = 12_345_678
@@ -82,7 +85,7 @@ async def test_create_returns_original_size(db, monkeypatch):
         return {"ok": True, "id": row.id,
                 "original_size_bytes": 12_345_678}
 
-    monkeypatch.setattr(videos.store, "video_settings", fake_settings)
+    monkeypatch.setattr(videos.store, "video_target", fake_target)
     monkeypatch.setattr(videos.store, "archive_video", fake_archive)
 
     out = await videos.create_video(videos.VideoCreate(
@@ -121,13 +124,16 @@ async def test_validation_and_404(db):
 async def test_archive_failure_maps_to_502(db, monkeypatch):
     engine, _ = db
 
-    async def fake_settings(session):
+    async def fake_settings(session, bucket=None):
         return SimpleNamespace(bucket="videos"), 1
 
-    async def fake_archive(session, row, settings):
+    async def fake_target(session):
+        return SimpleNamespace(bucket="videos"), ""
+
+    async def fake_archive(session, row, settings, key_prefix=""):
         return {"ok": False, "error": "候选地址全部失败"}
 
-    monkeypatch.setattr(videos.store, "video_settings", fake_settings)
+    monkeypatch.setattr(videos.store, "video_target", fake_target)
     monkeypatch.setattr(videos.store, "archive_video", fake_archive)
 
     with pytest.raises(HTTPException) as e:
@@ -147,7 +153,7 @@ async def test_delete_removes_record(db, monkeypatch):
         await s.commit()
         vid = (await s.execute(select(VideoAsset.id))).scalar()
 
-    async def fake_settings(session):
+    async def fake_settings(session, bucket=None):
         return SimpleNamespace(bucket="videos"), 1
 
     monkeypatch.setattr(videos.store, "video_settings", fake_settings)
@@ -173,7 +179,7 @@ async def test_stream_supports_range_206(db, monkeypatch):
         await s.commit()
         vid = row.id
 
-    async def fake_settings(session):
+    async def fake_settings(session, bucket=None):
         return SimpleNamespace(bucket="videos"), 1
 
     async def fake_call(settings, op, **kwargs):

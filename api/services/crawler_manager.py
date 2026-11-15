@@ -347,6 +347,16 @@ class CrawlerManager:
         await self._push_log(entry)
 
         try:
+            # 手动「详情」抓取是用户明确指定要抓这几篇帖子，视频帖顺带把视频转储到
+            # S3 才是符合直觉的行为：原来这里不注入开关，视频帖只会落文字+封面，
+            # 详情页永远没有视频。列表/搜索/创作者模式按配置默认值走，避免批量拉片。
+            crawler_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            try:
+                if str(getattr(config.crawler_type, "value", "")) == "detail":
+                    crawler_env.setdefault("ENABLE_VIDEO_BACKUP", "1")
+            except Exception:
+                pass
+
             # Start subprocess
             self.process = subprocess.Popen(
                 cmd,
@@ -356,7 +366,7 @@ class CrawlerManager:
                 encoding='utf-8',
                 bufsize=1,
                 cwd=str(self._project_root),
-                env={**os.environ, "PYTHONUNBUFFERED": "1"}
+                env=crawler_env
             )
 
             self.status = "running"
