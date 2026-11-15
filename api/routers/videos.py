@@ -234,6 +234,24 @@ def _is_private_host(host: str) -> bool:
     return bool(ip.is_private or ip.is_loopback)
 
 
+def _browser_reachable(host: str) -> bool:
+    """浏览器能否解析这个主机名。
+
+    IP 一定可以；含点的域名交给局域网 DNS；**容器名（无点）只有 docker
+    内部能解析**，给浏览器就是个打不开的地址（曾导致内网视频无声失败）。
+    """
+    import ipaddress
+
+    host = (host or "").strip().lower()
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return "." in host
+
+
 def presign_settings_for(request: Request, public, internal):
     """按访问来源挑预签名用的 S3 endpoint。
 
@@ -256,6 +274,13 @@ def presign_settings_for(request: Request, public, internal):
     if not host:
         return public
     internal_host = (urlparse(internal.endpoint).hostname or "").lower()
+    if not _browser_reachable(internal_host):
+        # 容器名只对容器有意义，宁可回退公网也别给浏览器一个解析不了的地址
+        logging.getLogger(__name__).warning(
+            "[videos] S3_INTERNAL_ENDPOINT=%s 是容器名，浏览器无法解析，"
+            "播放改用公网地址；需要内网直连请改成局域网 IP（如 "
+            "http://192.168.10.38:3900）", internal.endpoint)
+        return public
     if host == internal_host or _is_private_host(host):
         return internal
     return public

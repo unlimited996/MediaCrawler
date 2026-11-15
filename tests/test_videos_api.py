@@ -300,3 +300,11 @@ def test_presign_force_override(monkeypatch):
     assert videos.presign_settings_for(_req("192.168.1.5:18081"), pub, lan) is pub
     monkeypatch.setenv("S3_PRESIGN_FORCE", "internal")
     assert videos.presign_settings_for(_req("www.joyeuse.cn"), pub, lan) is lan
+
+
+def test_presign_rejects_container_name(monkeypatch):
+    """S3_INTERNAL_ENDPOINT 配成容器名时，浏览器解析不了，必须回退公网。"""
+    monkeypatch.delenv("S3_PRESIGN_FORCE", raising=False)
+    pub = _s3("http://www.joyeuse.cn:3900")
+    lan = _s3("http://dxflrs-garage:3900")   # 无点 = 容器名
+    assert videos.presign_settings_for(_req("192.168.10.38:18081"), pub, lan) is pub
