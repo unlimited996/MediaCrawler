@@ -76,12 +76,15 @@ sync_code() {
     # 早先整体 exclude 'database/' 导致里面的代码永远停留在首次同步的版本
     # （镜像里 SharedEngineHandle 缺失就是这样来的）。这里只排除数据库文件本身，
     # .py / seed/ 照常同步。
+    # 排除模式一律锚定传输根（前导 /）。不带 / 的 'data/' 会匹配任意层级的
+    # 同名目录，误伤 webui/src/components/data/，让前端详情页组件永远停在
+    # 首次同步的版本（视频播放器组件就是这样进不了镜像的）。
     rsync -a --delete \
         --exclude 'deploy/.env' \
-        --exclude 'logs/' --exclude 'data/' --exclude 'browser_data/' \
-        --exclude 'database/*.db' --exclude 'database/*.db-*' \
-        --exclude 'database/*.sqlite' --exclude 'database/*.sqlite3' \
-        --exclude 'api/webui/' \
+        --exclude '/logs/' --exclude '/data/' --exclude '/browser_data/' \
+        --exclude '/database/*.db' --exclude '/database/*.db-*' \
+        --exclude '/database/*.sqlite' --exclude '/database/*.sqlite3' \
+        --exclude '/api/webui/' \
         --exclude '.build-state.json' \
         "$SRC/" "$REPO_DIR/"
     chmod +x "$REPO_DIR/deploy/server-update.sh" \

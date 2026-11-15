@@ -5,6 +5,24 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-15] 修复：部署同步误排除前端目录，视频播放器始终进不了镜像
+
+- `deploy/server-update.sh` 的 `rsync --exclude 'data/'` 未锚定传输根，会匹配
+  **任意层级**的 `data/` 目录，把 `webui/src/components/data/` 一起排除。
+  结果服务器上的详情页组件永远停在首次同步（11/05）的版本，
+  `VideoAttachment.tsx` 从未同步过去，`npm run build` 产出的前端自然没有播放器。
+  后端接口其实早已更新（`/stories` 返回 `note_type: video`、
+  `POST /videos/backfill` 返回 200），但线上 bundle 里 `videos` /
+  `original_size_bytes` / `转储视频` 全为 0 —— 所以反复 `docker compose pull`
+  也不会让详情页出现视频。
+- 所有排除模式改为前导 `/` 锚定根目录。服务器端 dry-run 对照验证：
+  旧规则丢掉 `webui/src/components/data/VideoAttachment.tsx`，新规则放行，
+  同时项目根 `data/` 仍被正确排除。
+- 本地 `npm run build` 产出 `index-ChYaUGiS.js`，确认含全部视频代码。
+- 补记：上一版「`videos` 桶从未创建」的判断有误 —— 桶 11/13 就建好了，
+  只是没授权任何 access key（`keys: []`）。已在 Garage WebUI 授权并把存量
+  视频迁回 `videos` 桶；回退逻辑保留作为桶不可用时的兜底。
+
 ## [2026-11-15] 视频转储跑通：桶回退 + 登记开关 + 存量补建
 
 线上现象：抓过的视频帖详情页没有播放器，S3 里也查不到视频。逐层排查后
