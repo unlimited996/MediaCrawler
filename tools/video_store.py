@@ -48,11 +48,24 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def video_settings(session, bucket: Optional[str] = None):
-    """复用当前启用的 S3 配置，只把 Bucket 换成视频桶（凭据/endpoint 不变）。
+def internal_endpoint() -> str:
+    """容器内直连对象存储的地址（``S3_INTERNAL_ENDPOINT``），未配置返回空串。
+
+    群晖这类环境里，容器访问自家公网域名会走 NAT 回流：大包/长连接容易被掐断，
+    表现为上传 ``ConnectionClosedError``、播放 0kb/s。配上局域网 IP 或同一个
+    docker 网络的容器名（如 ``http://dxflrs-garage:3900``）后，容器内读写走内网，
+    既快又稳。**预签名 URL 仍必须用公网 endpoint 生成**，否则浏览器访问不到。
+    """
+    return os.getenv("S3_INTERNAL_ENDPOINT", "").strip().rstrip("/")
+
+
+async def video_settings(session, bucket: Optional[str] = None, *,
+                         internal: bool = False):
+    """复用当前启用的 S3 配置，只把 Bucket 换成视频桶（凭据不变）。
 
     `bucket` 传入时以它为准——数据库里记录的是「实际写进哪个桶」，
     读对象/删对象必须按记录走，不能再用默认视频桶去猜。
+    `internal=True` 时把 endpoint 换成 `S3_INTERNAL_ENDPOINT`（容器内读写用）。
     """
     from tools.media_backup import active_settings
     from tools.s3_client import S3Settings
@@ -61,6 +74,10 @@ async def video_settings(session, bucket: Optional[str] = None):
     if cfg is None:
         raise RuntimeError("未配置可用的 S3 存储")
     base: S3Settings = cfg["settings"]
+    if internal:
+        ep = internal_endpoint()
+        if ep and ep != base.endpoint:
+            base = replace(base, endpoint=ep)
     return replace(base, bucket=bucket or VIDEO_BUCKET), cfg.get("config_id")
 
 
@@ -260,8 +277,24 @@ async def archive_video(session, row: VideoAsset, settings,
                 key = f"{key_prefix}{row.platform}/{row.content_id}/{checksum[:16]}.mp4"
 
                 await ensure_bucket(settings)
-                await upload_file(settings, str(out), key, "video/mp4")
-                obj = await head_object(settings, key)
+                # 容器内上传优先走内网 endpoint（NAT 回流链路上大包长连接会被掐断，
+                # 报 ConnectionClosedError）。内网不可用时自动回退公网配置。
+                from tools.s3_client import _is_connection_error
+
+                upload_settings = await video_settings(
+                    session, bucket=settings.bucket, internal=True)
+                try:
+                    await upload_file(upload_settings, str(out), key, "video/mp4")
+                except Exception as e:
+                    if (upload_settings.endpoint != settings.endpoint
+                            and _is_connection_error(e)):
+                        utils.logger.warning(
+                            "[video_store] 内网上传失败，回退公网 endpoint：%s", e)
+                        upload_settings = settings
+                        await upload_file(settings, str(out), key, "video/mp4")
+                    else:
+                        raise
+                obj = await head_object(upload_settings, key)
                 if obj is None:
                     raise RuntimeError("上传后 head_object 查无此对象")
                 if obj.get("ContentLength") is not None:
@@ -459,7 +492,8 @@ async def purge_video(session, video_id: int) -> Dict[str, Any]:
     error = ""
     if row.object_key:
         try:
-            settings, _ = await video_settings(session, bucket=row.bucket)
+            settings, _ = await video_settings(
+                session, bucket=row.bucket, internal=True)
             await delete_object(settings, row.object_key)
             deleted = True
         except Exception as e:

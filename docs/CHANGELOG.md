@@ -5,6 +5,22 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-16] 修复：大文件上传断连（multipart）+ 容器内走内网对象存储
+
+线上转储「万能浇头冰版梅花肉」最终失败：
+`ConnectionClosedError: Connection was closed before we received a valid response
+from endpoint URL: http://120.40.24.88:3900/videos/...`，任务卡 24 分钟后报错。
+
+- **上传改 multipart**：原来 `upload_file` 把整个文件 `read()` 进内存后单次
+  `put_object`，96MB 走一条长连接，在 NAT 回流链路上必被掐断，且额外多占一个
+  文件大小的内存（这就是内存翻倍的另一半）。改用 boto3 `upload_file`：
+  8MB 分片、每片独立重试、并发 2；client `retries` 2 → 5。
+- **新增 `S3_INTERNAL_ENDPOINT`**：容器内下载/上传/删除优先走局域网 IP 或同一
+  docker 网络的容器名（如 `http://dxflrs-garage:3900`），彻底避开 NAT 回流；
+  不可用时自动回退公网。**预签名播放地址始终用公网 endpoint** —— 浏览器访问不到内网。
+- **backfill 优先 SSR 重解析**：`chapter.ext.video_url` 是抓取当时写死的候选顺序，
+  存量帖仍把 HEVC 原片排最前，backfill 会继续重编码；SSR 才能拿到 h264 兼容档。
+
 ## [2026-11-16] 优化：视频优先免转码 + 大幅降低 ffmpeg CPU / 内存
 
 线上现象：转「万能浇头冰版梅花肉」时 ffmpeg 吃满 CPU、内存到 GB 级，一条要十几分钟。
