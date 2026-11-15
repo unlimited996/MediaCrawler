@@ -69,6 +69,23 @@ def _out(row: VideoAsset) -> Dict[str, Any]:
     data = store.video_fields(row)
     data["object_url"] = (library_api(f"videos/{row.id}/stream")
                           if row.object_key else None)
+    # 前端「执行记录」要用：排队/处理中显示已耗时，完成显示总耗时
+    elapsed = None
+    try:
+        from datetime import datetime, timezone
+
+        created = row.created_at
+        if created is not None:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            end = row.uploaded_at or datetime.now(timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            elapsed = max(0.0, (end - created).total_seconds())
+    except Exception:
+        elapsed = None
+    data["elapsed_sec"] = elapsed
+    data["running"] = row.status in ("uploading",)
     return data
 
 
@@ -147,6 +164,41 @@ async def list_videos(
             _schedule_batch()
         return {"items": [_out(r) for r in rows], "total": total,
                 "page": page, "page_size": page_size}
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.get("/{video_id}/logs")
+async def video_logs(video_id: int, limit: int = Query(200, ge=1, le=1000)):
+    """某条转储的过程日志（下载/归一化/上传/完成/失败/终止）。"""
+    return {"items": store.read_events(video_id, limit=limit)}
+
+
+@router.post("/{video_id}/cancel")
+async def cancel_video(video_id: int):
+    """终止一条转储。排队中的直接取消；处理中的会中断协程。"""
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        result = await store.cancel_video(session, video_id)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error") or "终止失败")
+        return result
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
+@router.post("/cancel-pending")
+async def cancel_pending():
+    """把所有排队中/处理中的转储全部终止。"""
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        return await store.cancel_pending(session)
     finally:
         await session.close()
         await engine.dispose()

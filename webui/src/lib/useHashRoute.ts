@@ -7,7 +7,7 @@
  * - 访客页（#/guest）可以直接当独立链接分发
  *
  * 路由格式：#/{view}[/{platform}][/story/{id}]
- *   view    = crawl | discover | data | browser | tasks | stance | backup | guest
+ *   view    = crawl | discover | data | browser | tasks | stance | backup | videos | guest
  *   platform  仅 data / guest 使用（'' = 全部平台）
  *   story/{id} 帖子详情：打开某条帖子时写进 URL，刷新/分享链接能直接恢复到该帖子
  */
@@ -21,7 +21,8 @@ export interface RouteState {
 }
 
 const VIEWS = [
-  'crawl', 'discover', 'data', 'browser', 'tasks', 'stance', 'backup', 'config', 'guest',
+  'crawl', 'discover', 'data', 'browser', 'tasks', 'stance', 'backup', 'videos',
+  'config', 'guest',
 ]
 
 function parseHash(): RouteState {

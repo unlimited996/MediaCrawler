@@ -548,7 +548,7 @@ export interface S3BackupItem {
   source_url: string | null
   mime_type: string | null
   size_bytes: number | null
-  status: 'pending' | 'uploading' | 'uploaded' | 'failed' | 'orphaned'
+  status: 'pending' | 'uploading' | 'uploaded' | 'failed' | 'cancelled' | 'orphaned'
   retry_count: number
   max_retries: number
   next_retry_at: string | null
@@ -592,6 +592,10 @@ export interface VideoAssetRow {
   object_url: string | null
   last_error: string | null
   uploaded_at: string | null
+  /** 已耗时（秒）：排队/处理中为至今，完成为总耗时 */
+  elapsed_sec?: number | null
+  /** 是否正在处理（用于前端区分「处理中」与其他状态） */
+  running?: boolean
 }
 
 export interface VideoCreatePayload {
@@ -618,6 +622,16 @@ export const videoApi = {
   /** 存量视频帖补建转储：用抓取时已存的直链登记，再后台下载转码上传 */
   backfill: (storyId: number) =>
     api.post<VideoAssetRow>('/videos/backfill', { story_id: storyId }),
+  /** 某条转储的过程日志 */
+  logs: (id: number, limit = 200) =>
+    api.get<{ items: { at: string; id: number; msg: string }[] }>(
+      `/videos/${id}/logs`, { params: { limit } }),
+  /** 终止单条转储（排队中/处理中都可以） */
+  cancel: (id: number) =>
+    api.post<{ ok: boolean; id: number; status: string }>(`/videos/${id}/cancel`),
+  /** 全部终止 */
+  cancelAll: () =>
+    api.post<{ ok: boolean; cancelled: number }>('/videos/cancel-pending'),
 }
 
 export const s3BackupApi = {

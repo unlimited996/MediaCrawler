@@ -1,4 +1,4 @@
-import { Bug, Wifi, Flame, Database, FolderOpen, CalendarClock, Tags, DatabaseBackup, Eye, SlidersHorizontal } from 'lucide-react'
+import { Bug, Wifi, Flame, Database, FolderOpen, CalendarClock, Tags, DatabaseBackup, Eye, SlidersHorizontal, Film } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Badge } from '@/components/ui/badge'
 import { useCrawlerStore } from '@/store/crawlerStore'
@@ -8,7 +8,7 @@ import { PlatformBrandMark } from '@/components/data/platform/PlatformBrand'
 import { LanguageSwitch } from './LanguageSwitch'
 import { ThemeToggle } from './ThemeToggle'
 
-export type MainView = 'crawl' | 'discover' | 'data' | 'browser' | 'tasks' | 'stance' | 'backup' | 'config' | 'guest'
+export type MainView = 'crawl' | 'discover' | 'data' | 'browser' | 'tasks' | 'stance' | 'backup' | 'videos' | 'config' | 'guest'
 
 /** 后端 /config/platforms 暂时不可用时的兜底：
  *  拆分部署后该端点一度只存在于单体进程，crawler 服务返回 404，
@@ -122,6 +122,17 @@ export function Sidebar({ view, onViewChange, dataPlatform }: SidebarProps) {
             >
               <DatabaseBackup className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">{t('nav.backup', { defaultValue: '图片备份' })}</span>
+            </button>
+            <button
+              onClick={() => onViewChange('videos')}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-mono transition-all ${
+                view === 'videos'
+                  ? 'bg-cyber-neon-cyan text-black font-bold'
+                  : 'text-cyber-text-secondary hover:text-cyber-text-primary border border-cyber-border-subtle hover:border-cyber-neon-cyan/50'
+              }`}
+            >
+              <Film className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">{t('nav.videos', { defaultValue: '视频转储' })}</span>
             </button>
             <button
               onClick={() => onViewChange('config')}

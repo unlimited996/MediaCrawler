@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -46,6 +47,57 @@ _BAD_TYPES = ("text/html", "application/json", "text/plain")
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+#: 每条转储的过程日志（JSONL，已随 ./logs 挂载，容器重启可回溯）
+_EVENT_LOG = Path(__file__).resolve().parents[1] / "logs" / "video_transfer.jsonl"
+
+#: 正在处理的任务（用于「界面终止」时取消协程）
+_RUNNING: Dict[int, "asyncio.Task"] = {}
+#: 已请求终止的记录 id
+_CANCEL: set = set()
+
+
+class VideoCancelled(Exception):
+    """用户手动终止了转储。"""
+
+
+def log_event(row_id: int, message: str) -> None:
+    """追加一条转储过程日志（失败不影响主流程）。"""
+    try:
+        _EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"at": datetime.now(timezone.utc).astimezone()
+                      .strftime("%Y-%m-%d %H:%M:%S"),
+               "id": int(row_id), "msg": str(message)[:500]}
+        with open(_EVENT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def read_events(row_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+    """读某条记录最近的日志（倒序文件里最多扫 4000 行）。"""
+    if not _EVENT_LOG.exists():
+        return []
+    try:
+        lines = _EVENT_LOG.read_text(
+            encoding="utf-8", errors="replace").splitlines()[-4000:]
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for raw in lines:
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        if int(rec.get("id") or 0) == int(row_id):
+            out.append(rec)
+    return out[-limit:]
+
+
+def _check_cancel(row_id: int) -> None:
+    if row_id in _CANCEL:
+        raise VideoCancelled("已手动终止")
 
 
 def internal_endpoint() -> str:
@@ -238,6 +290,8 @@ async def archive_video(session, row: VideoAsset, settings,
 
     row.status = "uploading"
     await session.commit()
+    log_event(row.id, f"开始转储：{row.source_url[:80]}")
+    _check_cancel(row.id)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="mc_video_"))
     try:
@@ -254,9 +308,17 @@ async def archive_video(session, row: VideoAsset, settings,
                         info = await _transcode_hls_url(url, src)
                         shutil.move(str(src), str(out))
                     else:
+                        log_event(row.id, "下载中…")
                         info = await _fetch_to_file(client, url, src)
+                        log_event(row.id, f"下载完成：{info.get('size')} 字节")
+                        _check_cancel(row.id)
                         probe = await probe_video(src)
+                        log_event(row.id, f"归一化：源 {probe.get('codec_v') or '?'}/"
+                                           f"{probe.get('codec_a') or '-'}")
                         norm = await normalize_video(src, out, probe)
+                        log_event(row.id, "重封装完成（无需重编码）"
+                                  if norm.get("remuxed") else "转码完成")
+                        _check_cancel(row.id)
                         out = Path(norm["path"])
                         info["transcoded"] = bool(norm.get("transcoded"))
                         if not norm.get("available"):
@@ -276,6 +338,7 @@ async def archive_video(session, row: VideoAsset, settings,
                 checksum = await asyncio.to_thread(_sha256_file, out)
                 key = f"{key_prefix}{row.platform}/{row.content_id}/{checksum[:16]}.mp4"
 
+                log_event(row.id, f"上传 {stored_size} 字节 → {settings.bucket}/{key}")
                 await ensure_bucket(settings)
                 # 容器内上传优先走内网 endpoint（NAT 回流链路上大包长连接会被掐断，
                 # 报 ConnectionClosedError）。内网不可用时自动回退公网配置。
@@ -320,9 +383,13 @@ async def archive_video(session, row: VideoAsset, settings,
                 utils.logger.info(
                     f"[video_store] 已转储 {row.content_id} → {settings.bucket}/{key} "
                     f"原始 {original_size}B / 存储 {stored_size}B")
+                log_event(row.id, f"转储完成：{settings.bucket}/{key}"
+                                  f"（原始 {original_size}B / 存储 {stored_size}B）")
                 return {"ok": True, "id": row.id,
                         "original_size_bytes": original_size,
                         "stored_size_bytes": stored_size}
+            except VideoCancelled:
+                raise
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
                 utils.logger.warning(
@@ -332,11 +399,18 @@ async def archive_video(session, row: VideoAsset, settings,
                         p.unlink(missing_ok=True)
                 continue
         raise RuntimeError(last_error or "没有可用的视频源地址")
+    except VideoCancelled:
+        row.status = "cancelled"
+        row.last_error = "已手动终止"
+        await session.commit()
+        log_event(row.id, "已手动终止")
+        return {"ok": False, "id": row.id, "error": "已手动终止", "cancelled": True}
     except Exception as e:
         row.status = "failed"
         row.retry_count = int(row.retry_count or 0) + 1
         row.last_error = str(e)[:1000]
         await session.commit()
+        log_event(row.id, f"失败：{row.last_error}")
         return {"ok": False, "id": row.id, "error": row.last_error}
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -468,6 +542,68 @@ async def _mark_failed(row_id: int, message: str) -> None:
         utils.logger.warning("[video_store] 标记失败记录出错 #%s: %s", row_id, e)
 
 
+async def _mark_cancelled(row_id: int) -> None:
+    """把一条记录标记为手动终止（独立 session）。"""
+    try:
+        async with _v2_session() as s:
+            if s is None:
+                return
+            row = (await s.execute(
+                select(VideoAsset).where(VideoAsset.id == row_id)
+            )).scalar_one_or_none()
+            if row is None or row.status in ("uploaded", "cancelled"):
+                return
+            row.status = "cancelled"
+            row.last_error = "已手动终止"
+            await s.commit()
+            log_event(row_id, "已手动终止")
+    except Exception as e:
+        utils.logger.warning("[video_store] 标记终止记录出错 #%s: %s", row_id, e)
+
+
+async def cancel_video(session, row_id: int) -> Dict[str, Any]:
+    """手动终止一条转储：标记取消 + 中断正在跑的协程。
+
+    `pending` 的直接落库；`uploading` 的会取消对应协程（下载/上传中也会中断），
+    协程被取消后 `_one` 负责把状态落成 cancelled。
+    """
+    row = (await session.execute(
+        select(VideoAsset).where(VideoAsset.id == row_id)
+    )).scalar_one_or_none()
+    if row is None:
+        return {"ok": False, "error": "记录不存在"}
+    if row.status == "uploaded":
+        return {"ok": False, "error": "该视频已转储完成，无需终止"}
+
+    _CANCEL.add(row_id)
+    task = _RUNNING.get(row_id)
+    if task is not None and not task.done():
+        task.cancel()
+    row.status = "cancelled"
+    row.last_error = "已手动终止"
+    await session.commit()
+    log_event(row_id, "手动终止")
+    return {"ok": True, "id": row_id, "status": "cancelled"}
+
+
+async def cancel_pending(session) -> Dict[str, Any]:
+    """把所有排队中/处理中的转储全部终止（界面「全部终止」）。"""
+    rows = (await session.execute(
+        select(VideoAsset).where(
+            VideoAsset.status.in_(("pending", "uploading", "failed")))
+    )).scalars().all()
+    for row in rows:
+        _CANCEL.add(row.id)
+        task = _RUNNING.get(row.id)
+        if task is not None and not task.done():
+            task.cancel()
+        row.status = "cancelled"
+        row.last_error = "已手动终止"
+        log_event(row.id, "手动终止（批量）")
+    await session.commit()
+    return {"ok": True, "cancelled": len(rows)}
+
+
 async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
     """处理 pending / 失败待重试的记录；同一时刻只允许一批（进程内锁）。
 
@@ -501,6 +637,9 @@ async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
 
         async def _one(row_id: int) -> bool:
             async with sem:
+                task = asyncio.current_task()
+                if task is not None:
+                    _RUNNING[row_id] = task
                 try:
                     async with _v2_session() as s2:
                         if s2 is None:
@@ -514,6 +653,9 @@ async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
                             archive_video(s2, row, settings, prefix),
                             timeout=_ARCHIVE_TIMEOUT)
                         return bool(res.get("ok"))
+                except asyncio.CancelledError:
+                    await _mark_cancelled(row_id)
+                    return False
                 except asyncio.TimeoutError:
                     utils.logger.warning(
                         "[video_store] #%s 处理超时（>%ds），标记失败继续",
@@ -526,6 +668,9 @@ async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
                         row_id, type(e).__name__, str(e)[:200])
                     await _mark_failed(row_id, f"{type(e).__name__}: {str(e)[:200]}")
                     return False
+                finally:
+                    _RUNNING.pop(row_id, None)
+                    _CANCEL.discard(row_id)
 
         results = await asyncio.gather(*[_one(rid) for rid in row_ids])
         ok = sum(1 for x in results if x)

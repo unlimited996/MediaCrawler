@@ -13,6 +13,7 @@ import { DataManagementView } from '@/views/DataManagementView'
 import { ScheduledTasksView } from '@/views/ScheduledTasksView'
 import { StanceTagsView } from '@/views/StanceTagsView'
 import { S3BackupView } from '@/views/S3BackupView'
+import { VideoTasksView } from '@/views/VideoTasksView'
 import { ConfigAdminView } from '@/views/ConfigAdminView'
 import { GuestView } from '@/views/GuestView'
 import { DataExplorer } from '@/components/data/DataExplorer'
@@ -99,6 +100,8 @@ function App() {
             <StanceTagsView />
           ) : view === 'backup' ? (
             <S3BackupView />
+          ) : view === 'videos' ? (
+            <VideoTasksView />
           ) : view === 'config' ? (
             <ConfigAdminView />
           ) : view === 'guest' ? (
