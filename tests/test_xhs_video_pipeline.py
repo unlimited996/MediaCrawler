@@ -216,3 +216,42 @@ async def test_hook_skips_video_when_disabled(db, monkeypatch):
     await _run_hook(monkeypatch, Session, _video_item("note-off"))
     async with Session() as s:
         assert (await s.execute(select(VideoAsset))).scalars().all() == []
+
+
+# ---------------------------------------------------------------------------
+# 4. library 镜像里没有 tenacity/playwright，ssr 解析必须还能导入
+# ---------------------------------------------------------------------------
+
+def test_ssr_importable_without_crawler_deps():
+    """library 容器只装了运行 library 需要的依赖。
+
+    `POST /videos/backfill` 的兜底路径要 import `media_platform.xhs.ssr`，
+    而该包的 `__init__` 原本会拉进 core（依赖 tenacity/playwright）。
+    用子进程屏蔽这两个包，确认轻量环境仍能解析视频直链。
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent("""
+        import importlib.abc, sys
+        BLOCK = {"tenacity", "playwright"}
+        class B(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split(".")[0] in BLOCK:
+                    raise ImportError(fullname)
+                return None
+        sys.meta_path.insert(0, B())
+        import media_platform.xhs.ssr as ssr
+        import media_platform.xhs.media as media
+        assert hasattr(ssr, "fetch_note_by_url")
+        urls = media.extract_video_urls(
+            {"type": "video", "video": {"media": {"stream": {"h264": [
+                {"masterUrl": "http://x"}]}}}})
+        assert urls == ["http://x"], urls
+        print("OK")
+    """)
+    root = __import__("pathlib").Path(__file__).resolve().parents[1]
+    proc = subprocess.run([sys.executable, "-c", code], cwd=str(root),
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-1000:]

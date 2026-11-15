@@ -18,5 +18,8 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 
-from .core import XiaoHongShuCrawler
+try:  # 轻量环境（如 library 镜像）只用到 ssr/media 等模块，没有爬虫依赖
+    from .core import XiaoHongShuCrawler
+except ImportError:  # pragma: no cover - 无 tenacity/playwright 时不阻塞子模块导入
+    XiaoHongShuCrawler = None  # type: ignore[assignment]
 from .field import *
