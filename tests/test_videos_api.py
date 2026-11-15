@@ -170,6 +170,8 @@ async def test_delete_removes_record(db, monkeypatch):
 async def test_stream_supports_range_206(db, monkeypatch):
     import tools.s3_client as s3
 
+    # 强制走容器内字节代理，验证 fallback 路径仍支持 Range/206
+    monkeypatch.setenv("VIDEO_STREAM_MODE", "proxy")
     engine, Session = db
     async with Session() as s:
         row = VideoAsset(platform="xhs", content_id="n4",
@@ -199,6 +201,44 @@ async def test_stream_supports_range_206(db, monkeypatch):
     assert resp.headers["content-range"] == "bytes 0-9/100"
     assert resp.headers["accept-ranges"] == "bytes"
     assert resp.media_type == "video/mp4"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stream_redirects_to_presigned_url(db, monkeypatch):
+    """默认路径：307 到 S3 预签名 URL，浏览器直连避免容器内代理卡死。"""
+    import tools.s3_client as s3
+
+    class FakeClient:
+        def generate_presigned_url(self, op, Params=None, ExpiresIn=None):
+            assert op == "get_object"
+            assert Params == {"Bucket": "videos", "Key": "xhs/videos/n5/a.mp4"}
+            assert ExpiresIn == 3600
+            return "http://s3.example/videos/xhs/videos/n5/a.mp4?X-Amz-Signature=abc"
+
+    async def fake_settings(session, bucket=None):
+        return SimpleNamespace(bucket="videos"), 1
+
+    async def fake_get_client(settings, allow_ip_fallback=True):
+        return FakeClient()
+
+    monkeypatch.setenv("VIDEO_STREAM_MODE", "presign")
+    monkeypatch.setattr(videos.store, "video_settings", fake_settings)
+    monkeypatch.setattr(s3, "get_client", fake_get_client)
+
+    engine, Session = db
+    async with Session() as s:
+        row = VideoAsset(platform="xhs", content_id="n5",
+                         source_url="https://cdn/x.mp4", status="uploaded",
+                         object_key="xhs/videos/n5/a.mp4", bucket="videos")
+        s.add(row)
+        await s.commit()
+        vid = row.id
+
+    resp = await videos.stream_video(vid, _request("bytes=0-1023"))
+    assert resp.status_code == 307
+    assert "X-Amz-Signature=abc" in resp.headers["location"]
+    assert resp.headers["cache-control"] == "no-store"
     await engine.dispose()
 
 

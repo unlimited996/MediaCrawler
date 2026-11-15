@@ -11,7 +11,8 @@ import { crawlerApi, storyApi, s3BackupApi } from '@/lib/api'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { getPlatformTheme } from './platformTheme'
-import { pickSourceUrl, extractTopics, RepliesContext, StanceEditContext } from './shared'
+import { pickSourceUrl, extractTopics, RepliesContext, StanceEditContext,
+         pickMedia, VideoPlayContext } from './shared'
 import { CommentToolbar } from './CommentToolbar'
 import type { CommentSort, HasRepliesFilter, StanceFilter, StanceStats } from './CommentToolbar'
 import { XhsLayout } from './XhsLayout'
@@ -313,6 +314,10 @@ export function PlatformStoryDetail({
   const { d } = useMemo(() => extractTopics(detailQ.data), [detailQ.data])
   /** 视频帖：后端把平台原始类型放在 chapters[].note_type 上 */
   const isVideoPost = ((d as any)?.chapters?.[0]?.note_type === 'video')
+  // 首图就是视频封面：用它精确匹配 MediaImage，把播放入口放到封面图本身的位置
+  const videoCoverUrl = isVideoPost ? (pickMedia(d)[0]?.candidates?.[0] || '') : ''
+  const videoPlayInfo = isVideoPost && videoCoverUrl
+    ? { storyId, coverUrl: videoCoverUrl } : null
   const theme = getPlatformTheme(d.platform)
 
   const commentsToolbar = (
@@ -384,6 +389,7 @@ export function PlatformStoryDetail({
   }
 
   return (
+    <VideoPlayContext.Provider value={videoPlayInfo}>
     <div className="h-full flex flex-col gap-3">
       {/* 顶部返回栏：平台徽标使用平台品牌色。
           允许换行（flex-wrap）：窗口窄或标题很长时按钮折到第二行，
@@ -585,7 +591,7 @@ export function PlatformStoryDetail({
         ) : readonly ? (
           // 只读模式（访客）：不提供改判入口，立场徽标自动变为不可点
           <RepliesContext.Provider value={{ showReplies, storyId }}>
-            <VideoAttachment storyId={storyId} isVideo={isVideoPost} />
+            {isVideoPost && !videoCoverUrl && <VideoAttachment storyId={storyId} isVideo />}
             {renderLayout()}
 
             {/* 滚动到底自动加载下一页评论；没有更多时给出总数提示 */}
@@ -620,7 +626,7 @@ export function PlatformStoryDetail({
         ) : (
           <RepliesContext.Provider value={{ showReplies, storyId }}>
             <StanceEditContext.Provider value={{ open: setStanceEditTarget }}>
-            <VideoAttachment storyId={storyId} isVideo={isVideoPost} />
+            {isVideoPost && !videoCoverUrl && <VideoAttachment storyId={storyId} isVideo />}
             {renderLayout()}
 
             {/* 滚动到底自动加载下一页评论；没有更多时给出总数提示 */}
@@ -721,5 +727,6 @@ export function PlatformStoryDetail({
         onClose={() => setEditsOpen(false)}
       />
     </div>
+    </VideoPlayContext.Provider>
   )
 }

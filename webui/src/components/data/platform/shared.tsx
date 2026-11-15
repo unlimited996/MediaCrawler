@@ -4,6 +4,18 @@ import type { ComponentType, CSSProperties } from 'react'
 import { storyApi } from '@/lib/api'
 import type { PlatformTheme } from './platformTheme'
 import { useImageViewer } from './ImageViewer'
+import { VideoAttachment } from '@/components/data/VideoAttachment'
+
+/**
+ * 视频帖播放上下文：详情页注入后，MediaImage 把「首图」替换为可播放封面
+ * （封面图 + 半透明 ▶️，点击原地切播放器）。用 coverUrl 精确匹配候选源，
+ * 避免误伤评论图片 / 列表卡片里的其他 MediaImage。
+ */
+export interface VideoPlayInfo {
+  storyId: number
+  coverUrl: string
+}
+export const VideoPlayContext = createContext<VideoPlayInfo | null>(null)
 
 /** 统一的时间格式化（兼容秒/毫秒时间戳） */
 export function fmtTs(ts?: number | null): string {
@@ -278,6 +290,7 @@ export function MediaImage({
   /** 在 gallery 中的起始下标 */
   galleryIndex?: number
 }) {
+  const videoPlay = useContext(VideoPlayContext)
   const candidates = media?.candidates || []
   const [idx, setIdx] = useState(0)
   const key = candidates[0] || ''
@@ -287,6 +300,19 @@ export function MediaImage({
   useEffect(() => { setIdx(0) }, [key])
 
   if (candidates.length === 0) return null
+
+  // 视频帖首图：改为「封面 + ▶️ → 点击播放」，位置就在原封面图这里
+  if (videoPlay && videoPlay.coverUrl && candidates.includes(videoPlay.coverUrl)) {
+    return (
+      <VideoAttachment
+        storyId={videoPlay.storyId}
+        isVideo
+        coverCandidates={candidates}
+        className={className}
+      />
+    )
+  }
+
   const current = candidates[Math.min(idx, candidates.length - 1)]
 
   const handleClick = () => {

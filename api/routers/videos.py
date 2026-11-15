@@ -9,7 +9,7 @@
     GET    /videos/{id}            查询详情
     DELETE /videos/{id}            删除记录（连同 S3 对象）
     POST   /videos/run             批量处理待转储记录（后台）
-    GET    /videos/{id}/stream     代理播放（支持 Range / 206，进度条可拖动）
+    GET    /videos/{id}/stream     播放（默认 307 → S3 预签名 URL，Range/206 由 S3 直出）
 
 所有返回都带 ``original_size_bytes``（源片真实大小，转码前）与
 ``stored_size_bytes``（S3 对象大小），页面展示用前者。
@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
@@ -239,6 +241,30 @@ async def stream_video(video_id: int, request: Request):
             settings, _ = await store.video_settings(session, bucket=row.bucket)
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"S3 存储不可用：{e}") from e
+
+        # 默认让浏览器直连 S3：部分部署里 library 容器回源对象存储会被
+        # NAT 回流/大包限制卡住（实测 1KB 秒回、64KB 起 0 字节，播放器显示 0kb/s）。
+        # 307 保留 GET 与 Range 头，浏览器跟随重定向后由 S3 直接回 206。
+        # 设 VIDEO_STREAM_MODE=proxy 可退回容器内字节代理（签名不可用时自动兜底）。
+        if os.getenv("VIDEO_STREAM_MODE", "presign").strip().lower() != "proxy":
+            try:
+                from tools.s3_client import get_client
+
+                client = await get_client(settings)
+                play_url = await asyncio.to_thread(
+                    lambda: client.generate_presigned_url(
+                        "get_object",
+                        Params={"Bucket": settings.bucket, "Key": row.object_key},
+                        ExpiresIn=3600,
+                    )
+                )
+                # 不缓存重定向，否则浏览器可能复用已过期的签名 URL
+                return RedirectResponse(
+                    url=play_url, status_code=307,
+                    headers={"Cache-Control": "no-store"})
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "[videos] 预签名失败，回退容器内代理：%s", e)
 
         kwargs: Dict[str, Any] = {"Bucket": settings.bucket, "Key": row.object_key}
         range_header = request.headers.get("range")

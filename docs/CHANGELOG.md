@@ -5,6 +5,23 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-15] 修复：视频改为「封面点击播放」+ 播放 0kb/s
+
+### 播放 0kb/s
+- 线上 stream 的小 Range 正常（1KB 秒回 206），但 **≥64KB 的 Range 90 秒吐 0 字节**，
+  正好卡在 `_chunks()` 的 `body.read(64*1024)`。本地直连同一 S3 读 64KB 仅 0.02s，
+  说明不是解析/编码问题，而是**群晖容器回源对象存储的 NAT 回流/大包问题**。
+- `GET /videos/{id}/stream` 默认改为 **307 重定向到 S3 预签名 URL**（`Cache-Control: no-store`
+  避免缓存过期签名），浏览器直连 S3，Range/206 由 S3 直出，library 容器不再代理字节。
+  签名失败自动回退原代理；`VIDEO_STREAM_MODE=proxy` 可强制走代理。
+  实测：307 → 206 1MB/0.69s（1.5MB/s），真实 Chrome `readyState=4`、无报错。
+
+### 位置与交互
+- 不再在详情页顶部另塞一个 `<video>`。新增 `VideoPlayContext`，`MediaImage` 用
+  `coverUrl` 精确匹配视频帖首图后，把该图替换为「封面 + 半透明 ▶️」；
+  点击原地切换播放器（autoPlay），右上角可返回封面。不影响评论图片 / 列表卡片。
+- 原始大小仍展示，改为封面/播放器右下角的小徽标（hover 看精确字节与编码信息）。
+
 ## [2026-11-15] 修复：部署同步误排除前端目录，视频播放器始终进不了镜像
 
 - `deploy/server-update.sh` 的 `rsync --exclude 'data/'` 未锚定传输根，会匹配
