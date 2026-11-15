@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import os
 import shutil
 import tempfile
@@ -129,7 +130,9 @@ async def video_settings(session, bucket: Optional[str] = None, *,
     if internal:
         ep = internal_endpoint()
         if ep and ep != base.endpoint:
-            base = replace(base, endpoint=ep)
+            # fast_fail：内网不通时 2s 内失败、不重试，立刻回退公网，
+            # 避免每个 8MB 分片都耗 50s 把上传卡死
+            base = replace(base, endpoint=ep, fast_fail=True)
     return replace(base, bucket=bucket or VIDEO_BUCKET), cfg.get("config_id")
 
 
@@ -504,16 +507,33 @@ _ARCHIVE_TIMEOUT = float(os.getenv("VIDEO_ARCHIVE_TIMEOUT", "600"))
 _BATCH_CONCURRENCY = int(os.getenv("VIDEO_BATCH_CONCURRENCY", "2"))
 
 
+#: 本进程正在处理的记录 → 领取时刻（monotonic）。用于区分「真在跑」与「僵尸」。
+_STARTED_AT: Dict[int, float] = {}
+
+
 async def reap_stale_uploading(session) -> int:
     """回收僵尸 uploading 记录。
 
     进程崩溃 / 容器重启会把记录永久留在 uploading（批量只捡 pending/failed），
-    表现为「一直转码中」且永不重试。超过阈值就重新排队。
+    表现为「一直转码中」且永不重试，超过阈值就重新排队。
+
+    注意判据必须是「本进程没在跑」而不是只看 created_at —— 一条排队很久的
+    pending 被领取后 created_at 仍是旧的，只看时间会把它立刻打回 pending，
+    造成同一条被反复领取、永远跑不完。
     """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=_STALE_UPLOAD_MIN)
+    rows = (await session.execute(
+        select(VideoAsset.id).where(
+            VideoAsset.status == "uploading",
+            VideoAsset.created_at < cutoff,
+        )
+    )).scalars().all()
+    stale = [rid for rid in rows if rid not in _STARTED_AT]
+    if not stale:
+        return 0
     res = await session.execute(
         update(VideoAsset)
-        .where(VideoAsset.status == "uploading", VideoAsset.created_at < cutoff)
+        .where(VideoAsset.id.in_(stale), VideoAsset.status == "uploading")
         .values(status="pending", last_error="上传中断，已重新排队")
     )
     await session.commit()
@@ -604,79 +624,127 @@ async def cancel_pending(session) -> Dict[str, Any]:
     return {"ok": True, "cancelled": len(rows)}
 
 
-async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
-    """处理 pending / 失败待重试的记录；同一时刻只允许一批（进程内锁）。
+_EXEC_SEM: Optional[asyncio.Semaphore] = None
 
-    批内**并发**（默认 2，``VIDEO_BATCH_CONCURRENCY`` 可调）：以前串行处理，
-    点 5 个视频就是一条条排队，看起来像「全卡住」。每条用独立 session
-    （AsyncSession 不能并发共用），单条超时后标记失败继续，不会拖死整批。
+
+def _exec_sem() -> asyncio.Semaphore:
+    """全局执行并发上限（跨批次共享）。"""
+    global _EXEC_SEM
+    if _EXEC_SEM is None:
+        _EXEC_SEM = asyncio.Semaphore(max(1, _BATCH_CONCURRENCY))
+    return _EXEC_SEM
+
+
+async def claim_pending(session, limit: int) -> List[int]:
+    """原子领取待处理记录：pending/failed → uploading，返回真正领到的 id。
+
+    用「条件 UPDATE + RETURNING」而不是先查后改：多个批次（后台循环 +
+    手动触发 + 多标签页）同时跑时不会重复处理同一条。
     """
-    global _BATCH_LOCK
-    if _BATCH_LOCK.locked():
-        return {"running": True, "processed": 0}
-    async with _BATCH_LOCK:
-        async with _v2_session() as session:
-            if session is None:
-                return {"processed": 0, "error": "配置库不可用"}
-            await reap_stale_uploading(session)
-            rows = (await session.execute(
-                select(VideoAsset).where(
-                    VideoAsset.status.in_(("pending", "failed")),
-                    VideoAsset.retry_count < VideoAsset.max_retries,
-                ).order_by(VideoAsset.id).limit(limit)
-            )).scalars().all()
-            if not rows:
-                return {"processed": 0}
+    cand = (await session.execute(
+        select(VideoAsset.id).where(
+            VideoAsset.status.in_(("pending", "failed")),
+            VideoAsset.retry_count < VideoAsset.max_retries,
+        ).order_by(VideoAsset.id).limit(limit)
+    )).scalars().all()
+    if not cand:
+        return []
+    res = await session.execute(
+        update(VideoAsset)
+        .where(
+            VideoAsset.id.in_(cand),
+            VideoAsset.status.in_(("pending", "failed")),
+        )
+        .values(status="uploading")
+        .returning(VideoAsset.id)
+    )
+    claimed = [int(x) for x in res.scalars().all()]
+    await session.commit()
+    return claimed
+
+
+async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
+    """领取并处理一批待转储记录。
+
+    **不再整批持锁**：以前一批没跑完，后面所有 ``run`` 都返回
+    ``{"running": true}`` 空转；一条卡住（内网不可达 / 上传重试）就把整个
+    队列堵死，界面上表现为「全部卡在排队」。现在改成
+    「原子领取 + 全局并发信号量」：
+      - 领取靠 DB 条件 UPDATE，多批次并发也不会重复；
+      - 执行受 ``_exec_sem`` 限制总并发（``VIDEO_BATCH_CONCURRENCY`` 默认 2）；
+      - 上一批还在跑，后续批次照样能领走剩余记录。
+    每条用独立 AsyncSession（AsyncSession 不能并发共用），单条超时后标记
+    失败继续，不会拖死整批。
+    """
+    async with _v2_session() as session:
+        if session is None:
+            return {"processed": 0, "error": "配置库不可用"}
+        await reap_stale_uploading(session)
+        claimed = await claim_pending(session, limit)
+        if not claimed:
+            return {"processed": 0}
+        try:
+            settings, prefix = await video_target(session)
+        except Exception as e:
+            # 领取了却拿不到存储配置：退回 pending，别让它们卡在 uploading
+            await session.execute(
+                update(VideoAsset).where(VideoAsset.id.in_(claimed))
+                .values(status="pending", last_error=f"存储不可用：{e}")
+            )
+            await session.commit()
+            return {"processed": 0, "error": str(e)}
+
+    sem = _exec_sem()
+
+    async def _one(row_id: int) -> bool:
+        async with sem:
+            _STARTED_AT[row_id] = time.monotonic()
+            task = asyncio.current_task()
+            if task is not None:
+                _RUNNING[row_id] = task
             try:
-                settings, prefix = await video_target(session)
-            except Exception as e:
-                return {"processed": 0, "error": str(e)}
-            row_ids = [r.id for r in rows]
-
-        sem = asyncio.Semaphore(max(1, _BATCH_CONCURRENCY))
-
-        async def _one(row_id: int) -> bool:
-            async with sem:
-                task = asyncio.current_task()
-                if task is not None:
-                    _RUNNING[row_id] = task
-                try:
-                    async with _v2_session() as s2:
-                        if s2 is None:
-                            return False
-                        row = (await s2.execute(
-                            select(VideoAsset).where(VideoAsset.id == row_id)
-                        )).scalar_one_or_none()
-                        if row is None or row.status == "uploaded":
-                            return bool(row is not None)
-                        res = await asyncio.wait_for(
-                            archive_video(s2, row, settings, prefix),
-                            timeout=_ARCHIVE_TIMEOUT)
-                        return bool(res.get("ok"))
-                except asyncio.CancelledError:
+                if row_id in _CANCEL:
                     await _mark_cancelled(row_id)
                     return False
-                except asyncio.TimeoutError:
-                    utils.logger.warning(
-                        "[video_store] #%s 处理超时（>%ds），标记失败继续",
-                        row_id, int(_ARCHIVE_TIMEOUT))
-                    await _mark_failed(row_id, f"处理超时（>{int(_ARCHIVE_TIMEOUT)}s）")
-                    return False
-                except Exception as e:
-                    utils.logger.warning(
-                        "[video_store] #%s 处理失败：%s: %s",
-                        row_id, type(e).__name__, str(e)[:200])
-                    await _mark_failed(row_id, f"{type(e).__name__}: {str(e)[:200]}")
-                    return False
-                finally:
-                    _RUNNING.pop(row_id, None)
-                    _CANCEL.discard(row_id)
+                async with _v2_session() as s2:
+                    if s2 is None:
+                        return False
+                    row = (await s2.execute(
+                        select(VideoAsset).where(VideoAsset.id == row_id)
+                    )).scalar_one_or_none()
+                    if row is None or row.status == "uploaded":
+                        return bool(row is not None)
+                    if row.status == "cancelled":
+                        return False
+                    res = await asyncio.wait_for(
+                        archive_video(s2, row, settings, prefix),
+                        timeout=_ARCHIVE_TIMEOUT)
+                    return bool(res.get("ok"))
+            except asyncio.CancelledError:
+                await _mark_cancelled(row_id)
+                return False
+            except asyncio.TimeoutError:
+                utils.logger.warning(
+                    "[video_store] #%s 处理超时（>%ds），标记失败继续",
+                    row_id, int(_ARCHIVE_TIMEOUT))
+                await _mark_failed(row_id, f"处理超时（>{int(_ARCHIVE_TIMEOUT)}s）")
+                return False
+            except Exception as e:
+                utils.logger.warning(
+                    "[video_store] #%s 处理失败：%s: %s",
+                    row_id, type(e).__name__, str(e)[:200])
+                await _mark_failed(row_id, f"{type(e).__name__}: {str(e)[:200]}")
+                return False
+            finally:
+                _STARTED_AT.pop(row_id, None)
+                _RUNNING.pop(row_id, None)
+                _CANCEL.discard(row_id)
 
-        results = await asyncio.gather(*[_one(rid) for rid in row_ids])
-        ok = sum(1 for x in results if x)
-        utils.logger.info("[video_store] 批处理完成：%d 条，成功 %d 条",
-                          len(row_ids), ok)
-        return {"processed": len(row_ids), "succeeded": ok}
+    results = await asyncio.gather(*[_one(rid) for rid in claimed])
+    ok = sum(1 for x in results if x)
+    utils.logger.info("[video_store] 批处理完成：%d 条，成功 %d 条",
+                      len(claimed), ok)
+    return {"processed": len(claimed), "succeeded": ok}
 
 
 _BATCH_LOCK = asyncio.Lock()

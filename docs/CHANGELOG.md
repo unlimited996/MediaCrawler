@@ -5,6 +5,32 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-16] 修复：转储「全部卡在排队」——批处理锁改原子领取 + 内网快速失败
+
+现象：一次转多个视频，界面上全是「排队中」，没有一条进入「处理中」，
+`POST /videos/run` 返回 `{"started": true}` 但队列毫无动静。
+
+两层原因：
+1. **整批锁**：`_BATCH_LOCK` 在整批执行期间一直占着。只要有一条卡住
+   （实测 `#17` 上传 52MB 卡了 5 分钟），后续所有批次都直接返回
+   `{"running": true}` 空转，其余记录永远领不到。
+2. **内网 endpoint 长超时**：上一版回退图片代理改动时把 `fast_fail` 一并
+   撤掉了，`S3_INTERNAL_ENDPOINT` 不通时按 `connect_timeout=10 × 重试 5 次`
+   等，8MB 分片逐个卡，一条视频能卡几十分钟。
+
+改动：
+- `run_video_batch` 去掉整批锁，改为**原子领取**：条件 `UPDATE ... WHERE
+  status IN (pending, failed) ... RETURNING id` 把记录标成 `uploading`，
+  多个批次并发也不会重复处理；执行受全局 `_exec_sem`
+  （`VIDEO_BATCH_CONCURRENCY` 默认 2）限制。上一批还在跑，后续批次照样能
+  领走剩余记录。
+- 恢复 `S3Settings.fast_fail`：内网 endpoint 用 `connect_timeout=2` +
+  1 次重试，连不上立刻回退公网；公网和图片代理仍用原来的 10s × 5。
+- 修 `reap_stale_uploading` 判据：原来只看 `created_at`，排队很久的记录
+  一被领取就会被立刻打回 `pending`（反复领取、永远跑不完）；现在额外要求
+  「本进程没在跑」（`_STARTED_AT`）。
+- 领取后拿不到存储配置时退回 `pending`，不会卡在 `uploading`。
+
 ## [2026-11-16] 新增：视频转储执行记录（状态 / 日志 / 结果 / 终止）
 
 需求：转储任务应该像定时任务那样有执行记录，能看到状态、日志和结果，

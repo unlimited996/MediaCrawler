@@ -28,12 +28,16 @@ class S3Settings:
     region: str = "garage"
     bucket: str = "photos"
     addressing_style: str = "path"
+    #: 快速失败：给「内网 endpoint」这类可能不通的地址用。连不上立刻抛，
+    #: 由调用方回退公网。否则 10s connect × 5 次重试会把一个分片拖到 50s，
+    #: 几十个分片叠起来就是几十分钟（线上出现过上传卡 5 分钟+ 的情况）。
+    fast_fail: bool = False
 
     @property
     def cache_key(self) -> str:
         return "|".join([self.endpoint, self.access_key_id,
                          self.secret_access_key[:8], self.region,
-                         self.addressing_style])
+                         self.addressing_style, "f" if self.fast_fail else ""])
 
 
 #: client 缓存：key = S3Settings.cache_key。线程内复用，避免反复建 session。
@@ -69,10 +73,12 @@ def _make_client(settings: S3Settings, endpoint: Optional[str] = None):
         config=Config(
             signature_version="s3v4",
             s3={"addressing_style": settings.addressing_style or "path"},
-            connect_timeout=10,
+            connect_timeout=2 if settings.fast_fail else 10,
             read_timeout=180,
-            # 弱网/回流链路偶发断连，退避重试放到 5 次（正常请求不会触发重试）
-            retries={"max_attempts": 5, "mode": "standard"},
+            # 弱网/回流链路偶发断连，退避重试放到 5 次（正常请求不会触发重试）；
+            # fast_fail 场景只试 1 次，连不上立刻交给调用方回退公网
+            retries={"max_attempts": 1 if settings.fast_fail else 5,
+                     "mode": "standard"},
         ),
     )
 
