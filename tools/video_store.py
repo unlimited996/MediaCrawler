@@ -347,7 +347,10 @@ async def _story_video_sources(session, story_id: int) -> Dict[str, Any]:
     if note_type and note_type != "video":
         return {"error": "该内容不是视频帖"}
 
-    if not urls and chapter.source_url:
+    # 优先重新解析 SSR：ext.video_url 是抓取当时写死的候选顺序，老数据把
+    # originVideoKey（HEVC 原片）排在最前，必然触发重编码；SSR 能拿到 h264
+    # 兼容档，下载后直接 `-c copy`。只有 SSR 不可用（token 过期/网络）才退回 ext。
+    if chapter.source_url:
         try:
             from media_platform.xhs.media import extract_video_urls
             from media_platform.xhs.ssr import fetch_note_by_url
@@ -355,9 +358,12 @@ async def _story_video_sources(session, story_id: int) -> Dict[str, Any]:
             data = await fetch_note_by_url(chapter.source_url)
             item = data.get("note_item") or {}
             note_type = str(item.get("type") or note_type)
-            urls = extract_video_urls(item)
+            ssr_urls = extract_video_urls(item)
+            if ssr_urls:
+                urls = ssr_urls
         except Exception as e:
-            return {"error": f"重新解析视频直链失败（xsec_token 可能已过期）：{e}"}
+            utils.logger.warning(
+                "[video_store] SSR 重解析失败，退回 ext 直链：%s", e)
 
     if note_type and note_type != "video":
         return {"error": "该内容不是视频帖"}

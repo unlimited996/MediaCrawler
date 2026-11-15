@@ -71,7 +71,8 @@ def _make_client(settings: S3Settings, endpoint: Optional[str] = None):
             s3={"addressing_style": settings.addressing_style or "path"},
             connect_timeout=10,
             read_timeout=180,
-            retries={"max_attempts": 2, "mode": "standard"},
+            # 弱网/回流链路偶发断连，退避重试放到 5 次（正常请求不会触发重试）
+            retries={"max_attempts": 5, "mode": "standard"},
         ),
     )
 
@@ -150,19 +151,36 @@ async def test_connection(settings: S3Settings) -> Dict[str, Any]:
 
 async def upload_file(settings: S3Settings, local_path: str, key: str,
                       content_type: Optional[str] = None) -> Dict[str, Any]:
-    """上传本地文件。返回 {etag, size}。
+    """上传本地文件（超过 8MB 自动走 multipart 分片）。返回 {etag, size}。
 
-    直接读字节走 put_object：备份的文件以图片/视频为主，单文件远小于
-    分片阈值（大文件场景以后要升级再换 multipart），少一套代码路径。
+    以前是「整个文件读进内存 + 单次 put_object」：96MB 视频除了多占 96MB 内存，
+    还会在 NAT 回流/弱网链路上被对端掐断长连接
+    （ConnectionClosedError: Connection was closed before we received a valid
+    response）。改用 boto3 upload_file：8MB 分片、每片独立重试，
+    峰值内存只占一个分片。
     """
     import os
 
+    from boto3.s3.transfer import TransferConfig
+
     size = os.path.getsize(local_path)
-    with open(local_path, "rb") as f:
-        data = f.read()
-    resp = await call(settings, "put_object", Bucket=settings.bucket, Key=key,
-                      Body=data, ContentType=content_type or _guess_type(key))
-    return {"etag": (resp.get("ETag") or "").strip('"'), "size": size}
+    client = await get_client(settings)
+    transfer = TransferConfig(
+        multipart_threshold=8 * 1024 * 1024,
+        multipart_chunksize=8 * 1024 * 1024,
+        max_concurrency=2,
+        use_threads=True,
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: client.upload_file(
+            local_path, settings.bucket, key,
+            ExtraArgs={"ContentType": content_type or _guess_type(key)},
+            Config=transfer,
+        ),
+    )
+    return {"etag": "", "size": size}
 
 
 async def upload_bytes(settings: S3Settings, data: bytes, key: str,
