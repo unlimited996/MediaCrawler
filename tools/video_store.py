@@ -281,7 +281,7 @@ async def archive_video(session, row: VideoAsset, settings,
                 # 报 ConnectionClosedError）。内网不可用时自动回退公网配置。
                 from tools.s3_client import _is_connection_error
 
-                upload_settings = await video_settings(
+                upload_settings, _ = await video_settings(
                     session, bucket=settings.bucket, internal=True)
                 try:
                     await upload_file(upload_settings, str(out), key, "video/mp4")
@@ -426,6 +426,7 @@ async def backfill_story(session, story_id: int) -> Dict[str, Any]:
 
 
 _STALE_UPLOAD_MIN = int(os.getenv("VIDEO_STALE_UPLOAD_MIN", "15"))
+_ARCHIVE_TIMEOUT = float(os.getenv("VIDEO_ARCHIVE_TIMEOUT", "900"))
 
 
 async def reap_stale_uploading(session) -> int:
@@ -471,7 +472,24 @@ async def run_video_batch(limit: int = 5) -> Dict[str, Any]:
                 return {"processed": 0, "error": str(e)}
             ok = 0
             for row in rows:
-                res = await archive_video(session, row, settings, prefix)
+                try:
+                    res = await asyncio.wait_for(
+                        archive_video(session, row, settings, prefix),
+                        timeout=_ARCHIVE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    # 一条卡住（下载慢 / 上传重试）不能把后面所有任务都堵死
+                    utils.logger.warning(
+                        "[video_store] #%s 处理超时（>%ds），标记失败继续下一条",
+                        row.id, int(_ARCHIVE_TIMEOUT))
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+                    row.status = "failed"
+                    row.last_error = f"处理超时（>{int(_ARCHIVE_TIMEOUT)}s）"
+                    row.retry_count = (row.retry_count or 0) + 1
+                    await session.commit()
+                    continue
                 ok += 1 if res.get("ok") else 0
             return {"processed": len(rows), "succeeded": ok}
 

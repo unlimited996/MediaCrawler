@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import config as config_module
 
@@ -133,6 +134,34 @@ def start_stance_library() -> None:
         asyncio.create_task(_bg())
     except Exception as e:
         _log("stance", f"标签库启动失败（不影响 API）：{e}")
+
+
+def start_video_batch() -> None:
+    """视频转储批处理循环。
+
+    抓取侧只负责「登记 pending」，没有调度器时它会一直躺着不动
+    （线上出现过 pending 挂 8 分钟没人处理）。这里每 N 秒捞一批，
+    由 video_store 自己的进程内锁保证同一时刻只跑一批。
+    """
+    try:
+        from tools import video_store
+
+        async def _bg():
+            interval = int(os.getenv("VIDEO_BATCH_INTERVAL", "20") or 20)
+            await asyncio.sleep(10)  # 等服务完全起来
+            while True:
+                try:
+                    res = await video_store.run_video_batch(limit=2)
+                    if res.get("processed"):
+                        _log("video-batch",
+                             f"处理 {res['processed']} 条，成功 {res.get('succeeded', 0)} 条")
+                except Exception as e:
+                    _log("video-batch", f"批处理异常（继续下一轮）：{e}")
+                await asyncio.sleep(interval)
+
+        asyncio.create_task(_bg())
+    except Exception as e:
+        _log("video-batch", f"启动失败：{e}")
 
 
 def start_s3_backup() -> None:

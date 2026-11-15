@@ -353,3 +353,16 @@ def test_extract_can_opt_out_of_h264_preference(monkeypatch):
     }}}}
     urls = extract_video_urls(item)
     assert urls[0].endswith("/608.mp4"), urls
+
+
+def test_video_settings_calls_are_unpacked():
+    """`video_settings` 返回 (settings, config_id)，漏解包会让上传直接
+    AttributeError: 'tuple' object has no attribute 'endpoint'（曾导致全部上传失败）。"""
+    import inspect
+
+    from tools import video_store
+
+    src = inspect.getsource(video_store)
+    bad = [ln.strip() for ln in src.splitlines()
+           if "await video_settings(" in ln and ", _" not in ln]
+    assert not bad, bad
