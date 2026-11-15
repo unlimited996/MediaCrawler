@@ -632,6 +632,21 @@ export const videoApi = {
   /** 全部终止 */
   cancelAll: () =>
     api.post<{ ok: boolean; cancelled: number }>('/videos/cancel-pending'),
+  /** 探测对象存储连通性（内网 / 公网 endpoint 各一次 head_bucket） */
+  diag: () =>
+    api.get<{
+      bucket: string
+      same_endpoint: boolean
+      configured_internal: string
+      probes: {
+        name: 'internal' | 'public'
+        endpoint: string
+        fast_fail: boolean
+        ok: boolean
+        ms: number
+        error?: string
+      }[]
+    }>('/videos/diag/s3'),
 }
 
 export const s3BackupApi = {

@@ -204,6 +204,61 @@ async def cancel_pending():
         await engine.dispose()
 
 
+@router.get("/diag/s3")
+async def diag_s3():
+    """探测对象存储连通性（内网 / 公网 endpoint 各测一次 head_bucket）。
+
+    排查「上传卡住」的入口：内网 endpoint 若在此处就报错/超时，说明容器
+    根本连不上，上传每次都要先失败再回退公网。放在 `/{video_id}` 之前定义，
+    否则会被当成 video_id 解析。
+    """
+    import time as _time
+
+    from tools.s3_client import call as s3_call
+
+    engine, session = await _session()
+    if session is None:
+        raise HTTPException(status_code=503, detail="配置库不可用")
+    try:
+        try:
+            public, _ = await store.video_settings(session)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"S3 配置不可用：{e}") from e
+        internal = public
+        internal_cfg_error = None
+        try:
+            internal, _ = await store.video_settings(session, internal=True)
+        except Exception as e:
+            internal_cfg_error = str(e)[:200]
+
+        probes = []
+        for name, st in (("internal", internal), ("public", public)):
+            item = {"name": name, "endpoint": st.endpoint,
+                    "fast_fail": bool(getattr(st, "fast_fail", False))}
+            t0 = _time.monotonic()
+            try:
+                await s3_call(st, "head_bucket", Bucket=st.bucket)
+                item["ok"] = True
+            except Exception as e:
+                item["ok"] = False
+                item["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+            item["ms"] = int((_time.monotonic() - t0) * 1000)
+            probes.append(item)
+
+        result = {
+            "bucket": public.bucket,
+            "same_endpoint": internal.endpoint == public.endpoint,
+            "configured_internal": store.internal_endpoint() or "",
+            "probes": probes,
+        }
+        if internal_cfg_error:
+            result["internal_config_error"] = internal_cfg_error
+        return result
+    finally:
+        await session.close()
+        await engine.dispose()
+
+
 @router.post("/run")
 async def run_batch(limit: int = Query(5, ge=1, le=50)):
     """立即跑一批待转储视频（后台，避免请求被大文件下载拖住）。"""

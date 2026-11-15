@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Ban, ChevronDown, ChevronRight, Film, Loader2, Play, RefreshCw, Terminal,
+  Ban, ChevronDown, ChevronRight, Film, Loader2, Play, RefreshCw, Terminal, Wifi,
 } from 'lucide-react'
 import { videoApi, type VideoAssetRow } from '@/lib/api'
 import { formatBytes } from '@/lib/format'
@@ -152,6 +152,26 @@ export function VideoTasksView() {
   const items = q.data?.items ?? []
   const busy = items.filter((v) => v.status === 'pending' || v.status === 'uploading').length
 
+  // 存储连通性诊断：内网 endpoint 不通时上传会先失败再回退公网（慢）
+  const [diag, setDiag] = useState<{ ok: boolean; text: string } | null>(null)
+  const diagM = useMutation({
+    mutationFn: () => videoApi.diag(),
+    onSuccess: (res) => {
+      const d = res.data
+      const lan = d.probes.find((p) => p.name === 'internal')
+      const pub = d.probes.find((p) => p.name === 'public')
+      const lanText = lan
+        ? `${lan.endpoint} ${lan.ok ? `通 ${lan.ms}ms` : `不通(${lan.ms}ms)`}`
+        : '未配置'
+      const pubText = pub ? `${pub.ok ? `通 ${pub.ms}ms` : `不通(${pub.ms}ms)`}` : '-'
+      setDiag({
+        ok: !!(lan && lan.ok),
+        text: `内网 ${lanText}　|　公网 ${pubText}`,
+      })
+    },
+    onError: (e: any) => setDiag({ ok: false, text: e?.message || '诊断失败' }),
+  })
+
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-cyber-border-subtle bg-cyber-bg-panel">
       <div className="flex flex-shrink-0 flex-wrap items-center gap-2 border-b border-cyber-border-subtle px-4 py-3">
@@ -202,6 +222,21 @@ export function VideoTasksView() {
           >
             <Ban className="h-3.5 w-3.5" /> 全部终止
           </button>
+          <button
+            type="button"
+            disabled={diagM.isPending}
+            onClick={() => diagM.mutate()}
+            title="探测容器到内网/公网对象存储的连通性与延迟"
+            className="inline-flex items-center gap-1 rounded border border-cyber-border-subtle px-2 py-1 text-[11px] font-mono text-cyber-text-secondary hover:bg-cyber-bg-hover disabled:opacity-50"
+          >
+            {diagM.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wifi className="h-3.5 w-3.5" />}
+            诊断存储
+          </button>
+          {diag && (
+            <span className={`font-mono text-[11px] ${diag.ok ? 'text-emerald-400' : 'text-amber-400'}`}>
+              {diag.text}
+            </span>
+          )}
         </div>
       </div>
 

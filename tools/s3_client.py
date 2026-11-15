@@ -28,9 +28,12 @@ class S3Settings:
     region: str = "garage"
     bucket: str = "photos"
     addressing_style: str = "path"
-    #: 快速失败：给「内网 endpoint」这类可能不通的地址用。连不上立刻抛，
-    #: 由调用方回退公网。否则 10s connect × 5 次重试会把一个分片拖到 50s，
-    #: 几十个分片叠起来就是几十分钟（线上出现过上传卡 5 分钟+ 的情况）。
+    #: 快速失败 + 直连：给「内网 endpoint」这类可能不通的地址用。
+    #: 1) 连不上立刻抛（2s connect + 1 次重试），由调用方回退公网，
+    #:    否则 10s × 5 次会把一个 8MB 分片拖到 50s，几十个分片就是几十分钟。
+    #: 2) **不走 http_proxy**：botocore 默认会读 HTTP(S)_PROXY 环境变量，
+    #:    内网地址被送去代理后代理连不到、挂 20s 才回 502（实测 20.5s），
+    #:    2s 的连接超时根本轮不到生效。这是「上传卡住」最隐蔽的一层。
     fast_fail: bool = False
 
     @property
@@ -79,6 +82,9 @@ def _make_client(settings: S3Settings, endpoint: Optional[str] = None):
             # fast_fail 场景只试 1 次，连不上立刻交给调用方回退公网
             retries={"max_attempts": 1 if settings.fast_fail else 5,
                      "mode": "standard"},
+            # fast_fail = 内网直连：必须绕开 HTTP(S)_PROXY，
+            # 否则请求被送进代理，代理连不到内网会挂 20s 才报 502
+            proxies={} if settings.fast_fail else None,
         ),
     )
 

@@ -349,17 +349,28 @@ async def archive_video(session, row: VideoAsset, settings,
 
                 upload_settings, _ = await video_settings(
                     session, bucket=settings.bucket, internal=True)
+                using_internal = upload_settings.endpoint != settings.endpoint
+                log_event(row.id, "上传端点：" + (
+                    f"内网 {upload_settings.endpoint}" if using_internal
+                    else f"{upload_settings.endpoint}（未配置内网或与公网相同）"))
+                upload_t0 = time.monotonic()
                 try:
                     await upload_file(upload_settings, str(out), key, "video/mp4")
                 except Exception as e:
-                    if (upload_settings.endpoint != settings.endpoint
-                            and _is_connection_error(e)):
+                    if using_internal and _is_connection_error(e):
                         utils.logger.warning(
                             "[video_store] 内网上传失败，回退公网 endpoint：%s", e)
+                        log_event(row.id, "内网不可用（"
+                                  f"{type(e).__name__}），已回退公网，"
+                                  f"耗时 {time.monotonic() - upload_t0:.1f}s")
                         upload_settings = settings
+                        upload_t0 = time.monotonic()
                         await upload_file(settings, str(out), key, "video/mp4")
                     else:
                         raise
+                log_event(row.id, f"上传完成，耗时 {time.monotonic() - upload_t0:.1f}s"
+                                  + ("（公网）" if upload_settings.endpoint == settings.endpoint
+                                     else "（内网）"))
                 obj = await head_object(upload_settings, key)
                 if obj is None:
                     raise RuntimeError("上传后 head_object 查无此对象")
