@@ -268,3 +268,35 @@ async def test_enqueue_is_idempotent_and_self_heals(db):
         assert row.status == "pending" and row.retry_count == 0
         assert video_store.video_fields(row)["original_size_bytes"] is None
     await engine.dispose()
+
+
+def _req(host: str):
+    return SimpleNamespace(headers={"host": host})
+
+
+def _s3(endpoint: str):
+    from tools.s3_client import S3Settings
+    return S3Settings(endpoint=endpoint, access_key_id="GK1",
+                      secret_access_key="x" * 20, bucket="videos")
+
+
+def test_presign_picks_endpoint_by_request_host(monkeypatch):
+    """内网访客拿内网 S3 地址，外网访客拿公网地址（否则一边必然播不了）。"""
+    monkeypatch.delenv("S3_PRESIGN_FORCE", raising=False)
+    pub = _s3("http://www.joyeuse.cn:3900")
+    lan = _s3("http://192.168.10.38:3900")
+
+    assert videos.presign_settings_for(_req("192.168.10.38:18081"), pub, lan) is lan
+    assert videos.presign_settings_for(_req("127.0.0.1:18081"), pub, lan) is lan
+    assert videos.presign_settings_for(_req("www.joyeuse.cn:18081"), pub, lan) is pub
+    # 没有配置内网 endpoint 时永远用公网
+    assert videos.presign_settings_for(_req("192.168.10.38:18081"), pub, pub) is pub
+
+
+def test_presign_force_override(monkeypatch):
+    pub = _s3("http://www.joyeuse.cn:3900")
+    lan = _s3("http://192.168.10.38:3900")
+    monkeypatch.setenv("S3_PRESIGN_FORCE", "public")
+    assert videos.presign_settings_for(_req("192.168.1.5:18081"), pub, lan) is pub
+    monkeypatch.setenv("S3_PRESIGN_FORCE", "internal")
+    assert videos.presign_settings_for(_req("www.joyeuse.cn"), pub, lan) is lan

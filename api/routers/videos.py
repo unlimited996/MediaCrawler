@@ -223,6 +223,44 @@ async def delete_video(video_id: int):
         await engine.dispose()
 
 
+def _is_private_host(host: str) -> bool:
+    """Host 是否是私网/回环地址（内网用户就是这样访问的）。"""
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(ip.is_private or ip.is_loopback)
+
+
+def presign_settings_for(request: Request, public, internal):
+    """按访问来源挑预签名用的 S3 endpoint。
+
+    内网用户拿到的如果是公网域名，浏览器会去连自家公网 IP（NAT 回流），
+    多数家用路由/群晖不支持 hairpin，表现为「外网能播、内网播不了」；
+    反过来外网用户拿到内网地址也打不开。所以跟着 Host 走：
+      Host 是私网 IP（或与内网 endpoint 同主机）→ 内网地址，其余 → 公网。
+    可用 `S3_PRESIGN_FORCE=internal|public` 强制。
+    """
+    from urllib.parse import urlparse
+
+    force = os.getenv("S3_PRESIGN_FORCE", "auto").strip().lower()
+    if force in ("internal", "intranet", "lan"):
+        return internal
+    if force in ("public", "wan", "external"):
+        return public
+    if internal.endpoint == public.endpoint:
+        return public
+    host = (request.headers.get("host") or "").split(":")[0].strip().lower()
+    if not host:
+        return public
+    internal_host = (urlparse(internal.endpoint).hostname or "").lower()
+    if host == internal_host or _is_private_host(host):
+        return internal
+    return public
+
+
 @router.get("/{video_id}/stream")
 async def stream_video(video_id: int, request: Request):
     """代理 S3 视频对象，支持 Range / 206 —— <video> 拖动进度条的必要条件。"""
@@ -250,11 +288,23 @@ async def stream_video(video_id: int, request: Request):
             try:
                 from tools.s3_client import get_client
 
-                client = await get_client(settings)
+                # 预签名地址要跟访问来源匹配：内网访问用内网 S3 地址，
+                # 外网访问用公网地址（否则内网走 NAT 回流，浏览器连不上）
+                sign_settings = settings
+                try:
+                    internal_settings, _ = await store.video_settings(
+                        session, bucket=row.bucket, internal=True)
+                    sign_settings = presign_settings_for(
+                        request, settings, internal_settings)
+                except Exception as e:
+                    logging.getLogger(__name__).debug(
+                        "[videos] 内网 endpoint 不可用，按公网签名：%s", e)
+
+                client = await get_client(sign_settings)
                 play_url = await asyncio.to_thread(
                     lambda: client.generate_presigned_url(
                         "get_object",
-                        Params={"Bucket": settings.bucket, "Key": row.object_key},
+                        Params={"Bucket": sign_settings.bucket, "Key": row.object_key},
                         ExpiresIn=3600,
                     )
                 )

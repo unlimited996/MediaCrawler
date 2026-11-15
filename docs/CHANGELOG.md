@@ -5,6 +5,20 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-16] 修复：内网访问时视频播不了（预签名地址跟访问来源走）
+
+现象：外网访问 `www.joyeuse.cn:18081` 能播，内网访问 `192.168.10.38:18081` 播不了。
+
+原因：`/videos/{id}/stream` 的 307 预签名地址**固定用公网 endpoint**。
+内网浏览器拿到 `www.joyeuse.cn:3900` 后会去连自家公网 IP（NAT 回流），
+家用路由/群晖普遍不支持 hairpin，连接直接失败。
+
+- 新增 `presign_settings_for()`：按请求 `Host` 挑 endpoint ——
+  私网 IP（或与内网 endpoint 同主机）→ 内网 S3 地址，其余 → 公网。
+- 支持 `S3_PRESIGN_FORCE=internal|public` 强制（内网用域名访问时可手动指定）。
+- 实测：`Host: 192.168.10.38:18081` → `http://192.168.10.38:3900/...`；
+  `Host: www.joyeuse.cn:18081` → `http://www.joyeuse.cn:3900/...`。
+
 ## [2026-11-16] 修复：大文件上传断连（multipart）+ 容器内走内网对象存储
 
 线上转储「万能浇头冰版梅花肉」最终失败：
