@@ -399,6 +399,58 @@ async def _fetch_remote(url: str, platform: str) -> bytes:
     return resp.content
 
 
+async def _upload_with_fallback(settings, *, local_path: str = "",
+                                data: Optional[bytes] = None,
+                                key: str = "", mime: str = "") -> Dict[str, Any]:
+    """上传优先走内网 endpoint；只有连接类错误才回退公网。
+
+    图片备份历史上大量 ``ConnectionClosedError`` 都发生在公网 endpoint：
+    容器访问自家公网域名走 NAT 回流，大包/长连接被掐断。内网 endpoint
+    配上以后直连稳定；没配或真不通时必须在 2s 内失败并回退，不能让
+    ``connect_timeout=10 × retries=5`` 把每张图拖几十秒。
+    """
+    from tools import utils
+    from tools.s3_client import (
+        _is_connection_error, head_object, internal_settings_for,
+        upload_bytes, upload_file,
+    )
+
+    candidates = []
+    internal = internal_settings_for(settings)
+    if internal is not None:
+        candidates.append(internal)
+    candidates.append(settings)  # 公网兜底
+
+    last_error: Optional[Exception] = None
+    for idx, st in enumerate(candidates):
+        try:
+            if local_path:
+                result = await upload_file(st, local_path, key, mime)
+            else:
+                if data is None:
+                    raise RuntimeError("无内容可上传")
+                result = await upload_bytes(st, data, key, mime)
+            size = int(result["size"])
+
+            # 上传后校验：对象必须存在且大小一致（用同一 endpoint 校验）
+            head = await head_object(st, key)
+            if head is None:
+                raise RuntimeError("上传后 head_object 查无此对象")
+            if head.get("ContentLength") is not None and int(head["ContentLength"]) != size:
+                raise RuntimeError(
+                    f"大小不一致：本地 {size} / 远端 {head['ContentLength']}")
+            return result
+        except Exception as e:
+            last_error = e
+            if idx < len(candidates) - 1 and _is_connection_error(e):
+                utils.logger.warning(
+                    "[media_backup] 内网上传失败，回退公网：%s: %s",
+                    type(e).__name__, str(e)[:160])
+                continue
+            raise
+    raise last_error  # pragma: no cover
+
+
 async def backup_one(session, row: MediaBackup, settings) -> Tuple[bool, str]:
     """备份单条媒体：**入库前先按内容校验**，命中已入库对象就只引用不上传。
 
@@ -413,7 +465,7 @@ async def backup_one(session, row: MediaBackup, settings) -> Tuple[bool, str]:
     同一 checksum 的处理用进程内锁串行，避免并发批次各自上传同一张图。
     """
     from tools import content_store as cs
-    from tools.s3_client import head_object, upload_bytes, upload_file
+    # 上传统一走 _upload_with_fallback（内网直连 + 公网回退）
 
     media = (await session.execute(
         select(MediaAttachment).where(MediaAttachment.id == row.media_id)
@@ -470,21 +522,10 @@ async def backup_one(session, row: MediaBackup, settings) -> Tuple[bool, str]:
             key = cs.canonical_object_key(
                 checksum, row.media_type or "image", row.mime_type)
             row.object_key = key
-            if local_path:
-                result = await upload_file(settings, local_path, key, row.mime_type)
-            else:
-                if data is None:
-                    raise RuntimeError("无内容可上传")
-                result = await upload_bytes(settings, data, key, row.mime_type)
-            size = result["size"]
-
-            # 上传后校验：对象必须存在且大小一致
-            head = await head_object(settings, key)
-            if head is None:
-                raise RuntimeError("上传后 head_object 查无此对象")
-            if head.get("ContentLength") is not None and int(head["ContentLength"]) != int(size):
-                raise RuntimeError(
-                    f"大小不一致：本地 {size} / 远端 {head.get('ContentLength')}")
+            result = await _upload_with_fallback(
+                settings, local_path=local_path, data=data,
+                key=key, mime=row.mime_type or "")
+            size = int(result["size"])
 
         row.status = "uploaded"
         row.size_bytes = size

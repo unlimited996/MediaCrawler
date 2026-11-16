@@ -5,6 +5,29 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-16] 修复：图片自动备份大量 ConnectionClosedError
+
+线上 `media_backup` 有 1007 条 failed（11067 uploaded，失败率 8.4%），
+错误几乎全是 `ConnectionClosedError` @ `http://www.joyeuse.cn:3900/photos/emoji/image/...`，
+且 11/16 一天就新增 418 条。全部 `retry_count=3`、`next_retry_at=NULL`，
+重试已耗尽且永远不会自动再试。
+
+根因与视频上传同源：图片备份一直走公网 endpoint，容器访问自家公网域名
+走 NAT 回流，长连接被掐断。之前给图片代理加内网分流时实测 502，是因为
+botocore 把内网地址也送进了 `http_proxy` —— 这个坑已在 af2709b 用
+`proxies={}` + `fast_fail` 修掉，图片上传现在可以安全复用。
+
+- 新增 `tools/s3_client.internal_settings_for()`：统一的「内网直连」配置
+  （fast_fail + proxies={}），视频与图片共用，不再各写一份。
+- `media_backup._upload_with_fallback()`：上传优先内网，**只有连接类错误**
+  才回退公网（403/签名错误不重复尝试）；上传后的 head_object 大小校验
+  用同一 endpoint，避免回退后校验错对象。
+- 历史失败记录需手动重置（见下方说明），新代码不会自动复活已耗尽重试的条目。
+
+本地实测：先取 1 条真实失败记录 → 内网 3.5s 快速失败、回退公网后上传成功；
+再取 20 条批量跑 → **20/20 全部 uploaded，39.6s**（并发 4，本机内网不可达
+所以每条都走了回退路径；群晖内网通则更快）。
+
 ## [2026-11-16] 修复：内网 S3 请求被 http_proxy 劫持（上传卡住的真凶）
 
 现象：`S3_INTERNAL_ENDPOINT` 已经配成局域网 IP `http://192.168.10.38:3900`，

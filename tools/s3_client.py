@@ -161,6 +161,22 @@ async def test_connection(settings: S3Settings) -> Dict[str, Any]:
             return {"ok": False, "error": f"{type(e2).__name__}: {e2 or e1}"}
 
 
+def internal_settings_for(settings: S3Settings):
+    """返回「内网直连」版 settings；未配置或与公网相同则返回 None。
+
+    统一给图片/视频上传用：内网 endpoint 必须 fast_fail（2s connect + 1 次
+    重试 + proxies={} 绕开 http_proxy），否则请求会被送进代理、挂 20s 才
+    回 502，长连接一断就把上传拖死。
+    """
+    import os
+    from dataclasses import replace
+
+    ep = os.getenv("S3_INTERNAL_ENDPOINT", "").strip().rstrip("/")
+    if not ep or ep == settings.endpoint:
+        return None
+    return replace(settings, endpoint=ep, fast_fail=True)
+
+
 async def upload_file(settings: S3Settings, local_path: str, key: str,
                       content_type: Optional[str] = None) -> Dict[str, Any]:
     """上传本地文件（超过 8MB 自动走 multipart 分片）。返回 {etag, size}。
