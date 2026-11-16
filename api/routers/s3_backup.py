@@ -349,10 +349,13 @@ async def retry(payload: Dict[str, Any] = Body(default={})):
     ids = payload.get("ids") if isinstance(payload, dict) else None
     if ids is not None and not isinstance(ids, list):
         raise HTTPException(status_code=400, detail="ids 必须是数组")
-    n = await retry_failed(ids)
-    if n:
+    res = await retry_failed(ids)
+    # 兼容旧版 int 返回（若有其它调用方）
+    if isinstance(res, int):
+        res = {"reset": res, "healed": 0, "missing": res, "total": res}
+    if res.get("reset"):
         asyncio.create_task(run_backup_batch())
-    return {"reset": n}
+    return res
 
 
 @router.post("/enqueue-missing")

@@ -60,3 +60,15 @@ def test_presign_force_override(monkeypatch):
     assert presign_settings_for(_req("192.168.10.38"), pub, lan) is pub
     monkeypatch.setenv("S3_PRESIGN_FORCE", "internal")
     assert presign_settings_for(_req("www.joyeuse.cn"), pub, lan) is lan
+
+
+def test_retry_failed_returns_structured_stats(monkeypatch):
+    """retry_failed 返回结构：重置前按 S3 事实自愈，剩下才 pending 重跑。"""
+    import inspect
+
+    from tools import media_backup as mb
+
+    src = inspect.getsource(mb.retry_failed)
+    assert "head_object" in src, "必须先按 S3 事实校验再决定状态"
+    assert '"healed"' in src and '"reset"' in src, "需回显自愈/重置数量"
+    assert 'r.status = "uploaded"' in src, "对象存在应直接收敛为 uploaded"

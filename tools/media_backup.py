@@ -656,28 +656,64 @@ async def run_backup_batch(limit: int = _BATCH_LIMIT,
         return stats
 
 
-async def retry_failed(ids: Optional[List[int]] = None) -> int:
-    """把 failed（或指定）条目重置为 pending 立即重跑。返回重置条数。"""
+async def retry_failed(ids: Optional[List[int]] = None):
+    """重试 failed 条目：先按 S3 事实自愈，剩下的才重置为 pending 重跑。
+
+    线上出现过「记录标 failed 但对象其实已上传成功」（上传完成后写库那一步
+    因连接抖动失败），盲目重置会重复下载已失效的 CDN 链接、再次 403。
+    这里先用 object_key 做 head_object 校验：
+      - 对象在（且大小一致）→ 直接转 uploaded，零下载零重传；
+      - 对象不在 / 尺寸不符 → 重置 pending，后台重新下载上传。
+    返回 dict {reset, healed, missing, total}（历史 int 调用方见下方兼容）。
+    """
     from config.db_config import resolve_config_db_type
     from database.db_session import get_async_engine
     from sqlalchemy.ext.asyncio import AsyncSession
 
     engine = get_async_engine(resolve_config_db_type())
     if engine is None:
-        return 0
+        return {"reset": 0, "healed": 0, "missing": 0, "total": 0}
     try:
+        from tools.s3_client import head_object
+
         async with AsyncSession(engine, expire_on_commit=False) as session:
+            cfg = await active_settings(session)
+            settings = cfg["settings"] if cfg else None
             q = select(MediaBackup).where(MediaBackup.status == "failed")
             if ids:
                 q = select(MediaBackup).where(MediaBackup.id.in_(ids))
             rows = (await session.execute(q)).scalars().all()
+
+            healed = reset = missing = 0
             for r in rows:
+                obj = None
+                if settings is not None and r.object_key:
+                    try:
+                        obj = await head_object(settings, r.object_key)
+                    except Exception:
+                        obj = None
+                if obj is not None:
+                    # 对象已在 S3，直接收敛状态；大小不符时才当缺失重传
+                    remote = obj.get("ContentLength")
+                    if (remote is None or not r.size_bytes
+                            or int(remote) == int(r.size_bytes)):
+                        r.status = "uploaded"
+                        r.uploaded_at = _now()
+                        r.last_error = None
+                        r.next_retry_at = None
+                        if remote is not None:
+                            r.size_bytes = int(remote)
+                        healed += 1
+                        continue
                 r.status = "pending"
                 r.retry_count = 0
                 r.next_retry_at = None
                 r.last_error = None
+                reset += 1
+                missing += 1
             await session.commit()
-            return len(rows)
+            return {"reset": reset, "healed": healed,
+                    "missing": missing, "total": len(rows)}
     finally:
         await engine.dispose()
 
