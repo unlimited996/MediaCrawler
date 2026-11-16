@@ -5,6 +5,28 @@
 
 格式参考 Keep a Changelog：`新增 / 变更 / 修复` 三类。
 
+## [2026-11-16] 修复：外网图片全部加载不出来（代理改 307 直连 S3）
+
+现象：页面图片全部卡死。实测线上 `/s3-backup/object/{key}`：
+1KB 图 0.10s 返回 1036 字节；2MB 图 **25 秒 0 字节**（curl 超时），
+而本机直连同一 S3 对象只要 0.38s —— 与之前视频 0kb/s 同源：
+群晖容器回源自家公网 S3 走 NAT 回流，小包能过、大包卡死。
+
+- `GET /s3-backup/object/{key}` 默认 **307 → S3 预签名 URL**，浏览器直连 S3，
+  不再经 library 容器回源。`Cache-Control: no-store` 防缓存过期签名。
+- 把 `videos.py` 的 `_is_private_host` / `_browser_reachable` /
+  `presign_settings_for` 抽到 `api/lib/s3_presign.py`，图片与视频共用一套
+  「按 Host 分流」：内网访客拿内网地址、外网访客拿公网地址；
+  `S3_PRESIGN_FORCE=internal|public` 可强制覆盖。
+- 历史表情包是 `.bin` + `application/octet-stream`（实测文件头是 WebP），
+  预签名时加 `ResponseContentType=image/webp` 保证浏览器渲染；
+  按「扩展名 → 路径规则」判定，**不做额外 S3 请求**（避免又卡一次）。
+- 签名失败自动回退原字节代理；`S3_BACKUP_READ_MODE=proxy` 可强制代理。
+
+本地实测：外网 Host → `www.joyeuse.cn:3900`、内网 Host → `192.168.10.38:3900`；
+跟随 307 下载 2MB 图 **0.43s / 2038740 字节 / image/webp**。
+视频播放 307 回归正常。测试 28 例全绿（新增 5 例分流用例）。
+
 ## [2026-11-16] 修复：图片自动备份大量 ConnectionClosedError
 
 线上 `media_backup` 有 1007 条 failed（11067 uploaded，失败率 8.4%），
