@@ -330,68 +330,8 @@ async def delete_video(video_id: int):
         await engine.dispose()
 
 
-def _is_private_host(host: str) -> bool:
-    """Host 是否是私网/回环地址（内网用户就是这样访问的）。"""
-    import ipaddress
-
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return bool(ip.is_private or ip.is_loopback)
-
-
-def _browser_reachable(host: str) -> bool:
-    """浏览器能否解析这个主机名。
-
-    IP 一定可以；含点的域名交给局域网 DNS；**容器名（无点）只有 docker
-    内部能解析**，给浏览器就是个打不开的地址（曾导致内网视频无声失败）。
-    """
-    import ipaddress
-
-    host = (host or "").strip().lower()
-    if not host:
-        return False
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return "." in host
-
-
-def presign_settings_for(request: Request, public, internal):
-    """按访问来源挑预签名用的 S3 endpoint。
-
-    内网用户拿到的如果是公网域名，浏览器会去连自家公网 IP（NAT 回流），
-    多数家用路由/群晖不支持 hairpin，表现为「外网能播、内网播不了」；
-    反过来外网用户拿到内网地址也打不开。所以跟着 Host 走：
-      Host 是私网 IP（或与内网 endpoint 同主机）→ 内网地址，其余 → 公网。
-    可用 `S3_PRESIGN_FORCE=internal|public` 强制。
-    """
-    from urllib.parse import urlparse
-
-    force = os.getenv("S3_PRESIGN_FORCE", "auto").strip().lower()
-    if force in ("internal", "intranet", "lan"):
-        return internal
-    if force in ("public", "wan", "external"):
-        return public
-    if internal.endpoint == public.endpoint:
-        return public
-    host = (request.headers.get("host") or "").split(":")[0].strip().lower()
-    if not host:
-        return public
-    internal_host = (urlparse(internal.endpoint).hostname or "").lower()
-    if not _browser_reachable(internal_host):
-        # 容器名只对容器有意义，宁可回退公网也别给浏览器一个解析不了的地址
-        logging.getLogger(__name__).warning(
-            "[videos] S3_INTERNAL_ENDPOINT=%s 是容器名，浏览器无法解析，"
-            "播放改用公网地址；需要内网直连请改成局域网 IP（如 "
-            "http://192.168.10.38:3900）", internal.endpoint)
-        return public
-    if host == internal_host or _is_private_host(host):
-        return internal
-    return public
-
+# 预签名分流逻辑已抽到公共模块（图片代理共用）
+from api.lib.s3_presign import presign_settings_for  # noqa: E402
 
 @router.get("/{video_id}/stream")
 async def stream_video(video_id: int, request: Request):

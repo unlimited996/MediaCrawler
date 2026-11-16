@@ -25,10 +25,11 @@
     GET    /s3-backup/object/{key}       代理 S3 对象（访问链第三级）
 """
 import asyncio
+import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Body, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from sqlalchemy import select
 
 from database.models_v2 import MediaAttachment, MediaBackup, S3Config
@@ -637,14 +638,24 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 @router.get("/object/{key:path}")
-async def serve_backup_object(key: str):
-    """代理 S3 备份对象。
+async def serve_backup_object(key: str, request: Request):
+    """读 S3 备份对象（默认 307 到预签名 URL，浏览器直连 S3）。
 
-    本地缓存没了、平台外链挂了之后走这里；帖子删除不影响（对象与
-    备份记录都不随 story 级联删除）。大文件边下边吐，不整包读内存。
+    群晖这类环境里，容器回源自家公网 S3 会走 NAT 回流：小图（1KB）秒回，
+    大图（≥1MB）回 200 但 0 字节、几十秒不吐数据（实测 2MB 图 25s / 0B，
+    而本机直连同一对象只要 0.38s）。所以默认让浏览器直连 S3，
+    与视频播放同一套按 Host 分流的预签名逻辑。
+
+    签名失败自动退回原来的字节代理；``S3_BACKUP_READ_MODE=proxy``
+    可强制代理（排障用）。
     """
+    import os
+
+    from api.lib.s3_presign import presign_settings_for
     from tools.media_backup import active_settings
-    from tools.s3_client import call
+    from tools.s3_client import (
+        _guess_type, call, get_client, internal_settings_for,
+    )
 
     engine, session = await _session()
     if session is None:
@@ -653,7 +664,55 @@ async def serve_backup_object(key: str):
         cfg = await active_settings(session)
         if cfg is None:
             raise HTTPException(status_code=503, detail="未配置可用的 S3 存储")
-        settings = cfg["settings"]
+        settings: S3Settings = cfg["settings"]
+
+        # 查库拿该对象的真实 mime：很多 emoji 存成 .bin + octet-stream，
+        # 预签名时用 ResponseContentType 覆盖，保证浏览器按图片渲染。
+        mime = ""
+        try:
+            row = (await session.execute(
+                select(MediaBackup.mime_type).where(
+                    MediaBackup.object_key == key).limit(1)
+            )).scalar_one_or_none()
+            if row:
+                mime = str(row)
+        except Exception:
+            pass
+        if not mime or mime == "application/octet-stream":
+            # 按扩展名/路径判，不做额外 S3 请求（那会在 NAT 回流环境又卡一次）。
+            # 历史表情包是 .bin + octet-stream，实测文件头是 WebP。
+            guess = _guess_type(key)
+            if guess != "application/octet-stream":
+                mime = guess
+            elif "/image/" in key or key.lower().endswith(".bin"):
+                mime = "image/webp"
+            else:
+                mime = ""
+
+        if os.getenv("S3_BACKUP_READ_MODE", "presign").strip().lower() != "proxy":
+            try:
+                # 图片沿用同一个 bucket（photos 等），只切内网 endpoint；
+                # 不能用 video_settings()——那个会把桶换成 videos。
+                internal = internal_settings_for(settings) or settings
+                sign = presign_settings_for(request, settings, internal)
+                client = await get_client(sign)
+                params = {"Bucket": sign.bucket, "Key": key}
+                if mime:
+                    params["ResponseContentType"] = mime
+                url = await asyncio.to_thread(
+                    lambda: client.generate_presigned_url(
+                        "get_object", Params=params, ExpiresIn=3600))
+                # no-store：防止浏览器缓存已经过期的签名 URL
+                return RedirectResponse(
+                    url, status_code=307,
+                    headers={"Cache-Control": "no-store",
+                             "X-Backup-Source": "s3-presigned"})
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "[s3_backup] 预签名失败，回退字节代理：%s: %s",
+                    type(e).__name__, str(e)[:160])
+
+        # 回退：原字节代理（大文件边下边吐，不整包读内存）
         try:
             resp = await call(settings, "get_object",
                               Bucket=settings.bucket, Key=key)
@@ -668,7 +727,8 @@ async def serve_backup_object(key: str):
             raise HTTPException(status_code=502, detail=f"S3 读取失败: {e}")
 
         body = resp.get("Body")
-        ctype = resp.get("ContentType") or "application/octet-stream"
+        ctype = (mime or resp.get("ContentType")
+                 or "application/octet-stream")
         if body is None:
             raise HTTPException(status_code=404, detail="备份对象为空")
 
@@ -688,7 +748,7 @@ async def serve_backup_object(key: str):
         return StreamingResponse(
             _iter(), media_type=ctype,
             headers={"Cache-Control": "public, max-age=86400",
-                     "X-Backup-Source": "s3"})
+                     "X-Backup-Source": "s3-proxy"})
     finally:
         await session.close()
         await engine.dispose()

@@ -101,6 +101,8 @@ services:
       # 容器内直连对象存储（避开 NAT 回流：上传断连 / 播放 0kb/s）。
       # 留空则用 s3_config 里的公网地址；预签名播放地址始终用公网，不受影响。
       S3_INTERNAL_ENDPOINT: ${S3_INTERNAL_ENDPOINT:-}
+      # 图片读取默认 307 直连 S3（绕开群晖 NAT 回流大包卡死）；排障时可设 proxy 走容器代理
+      S3_BACKUP_READ_MODE: ${S3_BACKUP_READ_MODE:-presign}
     # 主机有核显（Intel/AMD）时取消下面两行注释，把 /dev/dri 透传给容器，
     # ffmpeg 会自动改用 h264_vaapi 硬件编码（CPU 占用可从 4 核降到 1 核以内）。
     # devices:
